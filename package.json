@@ -1,0 +1,31 @@
+{
+  "name": "juanproxy",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "author": "JuanProxy contributors",
+  "keywords": [
+    "electron",
+    "openai-compatible",
+    "api-proxy",
+    "desktop",
+    "proxy"
+  ],
+  "productName": "JuanProxy",
+  "description": "JuanProxy desktop manager and local proxy for OpenAI-compatible API endpoints.",
+  "main": "src/main.js",
+  "build": {
+    "appId": "zone.huawei.juanproxy",
+    "productName": "JuanProxy"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "electron": "^42.3.2"
+  }
+}
