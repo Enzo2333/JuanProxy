@@ -102,3 +102,47 @@ test('manual test records a failing site without enabling it', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('manual test disables an enabled site for HTTP failures', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-manual-test-http-failure-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ failureThreshold: 0 });
+    const site = await config.addSite({
+      name: 'target',
+      baseUrl: 'https://target.example/v1',
+      apiKey: 'sk-target'
+    });
+
+    const result = await testConfiguredSite({
+      configService: config,
+      siteId: site.id,
+      testSite: async () => ({
+        ok: false,
+        statusCode: 400,
+        message: 'Availability test failed HTTP 400',
+        detail: JSON.stringify({
+          error: {
+            message: 'Instructions are required',
+            type: 'invalid_request_error'
+          }
+        })
+      })
+    });
+
+    const updated = config.getState().sites.find((candidate) => candidate.id === site.id);
+
+    assert.equal(result.ok, false);
+    assert.equal(updated.manualEnabled, true);
+    assert.equal(updated.failureDisabled, true);
+    assert.equal(updated.enabled, false);
+    assert.equal(updated.consecutiveErrors, 1);
+    assert.equal(updated.errorCount, 1);
+    assert.equal(updated.lastError.statusCode, 400);
+    assert.equal(updated.lastError.affectsSiteHealth, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

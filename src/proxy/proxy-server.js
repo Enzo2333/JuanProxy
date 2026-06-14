@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 
 import { recoverAvailableSites } from './recover-sites.js';
 import { testSiteAvailability } from './site-tester.js';
@@ -22,6 +23,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 const ERROR_SNIPPET_LIMIT = 1000;
 const DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES = 64 * 1024;
+const INCOMPLETE_RESPONSES_STREAM_ERROR =
+  'stream disconnected before completion: stream closed before response.completed';
+const RESPONSES_COMPLETED_EVENT = 'response.completed';
 
 export class OpenApiProxyServer extends EventEmitter {
   constructor({
@@ -145,6 +149,7 @@ export class OpenApiProxyServer extends EventEmitter {
     }
 
     const requestBody = await prepareRequestBody(req, this.maxReplayableRequestBodyBytes);
+    const requestDiagnostics = createRequestDiagnostics(req, requestBody);
     const attemptedSiteIds = new Set();
     let lastFailure = null;
 
@@ -168,7 +173,14 @@ export class OpenApiProxyServer extends EventEmitter {
 
       attemptedSiteIds.add(site.id);
       const target = composeTargetUrl(site.baseUrl, req.url);
-      const result = await this.forwardRequest({ req, res, site, target, requestBody });
+      const result = await this.forwardRequest({
+        req,
+        res,
+        site,
+        target,
+        requestBody,
+        requestDiagnostics
+      });
       if (result.ok) {
         return;
       }
@@ -242,14 +254,18 @@ export class OpenApiProxyServer extends EventEmitter {
     return result;
   }
 
-  async forwardRequest({ req, res, site, target, requestBody }) {
+  async forwardRequest({ req, res, site, target, requestBody, requestDiagnostics }) {
     const transport = target.protocol === 'https:' ? https : http;
-    const outboundRequestBody = prepareForwardRequestBody({
+    const { requestBody: outboundRequestBody, modelRewrite } = prepareForwardRequestBody({
       req,
       site,
       requestBody,
       globalModelMapping: this.configService.getModelMapping?.()
     });
+    const completedRequestDiagnostics = finalizeRequestDiagnostics(
+      requestDiagnostics,
+      modelRewrite
+    );
     const headers = buildForwardHeaders(req.headers, site.apiKey, {
       contentLength: shouldSendReplayableBody(req, outboundRequestBody)
         ? outboundRequestBody.body.length
@@ -352,7 +368,11 @@ export class OpenApiProxyServer extends EventEmitter {
               affectsSiteHealth: classification.affectsSiteHealth
             })
               .then(() => {
-                this.emit('request-complete', { siteId: site.id, statusCode });
+                this.emit('request-complete', {
+                  siteId: site.id,
+                  statusCode,
+                  request: completedRequestDiagnostics
+                });
               })
               .catch((error) => {
                 this.emit('request-error', { siteId: site.id, error });
@@ -402,15 +422,28 @@ export class OpenApiProxyServer extends EventEmitter {
         }
 
         responseStarted = true;
+        const completionTracker = createResponsesStreamCompletionTracker(req, upstreamRes);
 
         res.writeHead(statusCode, responseHeaders);
 
+        upstreamRes.on('data', (chunk) => {
+          completionTracker?.observe(chunk);
+        });
         upstreamRes.pipe(res);
 
         upstreamRes.on('end', () => {
-          this.recordCompletedRequest({ site, statusCode, errorSnippet: '' })
+          const incompleteStreamError = completionTracker?.getIncompleteError();
+          const recordResult = incompleteStreamError
+            ? this.recordFailedRequest(site, incompleteStreamError)
+            : this.recordCompletedRequest({ site, statusCode, errorSnippet: '' });
+
+          recordResult
             .then(() => {
-              this.emit('request-complete', { siteId: site.id, statusCode });
+              this.emit('request-complete', {
+                siteId: site.id,
+                statusCode,
+                request: completedRequestDiagnostics
+              });
             })
             .catch((error) => {
               this.emit('request-error', { siteId: site.id, error });
@@ -592,7 +625,7 @@ export function composeTargetUrl(baseUrl, requestUrl) {
   let basePath = stripTrailingSlash(target.pathname);
   let incomingPath = incoming.pathname;
 
-  if (basePath.endsWith('/v1') && (incomingPath === '/v1' || incomingPath.startsWith('/v1/'))) {
+  if (basePath && isOpenAiV1Path(incomingPath)) {
     incomingPath = incomingPath.slice('/v1'.length) || '/';
   }
   if (basePath.endsWith('/v1') && isCodexBackendPath(incomingPath)) {
@@ -651,6 +684,10 @@ function stripTrailingSlash(value) {
     return '';
   }
   return value.replace(/\/+$/, '');
+}
+
+function isOpenAiV1Path(pathname) {
+  return pathname === '/v1' || pathname.startsWith('/v1/');
 }
 
 function isCodexBackendPath(pathname) {
@@ -716,54 +753,76 @@ async function prepareRequestBody(req, maxReplayableBytes) {
 
 function prepareForwardRequestBody({ req, site, requestBody, globalModelMapping }) {
   if (!requestBody.replayable || req.method === 'GET' || req.method === 'HEAD') {
-    return requestBody;
+    return {
+      requestBody,
+      modelRewrite: null
+    };
   }
 
-  const rewrittenBody = rewriteRequestModel({
+  const rewrite = rewriteRequestModel({
     body: requestBody.body,
     contentType: req.headers['content-type'],
     siteModelMapping: site.modelMapping,
     globalModelMapping
   });
+  const rewrittenBody = rewrite.body;
 
   if (rewrittenBody === requestBody.body) {
-    return requestBody;
+    return {
+      requestBody,
+      modelRewrite: rewrite.modelRewrite
+    };
   }
 
   return {
-    ...requestBody,
-    body: rewrittenBody
+    requestBody: {
+      ...requestBody,
+      body: rewrittenBody
+    },
+    modelRewrite: rewrite.modelRewrite
   };
 }
 
 function rewriteRequestModel({ body, contentType, siteModelMapping, globalModelMapping }) {
+  const unchanged = (modelRewrite = null) => ({ body, modelRewrite });
   if (!Buffer.isBuffer(body) || body.length === 0 || !isJsonContentType(contentType)) {
-    return body;
+    return unchanged();
   }
 
   let payload = null;
   try {
     payload = JSON.parse(body.toString('utf8'));
   } catch {
-    return body;
+    return unchanged();
   }
 
   if (!payload || Array.isArray(payload) || typeof payload !== 'object') {
-    return body;
+    return unchanged();
   }
   if (typeof payload.model !== 'string') {
-    return body;
+    return unchanged();
   }
 
   const mappedModel = resolveMappedModel(payload.model, siteModelMapping, globalModelMapping);
   if (!mappedModel || mappedModel === payload.model) {
-    return body;
+    return unchanged({
+      originalModel: payload.model,
+      forwardedModel: payload.model,
+      modelMapped: false
+    });
   }
 
-  return Buffer.from(JSON.stringify({
-    ...payload,
-    model: mappedModel
-  }));
+  return {
+    body: Buffer.from(JSON.stringify({
+      ...payload,
+      model: mappedModel
+    })),
+    modelRewrite: {
+      originalModel: payload.model,
+      forwardedModel: mappedModel,
+      modelMapped: true
+    }
+  };
 }
 
 function resolveMappedModel(model, siteModelMapping, globalModelMapping) {
@@ -789,6 +848,97 @@ function isJsonContentType(value) {
 
   const type = String(raw).split(';')[0].trim().toLowerCase();
   return type === 'application/json' || type.endsWith('+json');
+}
+
+function createRequestDiagnostics(req, requestBody) {
+  const parsedUrl = parseRequestUrl(req.url);
+  return {
+    id: randomUUID(),
+    method: req.method,
+    path: parsedUrl.pathname,
+    queryKeys: Array.from(parsedUrl.searchParams.keys()).sort(),
+    contentType: normalizeHeaderValue(req.headers['content-type']),
+    replayable: Boolean(requestBody.replayable),
+    originalModel: null,
+    forwardedModel: null,
+    modelMapped: false
+  };
+}
+
+function finalizeRequestDiagnostics(requestDiagnostics, modelRewrite) {
+  if (!modelRewrite) {
+    return requestDiagnostics;
+  }
+
+  return {
+    ...requestDiagnostics,
+    originalModel: modelRewrite.originalModel ?? null,
+    forwardedModel: modelRewrite.forwardedModel ?? null,
+    modelMapped: Boolean(modelRewrite.modelMapped)
+  };
+}
+
+function parseRequestUrl(value) {
+  try {
+    return new URL(value || '/', 'http://127.0.0.1');
+  } catch {
+    return new URL('/', 'http://127.0.0.1');
+  }
+}
+
+function normalizeHeaderValue(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) {
+    return null;
+  }
+  return String(raw).split(';')[0].trim().toLowerCase() || null;
+}
+
+function createResponsesStreamCompletionTracker(req, upstreamRes) {
+  if (!isResponsesStreamRequest(req, upstreamRes)) {
+    return null;
+  }
+
+  let completed = false;
+  let tail = '';
+  return {
+    observe(chunk) {
+      if (completed) {
+        return;
+      }
+
+      tail = `${tail}${chunk.toString('utf8')}`;
+      if (tail.includes(RESPONSES_COMPLETED_EVENT)) {
+        completed = true;
+        tail = '';
+        return;
+      }
+
+      tail = tail.slice(-RESPONSES_COMPLETED_EVENT.length);
+    },
+    getIncompleteError() {
+      if (completed) {
+        return null;
+      }
+      return {
+        statusCode: null,
+        message: INCOMPLETE_RESPONSES_STREAM_ERROR,
+        detail: 'Upstream text/event-stream ended before a response.completed event.',
+        affectsSiteHealth: true
+      };
+    }
+  };
+}
+
+function isResponsesStreamRequest(req, upstreamRes) {
+  return (
+    isResponsesPath(req.url) &&
+    normalizeHeaderValue(upstreamRes.headers['content-type']) === 'text/event-stream'
+  );
+}
+
+function isResponsesPath(value) {
+  return parseRequestUrl(value).pathname.endsWith('/responses');
 }
 
 function shouldSendReplayableBody(req, requestBody) {

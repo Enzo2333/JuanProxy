@@ -9,7 +9,7 @@ async function listen(server) {
   return server.address().port;
 }
 
-test('tests a site with a minimal responses request', async () => {
+test('tests a site with a responses request compatible with stricter relays', async () => {
   let observed = null;
   const server = http.createServer((req, res) => {
     let body = '';
@@ -41,6 +41,7 @@ test('tests a site with a minimal responses request', async () => {
     assert.equal(observed.url, '/v1/responses');
     assert.equal(observed.authorization, 'Bearer sk-test');
     assert.equal(observed.body.model, 'gpt-test');
+    assert.equal(observed.body.instructions, 'Reply briefly.');
     assert.equal(observed.body.input, 'Hi');
     assert.equal(observed.body.max_output_tokens, 1);
     assert.equal(observed.body.stream, false);

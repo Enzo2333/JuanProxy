@@ -76,10 +76,10 @@ test('records failure details and resets consecutive errors on success', () => {
   assert.equal(recovered.lastSuccess.statusCode, 200);
 });
 
-test('records request-scoped failures without adding site health penalty', () => {
+test('records non-upstream request failures without adding site health penalty', () => {
   const failed = recordRequestFailure(
     site({ id: 'a', name: 'a', priority: 1 }),
-    { statusCode: 503, message: 'model not found' },
+    { message: 'client request failed before upstream selection' },
     new Date('2026-06-03T08:00:00.000Z')
   );
 

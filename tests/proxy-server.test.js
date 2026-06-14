@@ -290,6 +290,87 @@ test('rewrites chunked JSON request models before streaming upstream responses',
   }
 });
 
+test('records incomplete responses streams as site health failures', async () => {
+  const upstream = await createUpstream((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('data: {"type":"response.output_text.delta","delta":"hello"}\n\n');
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-incomplete-responses-stream-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ failureThreshold: 0 });
+    const site = await config.addSite({ name: 'primary', baseUrl: upstream.baseUrl, apiKey: 'sk-proxy' });
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-5',
+      input: 'hello',
+      stream: true
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(text, /response\.output_text\.delta/);
+
+    const updated = config.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(updated.failureDisabled, true);
+    assert.equal(updated.enabled, false);
+    assert.equal(updated.consecutiveErrors, 1);
+    assert.equal(updated.errorCount, 1);
+    assert.equal(updated.lastError.statusCode, null);
+    assert.equal(updated.lastError.affectsSiteHealth, true);
+    assert.equal(
+      updated.lastError.message,
+      'stream disconnected before completion: stream closed before response.completed'
+    );
+  } finally {
+    await proxy.stop();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeps completed responses streams as successful site requests', async () => {
+  const upstream = await createUpstream((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('data: {"type":"response.output_text.delta","delta":"hello"}\n\n');
+    res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n');
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-completed-responses-stream-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    const site = await config.addSite({ name: 'primary', baseUrl: upstream.baseUrl, apiKey: 'sk-proxy' });
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-5',
+      input: 'hello',
+      stream: true
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(text, /response\.completed/);
+
+    const updated = config.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(updated.status, 'success');
+    assert.equal(updated.failureDisabled, false);
+    assert.equal(updated.consecutiveErrors, 0);
+    assert.equal(updated.successCount, 1);
+    assert.equal(updated.errorCount, 0);
+  } finally {
+    await proxy.stop();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('strips trailing v1 from upstream base URL for Codex backend API paths', () => {
   const target = composeTargetUrl(
     'https://upstream.example/v1',
@@ -297,6 +378,15 @@ test('strips trailing v1 from upstream base URL for Codex backend API paths', ()
   );
 
   assert.equal(target.href, 'https://upstream.example/backend-api/codex/responses?stream=true');
+});
+
+test('replaces the local v1 prefix with the complete upstream base URL path', () => {
+  const target = composeTargetUrl(
+    'https://upstream.example/codex',
+    '/v1/responses?stream=true'
+  );
+
+  assert.equal(target.href, 'https://upstream.example/codex/responses?stream=true');
 });
 
 test('uses the unified configured timeout for compact requests', () => {
@@ -507,7 +597,7 @@ test('retries a failed upstream response on another site within the same client 
   }
 });
 
-test('does not retry or disable sites for request-scoped upstream errors', async () => {
+test('retries and disables sites for upstream HTTP errors', async () => {
   let firstRequests = 0;
   let secondRequests = 0;
   const modelError = {
@@ -555,24 +645,162 @@ test('does not retry or disable sites for request-scoped upstream errors', async
       input: 'hello'
     });
 
-    assert.equal(response.status, 503);
-    assert.deepEqual(JSON.parse(text), modelError);
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true, upstream: 'second' });
     assert.equal(firstRequests, 1);
-    assert.equal(secondRequests, 0);
+    assert.equal(secondRequests, 1);
 
     const state = config.getState();
     const updatedFirst = state.sites.find((site) => site.id === firstSite.id);
     const updatedSecond = state.sites.find((site) => site.id === secondSite.id);
-    assert.equal(updatedFirst.failureDisabled, false);
-    assert.equal(updatedFirst.consecutiveErrors, 0);
+    assert.equal(updatedFirst.failureDisabled, true);
+    assert.equal(updatedFirst.enabled, false);
+    assert.equal(updatedFirst.consecutiveErrors, 1);
     assert.equal(updatedFirst.errorCount, 1);
     assert.equal(updatedFirst.lastError.statusCode, 503);
-    assert.equal(updatedSecond.status, 'idle');
-    assert.equal(state.activeSiteId, firstSite.id);
+    assert.equal(updatedFirst.lastError.affectsSiteHealth, true);
+    assert.equal(updatedSecond.status, 'success');
+    assert.equal(state.activeSiteId, secondSite.id);
   } finally {
     await proxy.stop();
     await first.close();
     await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('retries and disables sites for upstream feature permission errors', async () => {
+  let firstRequests = 0;
+  let secondRequests = 0;
+  const imagePermissionError = {
+    error: {
+      message: 'Image generation is not enabled for this group',
+      type: 'permission_error'
+    }
+  };
+  const first = await createUpstream((_req, res) => {
+    firstRequests += 1;
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(imagePermissionError));
+  });
+  const second = await createUpstream((_req, res) => {
+    secondRequests += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'second' }));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-feature-permission-no-failover-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ failureThreshold: 0 });
+    const firstSite = await config.addSite({
+      name: 'first',
+      baseUrl: first.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    const secondSite = await config.addSite({
+      name: 'second',
+      baseUrl: second.baseUrl,
+      apiKey: 'sk-second',
+      priority: 2
+    });
+    await config.setActiveSite(firstSite.id);
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/images/generations`, {
+      model: 'gpt-image-2',
+      prompt: 'test image'
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true, upstream: 'second' });
+    assert.equal(firstRequests, 1);
+    assert.equal(secondRequests, 1);
+
+    const state = config.getState();
+    const updatedFirst = state.sites.find((site) => site.id === firstSite.id);
+    const updatedSecond = state.sites.find((site) => site.id === secondSite.id);
+    assert.equal(updatedFirst.failureDisabled, true);
+    assert.equal(updatedFirst.enabled, false);
+    assert.equal(updatedFirst.consecutiveErrors, 1);
+    assert.equal(updatedFirst.errorCount, 1);
+    assert.equal(updatedFirst.lastError.statusCode, 403);
+    assert.equal(updatedFirst.lastError.affectsSiteHealth, true);
+    assert.equal(updatedSecond.status, 'success');
+    assert.equal(state.activeSiteId, secondSite.id);
+  } finally {
+    await proxy.stop();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('emits sanitized request diagnostics for upstream errors', async () => {
+  const errorPayload = {
+    error: {
+      message: 'Image generation is not enabled for this group',
+      type: 'permission_error'
+    }
+  };
+  const upstream = await createUpstream((_req, res) => {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(errorPayload));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-error-diagnostics-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+  const completedEvents = [];
+  proxy.on('request-complete', (event) => completedEvents.push(event));
+
+  try {
+    await config.load();
+    await config.updateModelMapping({
+      enabled: true,
+      mappings: [{ from: 'client-image-model', to: 'gpt-image-2' }]
+    });
+    const site = await config.addSite({
+      name: 'first',
+      baseUrl: upstream.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    await config.setActiveSite(site.id);
+    const port = await proxy.start(0);
+
+    const { response } = await postJson(`http://127.0.0.1:${port}/v1/images/generations?api_key=client-secret`, {
+      model: 'client-image-model',
+      prompt: 'test image',
+      apiKey: 'body-secret'
+    });
+
+    assert.equal(response.status, 403);
+    assert.deepEqual(completedEvents, [
+      {
+        siteId: site.id,
+        statusCode: 403,
+        request: {
+          id: completedEvents[0].request.id,
+          method: 'POST',
+          path: '/v1/images/generations',
+          queryKeys: ['api_key'],
+          contentType: 'application/json',
+          replayable: true,
+          originalModel: 'client-image-model',
+          forwardedModel: 'gpt-image-2',
+          modelMapped: true
+        }
+      }
+    ]);
+    assert.match(completedEvents[0].request.id, /^[0-9a-f-]{36}$/);
+  } finally {
+    await proxy.stop();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -14,6 +14,7 @@ export async function testSiteAvailability(site, { timeoutMs = 30000 } = {}) {
       },
       body: JSON.stringify({
         model: site.testModel?.trim() || DEFAULT_TEST_MODEL,
+        instructions: 'Reply briefly.',
         input: 'Hi',
         max_output_tokens: 1,
         stream: false

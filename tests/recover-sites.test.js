@@ -78,7 +78,7 @@ test('enables every passing non-manual site when every usable site is disabled',
   }
 });
 
-test('does not add health failures for request-scoped availability test errors', async () => {
+test('adds health failures for availability test HTTP errors', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-recover-request-error-'));
   const config = new ConfigService({ filePath: join(dir, 'config.json') });
 
@@ -113,10 +113,10 @@ test('does not add health failures for request-scoped availability test errors',
     assert.deepEqual(result.enabledSites, []);
     assert.deepEqual(result.failedSites.map((failedSite) => failedSite.id), [site.id]);
     assert.equal(after.failureDisabled, true);
-    assert.equal(after.consecutiveErrors, before.consecutiveErrors);
-    assert.equal(after.errorCount, before.errorCount);
-    assert.equal(after.autoRecoveryState.lastResult, 'failure');
-    assert.equal(after.autoRecoveryState.lastMessage, 'Availability test failed HTTP 400');
+    assert.equal(after.consecutiveErrors, before.consecutiveErrors + 1);
+    assert.equal(after.errorCount, before.errorCount + 1);
+    assert.equal(after.lastError.statusCode, 400);
+    assert.equal(after.lastError.affectsSiteHealth, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
