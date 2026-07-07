@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, screen } from 'electron';
 
 import { APP_DISPLAY_NAME, APP_ID, selectUserDataPath } from './app-identity.js';
 import { ConfigService } from './proxy/config-service.js';
@@ -14,6 +14,7 @@ import { detectSiteCapabilities } from './proxy/site-capabilities.js';
 import { startProxyWithFallback } from './proxy/start-proxy-with-fallback.js';
 import { testConfiguredSite } from './proxy/site-actions.js';
 import {
+  createConfiguredSiteKey,
   switchConfiguredSiteGroup,
   syncAllConfiguredSites,
   syncConfiguredSite
@@ -31,6 +32,10 @@ if (process.platform === 'win32') {
 }
 
 let mainWindow = null;
+let floatingWindow = null;
+let floatingWindowCompactBounds = null;
+let floatingWindowPositionSaveTimer = null;
+let pendingFloatingWindowPosition = null;
 let configService = null;
 let proxyServer = null;
 let autoRecoveryScheduler = null;
@@ -65,8 +70,72 @@ async function createWindow() {
 
   trackWindowSize(mainWindow);
   trackWindowRuntimeErrors(mainWindow);
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    if (!quitting && process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
 
   await mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
+}
+
+async function createFloatingWindow() {
+  if (floatingWindow && !floatingWindow.isDestroyed()) {
+    return floatingWindow;
+  }
+
+  const width = 92;
+  const height = 92;
+  const initialBounds = getInitialFloatingWindowBounds(width, height);
+  floatingWindowCompactBounds = initialBounds;
+  floatingWindow = new BrowserWindow({
+    width,
+    height,
+    x: initialBounds.x,
+    y: initialBounds.y,
+    minWidth: 92,
+    minHeight: 92,
+    maxWidth: 380,
+    maxHeight: 320,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    skipTaskbar: true,
+    show: false,
+    title: `${APP_DISPLAY_NAME} 悬浮窗`,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    alwaysOnTop: getFloatingWindowAlwaysOnTop(),
+    webPreferences: {
+      preload: join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+
+  trackWindowRuntimeErrors(floatingWindow);
+  floatingWindow.on('closed', () => {
+    if (!quitting) {
+      logRuntimeError('floating-window.closed', new Error('Floating window was closed'));
+    }
+    floatingWindow = null;
+  });
+  applyFloatingWindowSettings();
+  try {
+    await floatingWindow.loadFile(join(__dirname, 'renderer', 'floating.html'));
+  } catch (error) {
+    await logRuntimeError('floating-window.load-failed', error);
+    if (!floatingWindow.isDestroyed()) {
+      floatingWindow.destroy();
+    }
+    throw error;
+  }
+  if (!floatingWindow.isDestroyed()) {
+    floatingWindow.showInactive();
+  }
+  return floatingWindow;
 }
 
 async function bootstrap() {
@@ -129,7 +198,8 @@ async function bootstrap() {
         new Error(`Upstream returned HTTP ${event.statusCode}`),
         {
           siteId: event.siteId,
-          statusCode: event.statusCode
+          statusCode: event.statusCode,
+          request: event.request
         }
       );
     }
@@ -156,6 +226,7 @@ async function bootstrap() {
 
   registerIpc();
   await createWindow();
+  await createFloatingWindow();
 }
 
 function trackWindowSize(window) {
@@ -288,6 +359,20 @@ function registerIpc() {
       }
     };
   });
+  handleLogged('site:create-key', async (_event, id) => {
+    const createKeyResult = await createConfiguredSiteKey({ configService, siteId: id });
+    return {
+      ...buildState(),
+      createKeyResult: {
+        ok: createKeyResult.ok,
+        multiplier: createKeyResult.multiplier,
+        keyName: createKeyResult.keyName,
+        error: createKeyResult.error ? {
+          message: createKeyResult.error.message ?? String(createKeyResult.error)
+        } : null
+      }
+    };
+  });
   handleLogged('site:detect-capabilities', async (_event, id) => {
     const site = configService.findSite(id);
     const capabilityResult = await detectSiteCapabilities(site, {
@@ -311,8 +396,12 @@ function registerIpc() {
       }
     };
   });
-  handleLogged('site:switch-group', async (_event, id, groupName) => {
-    await switchConfiguredSiteGroup({ configService, siteId: id, groupName });
+  handleLogged('site:switch-group', async (_event, id, group) => {
+    await switchConfiguredSiteGroup({
+      configService,
+      siteId: id,
+      ...normalizeIpcSwitchGroup(group)
+    });
     return buildState();
   });
   handleLogged('site-sync:refresh-all', async () => {
@@ -353,6 +442,20 @@ function registerIpc() {
   handleLogged('model-mapping:update', async (_event, patch) => {
     await configService.updateModelMapping(patch);
     return buildState();
+  });
+  handleLogged('app-settings:update', async (_event, patch) => {
+    await configService.updateAppSettings(patch);
+    applyFloatingWindowSettings();
+    return buildState();
+  });
+  handleLogged('floating-window:set-expanded', (_event, expanded) => {
+    setFloatingWindowExpanded(Boolean(expanded));
+    return getFloatingWindowBounds();
+  });
+  handleLogged('floating-window:get-bounds', () => getFloatingWindowBounds());
+  handleLogged('floating-window:set-bounds', (_event, bounds) => {
+    setFloatingWindowBounds(bounds);
+    return getFloatingWindowBounds();
   });
   handleLogged('config-export:save', async (_event, options = {}) => {
     const exportPayload = configService.exportConfig({
@@ -447,6 +550,18 @@ function normalizeOptionalIpcSiteIds(siteIds) {
   return Array.isArray(siteIds) ? siteIds.map((id) => String(id)) : [String(siteIds)];
 }
 
+function normalizeIpcSwitchGroup(group) {
+  if (group && typeof group === 'object' && !Array.isArray(group)) {
+    return {
+      groupName: String(group.groupName ?? group.name ?? '').trim(),
+      groupId: String(group.groupId ?? group.id ?? '').trim()
+    };
+  }
+  return {
+    groupName: String(group ?? '').trim()
+  };
+}
+
 function createConfigExportFileName(now = new Date()) {
   const pad = (part) => String(part).padStart(2, '0');
   const stamp = [
@@ -509,15 +624,15 @@ function broadcastSitePatch(siteId) {
 }
 
 function sendState() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return;
-  }
-  mainWindow.webContents.send('state:changed', buildState());
+  sendToRendererWindows('state:changed', buildState());
 }
 
 function sendSitePatches() {
   pendingSitePatchTimer = null;
-  if (!mainWindow || mainWindow.isDestroyed()) {
+  if (
+    (!mainWindow || mainWindow.isDestroyed()) &&
+    (!floatingWindow || floatingWindow.isDestroyed())
+  ) {
     pendingSitePatchIds.clear();
     return;
   }
@@ -529,12 +644,167 @@ function sendSitePatches() {
     if (!site) {
       continue;
     }
-    mainWindow.webContents.send('site:changed', {
+    sendToRendererWindows('site:changed', {
       site,
       activeSiteId: configService.getActiveSiteId(),
       proxyStatus: proxyServer.getStatus()
     });
   }
+}
+
+function sendToRendererWindows(channel, payload) {
+  for (const window of [mainWindow, floatingWindow]) {
+    if (!window || window.isDestroyed()) {
+      continue;
+    }
+    window.webContents.send(channel, payload);
+  }
+}
+
+function getFloatingWindowAlwaysOnTop() {
+  return Boolean(configService?.getState()?.appSettings?.floatingWindow?.alwaysOnTop);
+}
+
+function applyFloatingWindowSettings() {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    return;
+  }
+  const alwaysOnTop = getFloatingWindowAlwaysOnTop();
+  try {
+    if (alwaysOnTop) {
+      floatingWindow.setAlwaysOnTop(true, 'screen-saver');
+    } else {
+      floatingWindow.setAlwaysOnTop(false);
+    }
+  } catch (error) {
+    logRuntimeError('floating-window.always-on-top-failed', error, { alwaysOnTop });
+  }
+  try {
+    floatingWindow.setVisibleOnAllWorkspaces(alwaysOnTop, {
+      visibleOnFullScreen: alwaysOnTop
+    });
+  } catch (error) {
+    logRuntimeError('floating-window.workspace-visibility-failed', error, { alwaysOnTop });
+  }
+}
+
+function getInitialFloatingWindowBounds(width, height) {
+  const savedPosition = configService?.getState()?.appSettings?.floatingWindow?.position;
+  if (savedPosition) {
+    return keepBoundsInDisplay({
+      width,
+      height,
+      x: savedPosition.x,
+      y: savedPosition.y
+    });
+  }
+
+  const workArea = screen.getPrimaryDisplay().workArea;
+  return {
+    width,
+    height,
+    x: workArea.x + workArea.width - width - 18,
+    y: workArea.y + workArea.height - height - 18
+  };
+}
+
+function setFloatingWindowExpanded(expanded) {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    return;
+  }
+  const bounds = floatingWindow.getBounds();
+  if (!expanded) {
+    const nextCompactBounds = keepBoundsInDisplay({
+      ...(floatingWindowCompactBounds ?? bounds),
+      width: 92,
+      height: 92
+    });
+    floatingWindowCompactBounds = nextCompactBounds;
+    floatingWindow.setBounds(nextCompactBounds);
+    return;
+  }
+
+  if (bounds.width <= 120 && bounds.height <= 120) {
+    floatingWindowCompactBounds = bounds;
+  }
+  const nextBounds = keepBoundsInDisplay({
+    ...(floatingWindowCompactBounds ?? bounds),
+    width: 360,
+    height: 300
+  });
+  floatingWindow.setBounds(nextBounds);
+}
+
+function getFloatingWindowBounds() {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    return null;
+  }
+  return floatingWindow.getBounds();
+}
+
+function setFloatingWindowBounds(bounds = {}) {
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    return;
+  }
+  const current = floatingWindow.getBounds();
+  const nextBounds = keepBoundsInDisplay({
+    ...current,
+    x: Number.isFinite(Number(bounds.x)) ? Math.round(Number(bounds.x)) : current.x,
+    y: Number.isFinite(Number(bounds.y)) ? Math.round(Number(bounds.y)) : current.y
+  });
+  floatingWindowCompactBounds = {
+    ...nextBounds,
+    width: 92,
+    height: 92
+  };
+  floatingWindow.setBounds(nextBounds);
+  scheduleFloatingWindowPositionSave(floatingWindowCompactBounds);
+}
+
+function keepBoundsInDisplay(bounds) {
+  const display = screen.getDisplayMatching(bounds);
+  const workArea = display.workArea;
+  const width = Math.max(92, Math.min(380, Math.round(Number(bounds.width) || 92)));
+  const height = Math.max(92, Math.min(320, Math.round(Number(bounds.height) || 92)));
+  return {
+    width,
+    height,
+    x: Math.min(Math.max(Math.round(Number(bounds.x) || workArea.x), workArea.x), workArea.x + workArea.width - width),
+    y: Math.min(Math.max(Math.round(Number(bounds.y) || workArea.y), workArea.y), workArea.y + workArea.height - height)
+  };
+}
+
+function scheduleFloatingWindowPositionSave(bounds) {
+  pendingFloatingWindowPosition = bounds;
+  clearTimeout(floatingWindowPositionSaveTimer);
+  floatingWindowPositionSaveTimer = setTimeout(() => {
+    floatingWindowPositionSaveTimer = null;
+    flushFloatingWindowPositionSave().catch((error) => {
+      logRuntimeError('floating-window.position-save-failed', error);
+    });
+  }, 250);
+}
+
+async function flushFloatingWindowPositionSave() {
+  clearTimeout(floatingWindowPositionSaveTimer);
+  floatingWindowPositionSaveTimer = null;
+  const bounds = pendingFloatingWindowPosition;
+  pendingFloatingWindowPosition = null;
+  await saveFloatingWindowPosition(bounds);
+}
+
+async function saveFloatingWindowPosition(bounds) {
+  if (!configService || !bounds) {
+    return;
+  }
+  await configService.updateAppSettings({
+    floatingWindow: {
+      position: {
+        x: bounds.x,
+        y: bounds.y
+      }
+    }
+  });
 }
 
 function createLoggerBridge(source) {
@@ -589,9 +859,14 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow().catch((error) => {
       reportRuntimeError('app.activate', error);
+    });
+  }
+  if (!floatingWindow || floatingWindow.isDestroyed()) {
+    createFloatingWindow().catch((error) => {
+      reportRuntimeError('app.activate-floating', error);
     });
   }
 });
@@ -611,6 +886,7 @@ app.on('before-quit', async (event) => {
       pendingSitePatchIds.clear();
     }
     stateBroadcaster?.flush();
+    await flushFloatingWindowPositionSave();
     await configService?.flush();
     if (proxyServer?.getStatus().running) {
       await proxyServer.stop();

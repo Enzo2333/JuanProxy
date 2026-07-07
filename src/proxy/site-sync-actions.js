@@ -1,4 +1,5 @@
 import {
+  loginAndCreateSiteKey,
   loginAndFetchSiteSync,
   loginAndSwitchSiteGroup
 } from './site-sync-service.js';
@@ -29,7 +30,7 @@ export async function syncConfiguredSite({
     sync: syncPatch
   };
 
-  if (Number.isFinite(result.multiplier) && result.multiplier >= 0) {
+  if (shouldUpdateSiteMultiplier(site, result.multiplier)) {
     patch.multiplier = result.multiplier;
   }
 
@@ -52,38 +53,53 @@ export async function syncGroupWebsite({
     throw new Error(`Group sync representative site not found: ${websiteKey}`);
   }
 
-  const result = await fetchRemoteSync({
-    sync: representativeSite.sync,
-    apiKey: representativeSite.apiKey
-  });
+  const candidates = configService.getGroupSyncWebsiteSites(websiteKey);
+  let lastFailure = null;
+  let lastRepresentativeSite = representativeSite;
 
-  if (!result.ok) {
-    await configService.recordGroupSyncFailure(
+  for (const candidate of candidates) {
+    const result = await fetchRemoteSync({
+      sync: candidate.sync,
+      apiKey: candidate.apiKey
+    });
+
+    if (!result.ok) {
+      lastFailure = result;
+      lastRepresentativeSite = candidate;
+      continue;
+    }
+
+    const affectedSites = await configService.recordGroupSyncSuccess(
       websiteKey,
-      result.error ?? new Error(result.syncPatch?.lastSyncError ?? 'Remote group sync failed'),
-      { representativeSiteId: representativeSite.id },
+      result,
+      { representativeSiteId: candidate.id },
       now
     );
     return {
       ...result,
       website: configService.findGroupSyncWebsite(websiteKey),
-      representativeSite,
+      representativeSite: candidate,
+      affectedSites
+    };
+  }
+
+  if (lastFailure) {
+    await configService.recordGroupSyncFailure(
+      websiteKey,
+      lastFailure.error ??
+        new Error(lastFailure.syncPatch?.lastSyncError ?? 'Remote group sync failed'),
+      { representativeSiteId: lastRepresentativeSite.id },
+      now
+    );
+    return {
+      ...lastFailure,
+      website: configService.findGroupSyncWebsite(websiteKey),
+      representativeSite: lastRepresentativeSite,
       affectedSites: []
     };
   }
 
-  const affectedSites = await configService.recordGroupSyncSuccess(
-    websiteKey,
-    result,
-    { representativeSiteId: representativeSite.id },
-    now
-  );
-  return {
-    ...result,
-    website: configService.findGroupSyncWebsite(websiteKey),
-    representativeSite,
-    affectedSites
-  };
+  throw new Error(`Group sync representative site not found: ${websiteKey}`);
 }
 
 export async function syncAllConfiguredSites({
@@ -142,10 +158,48 @@ export async function syncAllConfiguredSites({
   };
 }
 
+export async function createConfiguredSiteKey({
+  configService,
+  siteId,
+  createRemoteKey = loginAndCreateSiteKey
+}) {
+  if (!configService) {
+    throw new Error('configService is required');
+  }
+
+  const site = configService.findSite(siteId);
+  const result = await createRemoteKey({
+    sync: site.sync,
+    name: site.name || 'JuanProxy sync'
+  });
+  const syncPatch = {
+    ...site.sync,
+    ...result.syncPatch,
+    remote: {
+      ...site.sync.remote,
+      ...(result.syncPatch?.remote ?? {})
+    }
+  };
+  const patch = {
+    sync: syncPatch
+  };
+
+  if (result.ok && result.apiKey) {
+    patch.apiKey = result.apiKey;
+  }
+  if (shouldUpdateSiteMultiplier(site, result.multiplier)) {
+    patch.multiplier = result.multiplier;
+  }
+
+  await configService.updateSite(siteId, patch);
+  return result;
+}
+
 export async function switchConfiguredSiteGroup({
   configService,
   siteId,
   groupName,
+  groupId,
   switchRemoteGroup = loginAndSwitchSiteGroup
 }) {
   if (!configService) {
@@ -154,14 +208,27 @@ export async function switchConfiguredSiteGroup({
 
   const site = configService.findSite(siteId);
   const normalizedGroupName = String(groupName ?? '').trim();
-  if (!normalizedGroupName) {
-    throw new Error('groupName is required');
+  const normalizedGroupId = String(groupId ?? '').trim();
+  if (!normalizedGroupName && !normalizedGroupId) {
+    throw new Error('groupName or groupId is required');
   }
 
   const groups = Array.isArray(site.sync?.remote?.groups)
     ? site.sync.remote.groups
     : [];
-  const selectedGroup = groups.find((group) => group.name === normalizedGroupName);
+  const selectedGroup = groups.find((group) =>
+    (normalizedGroupId && String(group.id ?? '').trim() === normalizedGroupId) ||
+    (normalizedGroupName && group.name === normalizedGroupName)
+  ) ?? (
+    normalizedGroupId
+      ? {
+          id: normalizedGroupId,
+          name: normalizedGroupName || normalizedGroupId,
+          multiplier: null,
+          selected: true
+        }
+      : null
+  );
   if (!selectedGroup) {
     throw new Error(`Synced group not found: ${normalizedGroupName}`);
   }
@@ -184,15 +251,28 @@ export async function switchConfiguredSiteGroup({
     throw result.error ?? new Error(result.syncPatch?.lastSyncError ?? 'Remote group switch failed');
   }
 
+  const nextRemotePatch = result.syncPatch?.remote ?? {};
+  const nextGroupId = pickFirstString(nextRemotePatch.groupId, selectedGroup.id, site.sync.remote.groupId);
+  const nextKeyGroup = pickFirstString(nextRemotePatch.keyGroup, selectedGroup.name, site.sync.remote.keyGroup);
+  const nextGroups = normalizeRemoteGroupsAfterSwitch(
+    nextRemotePatch.groups ?? groups,
+    {
+      ...selectedGroup,
+      id: nextGroupId,
+      name: nextKeyGroup
+    }
+  );
   const nextRemote = {
     ...site.sync.remote,
-    ...(result.syncPatch?.remote ?? {}),
-    keyGroup: selectedGroup.name,
-    groupMultiplier: selectedGroup.multiplier,
-    groups: normalizeRemoteGroupsAfterSwitch(
-      result.syncPatch?.remote?.groups ?? groups,
-      selectedGroup
-    )
+    ...nextRemotePatch,
+    keyGroup: nextKeyGroup,
+    groupId: nextGroupId,
+    groupMultiplier: Number.isFinite(result.multiplier) && result.multiplier >= 0
+      ? result.multiplier
+      : Number.isFinite(selectedGroup.multiplier)
+        ? selectedGroup.multiplier
+        : nextRemotePatch.groupMultiplier,
+    groups: nextGroups
   };
   const patch = {
     sync: {
@@ -205,11 +285,15 @@ export async function switchConfiguredSiteGroup({
   const nextMultiplier = Number.isFinite(result.multiplier) && result.multiplier >= 0
     ? result.multiplier
     : selectedGroup.multiplier;
-  if (Number.isFinite(nextMultiplier) && nextMultiplier >= 0) {
+  if (shouldUpdateSiteMultiplier(site, nextMultiplier)) {
     patch.multiplier = nextMultiplier;
   }
 
   return configService.updateSite(siteId, patch);
+}
+
+function shouldUpdateSiteMultiplier(site, multiplier) {
+  return !site?.multiplierLocked && Number.isFinite(multiplier) && multiplier >= 0;
 }
 
 function pushUniqueSites(target, sites = []) {
@@ -221,6 +305,19 @@ function pushUniqueSites(target, sites = []) {
     seen.add(site.id);
     target.push(site);
   }
+}
+
+function pickFirstString(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+    const text = String(value).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return '';
 }
 
 function normalizeRemoteGroupsAfterSwitch(groups, selectedGroup) {

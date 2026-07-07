@@ -21,33 +21,45 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 const ERROR_SNIPPET_LIMIT = 1000;
-const DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES = 64 * 1024;
+const DEFAULT_MAX_BUFFERED_RETRYABLE_ERROR_BODY_BYTES = 1024 * 1024;
 const INCOMPLETE_RESPONSES_STREAM_ERROR =
   'stream disconnected before completion: stream closed before response.completed';
 const RESPONSES_COMPLETED_EVENT = 'response.completed';
 
 export class OpenApiProxyServer extends EventEmitter {
-  constructor({
-    configService,
-    timeoutMs = 120000,
-    siteTester = testSiteAvailability,
-    siteSyncPreheater = syncLikelySiteSyncSites,
-    logger = console,
-    maxReplayableRequestBodyBytes = DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES,
-    maxBufferedErrorBodyBytes = DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES
-  }) {
+  constructor(options = {}) {
+    const {
+      configService,
+      timeoutMs = 120000,
+      siteTester = testSiteAvailability,
+      siteSyncPreheater = syncLikelySiteSyncSites,
+      logger = console,
+      maxReplayableRequestBodyBytes,
+      maxBufferedErrorBodyBytes = DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES,
+      maxBufferedRetryableErrorBodyBytes = DEFAULT_MAX_BUFFERED_RETRYABLE_ERROR_BODY_BYTES
+    } = options;
     super();
     if (!configService) {
       throw new Error('configService is required');
     }
+    const hasMaxReplayableRequestBodyBytes = Object.hasOwn(
+      options,
+      'maxReplayableRequestBodyBytes'
+    );
     this.configService = configService;
     this.timeoutMs = timeoutMs;
     this.siteTester = siteTester;
     this.siteSyncPreheater = siteSyncPreheater;
     this.logger = logger;
-    this.maxReplayableRequestBodyBytes = maxReplayableRequestBodyBytes;
+    this.useConfiguredMaxReplayableRequestBodyBytes = !hasMaxReplayableRequestBodyBytes;
+    this.maxReplayableRequestBodyBytes = normalizeByteLimit(
+      maxReplayableRequestBodyBytes,
+      DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES
+    );
     this.maxBufferedErrorBodyBytes = maxBufferedErrorBodyBytes;
+    this.maxBufferedRetryableErrorBodyBytes = maxBufferedRetryableErrorBodyBytes;
     this.server = null;
     this.port = null;
     this.error = null;
@@ -148,15 +160,17 @@ export class OpenApiProxyServer extends EventEmitter {
       return;
     }
 
-    const requestBody = await prepareRequestBody(req, this.maxReplayableRequestBodyBytes);
+    const requestBody = await prepareRequestBody(req, this.getMaxReplayableRequestBodyBytes());
     const requestDiagnostics = createRequestDiagnostics(req, requestBody);
     const attemptedSiteIds = new Set();
     let lastFailure = null;
+    let requestLocalSelection = false;
 
     while (!res.headersSent) {
       const site = await this.resolveActiveSite({
         excludeSiteIds: attemptedSiteIds,
-        allowRecovery: attemptedSiteIds.size === 0
+        allowRecovery: attemptedSiteIds.size === 0,
+        persistSelection: !requestLocalSelection
       });
       if (!site) {
         if (lastFailure) {
@@ -189,6 +203,9 @@ export class OpenApiProxyServer extends EventEmitter {
       if (!requestBody.replayable || result.retryable === false) {
         this.sendForwardFailure(res, lastFailure);
         return;
+      }
+      if (result.requestLocalRetry) {
+        requestLocalSelection = true;
       }
     }
   }
@@ -315,13 +332,24 @@ export class OpenApiProxyServer extends EventEmitter {
 
         if (statusCode >= 400) {
           const contentLength = parseContentLength(upstreamRes.headers['content-length']);
+          const shouldDrainForRetry = outboundRequestBody.replayable && statusCode === 429;
+          const errorResponseBufferLimit = getErrorResponseBufferLimit(
+            statusCode,
+            this.maxBufferedErrorBodyBytes,
+            this.maxBufferedRetryableErrorBodyBytes
+          );
           const streamDirectly =
             !outboundRequestBody.replayable ||
-            (contentLength !== null && contentLength > this.maxBufferedErrorBodyBytes);
+            (
+              !shouldDrainForRetry &&
+              contentLength !== null &&
+              contentLength > errorResponseBufferLimit
+            );
           const chunks = [];
           let errorSnippet = '';
           let bufferedBytes = 0;
           let streamingToClient = streamDirectly;
+          let dropBufferedBody = false;
 
           if (streamingToClient) {
             responseStarted = true;
@@ -336,8 +364,14 @@ export class OpenApiProxyServer extends EventEmitter {
 
             if (
               !streamingToClient &&
-              bufferedBytes > this.maxBufferedErrorBodyBytes
+              bufferedBytes > errorResponseBufferLimit
             ) {
+              if (shouldDrainForRetry) {
+                dropBufferedBody = true;
+                chunks.length = 0;
+                return;
+              }
+
               streamingToClient = true;
               responseStarted = true;
               res.writeHead(statusCode, responseHeaders);
@@ -349,7 +383,7 @@ export class OpenApiProxyServer extends EventEmitter {
 
             if (streamingToClient) {
               res.write(chunk);
-            } else {
+            } else if (!dropBufferedBody) {
               chunks.push(chunk);
             }
           });
@@ -393,7 +427,8 @@ export class OpenApiProxyServer extends EventEmitter {
                   statusCode,
                   headers: responseHeaders,
                   body: responseBody,
-                  retryable: classification.retryable
+                  retryable: classification.retryable,
+                  requestLocalRetry: Boolean(classification.requestLocalRetry)
                 });
               });
           });
@@ -520,6 +555,16 @@ export class OpenApiProxyServer extends EventEmitter {
 
   getConfiguredTimeoutMs() {
     return this.configService.getProxyTimeoutMs() ?? this.timeoutMs;
+  }
+
+  getMaxReplayableRequestBodyBytes() {
+    if (!this.useConfiguredMaxReplayableRequestBodyBytes) {
+      return this.maxReplayableRequestBodyBytes;
+    }
+    return normalizeByteLimit(
+      this.configService.getMaxReplayableRequestBodyBytes?.(),
+      this.maxReplayableRequestBodyBytes
+    );
   }
 
   hasTemporarilyUnavailableEnabledSites() {
@@ -708,6 +753,23 @@ function isSiteNotFoundError(error, siteId) {
 
 function trimSnippet(value) {
   return value.length > ERROR_SNIPPET_LIMIT ? value.slice(0, ERROR_SNIPPET_LIMIT) : value;
+}
+
+function getErrorResponseBufferLimit(statusCode, defaultLimit, retryableLimit) {
+  const baseLimit = normalizeByteLimit(defaultLimit, DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES);
+  if (Number(statusCode) !== 429) {
+    return baseLimit;
+  }
+
+  return Math.max(
+    baseLimit,
+    normalizeByteLimit(retryableLimit, DEFAULT_MAX_BUFFERED_RETRYABLE_ERROR_BODY_BYTES)
+  );
+}
+
+function normalizeByteLimit(value, fallback) {
+  const limit = Number(value);
+  return Number.isFinite(limit) && limit > 0 ? limit : fallback;
 }
 
 function formatStatusError(error) {

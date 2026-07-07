@@ -112,6 +112,69 @@ export async function loginAndSwitchSiteGroup({
   }
 }
 
+export async function loginAndCreateSiteKey({
+  sync,
+  name,
+  fetch: fetchImpl = globalThis.fetch,
+  now = new Date(),
+  timeoutMs = 30000
+} = {}) {
+  if (!fetchImpl) {
+    throw new Error('fetch is required');
+  }
+
+  const startedAt = nowIso(now);
+  try {
+    const normalized = normalizeSyncInput(sync);
+    const keyName = normalizeCreatedKeyName(name);
+    const providerType = await resolveProviderType({
+      sync: normalized,
+      fetchImpl,
+      timeoutMs
+    });
+    const result = providerType === 'new-api'
+      ? await createNewApiKey({
+          sync: normalized,
+          originalSync: sync,
+          name: keyName,
+          fetchImpl,
+          timeoutMs
+        })
+      : await createModernV1Key({
+          sync: normalized,
+          originalSync: sync,
+          name: keyName,
+          fetchImpl,
+          timeoutMs
+        });
+
+    return {
+      ok: true,
+      apiKey: result.apiKey,
+      multiplier: result.remote.groupMultiplier,
+      keyName: pickFirstString(result.remote.keyName, keyName),
+      syncPatch: {
+        lastSyncAt: startedAt,
+        lastSyncStatus: 'success',
+        lastSyncError: null,
+        remote: result.remote
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      apiKey: '',
+      multiplier: null,
+      syncPatch: {
+        lastSyncAt: startedAt,
+        lastSyncStatus: 'failure',
+        lastSyncError: error.message || String(error)
+      },
+      error
+    };
+  }
+}
+
 export function detectProviderType(dashboardUrl, providerType = 'auto') {
   if (providerType === 'modern-v1' || providerType === 'new-api') {
     return providerType;
@@ -333,6 +396,71 @@ async function syncNewApi({ sync, apiKey = '', fetchImpl, timeoutMs }) {
       groupMultiplier: multiplier,
       groups
     }
+  };
+}
+
+async function createModernV1Key({ sync, originalSync, name, fetchImpl, timeoutMs }) {
+  const { apiBaseUrl, headers } = await loginModernV1({
+    sync,
+    fetchImpl,
+    timeoutMs
+  });
+  const createPayload = buildModernV1KeyCreatePayload({
+    name,
+    groupId: pickCreationGroupId(originalSync)
+  });
+  const createdPayload = await requestJson(fetchImpl, joinApiPath(apiBaseUrl, '/keys'), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(createPayload),
+    signal: timeoutSignal(timeoutMs)
+  });
+  const apiKey = pickCreatedApiKey(createdPayload);
+  if (!apiKey) {
+    throw new Error('Remote key creation did not return an API key');
+  }
+
+  const result = await syncModernV1({ sync, apiKey, fetchImpl, timeoutMs });
+  return {
+    apiKey,
+    remote: result.remote
+  };
+}
+
+async function createNewApiKey({ sync, originalSync, name, fetchImpl, timeoutMs }) {
+  const { origin, headers } = await loginNewApi({
+    sync,
+    fetchImpl,
+    timeoutMs
+  });
+  const createPayload = await requestJson(fetchImpl, `${origin}/api/token/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(buildNewApiTokenCreatePayload({
+      name,
+      groupId: pickNewApiCreationGroupId(originalSync)
+    })),
+    signal: timeoutSignal(timeoutMs)
+  });
+  const remoteKeyId = pickRemoteKeyId(unwrapData(createPayload));
+  if (!remoteKeyId) {
+    throw new Error('Remote token creation did not return a token id');
+  }
+
+  const keyPayload = await requestJson(fetchImpl, `${origin}/api/token/${encodeURIComponent(remoteKeyId)}/key`, {
+    method: 'POST',
+    headers,
+    signal: timeoutSignal(timeoutMs)
+  });
+  const apiKey = normalizeApiKeyScheme(pickCreatedApiKey(keyPayload));
+  if (!apiKey) {
+    throw new Error('Remote token key lookup did not return an API key');
+  }
+
+  const result = await syncNewApi({ sync, apiKey, fetchImpl, timeoutMs });
+  return {
+    apiKey,
+    remote: result.remote
   };
 }
 
@@ -877,12 +1005,13 @@ function normalizeSwitchGroup(group = {}) {
   if (!group || typeof group !== 'object') {
     throw new Error('group is required');
   }
-  const name = pickFirstString(group.name);
-  if (!name) {
-    throw new Error('group name is required');
+  const id = pickFirstString(group.id);
+  const name = pickFirstString(group.name, id);
+  if (!id && !name) {
+    throw new Error('group id or name is required');
   }
   return {
-    id: pickFirstString(group.id),
+    id,
     name,
     multiplier: pickMultiplier(group.multiplier),
     selected: true
@@ -907,6 +1036,31 @@ function markSelectedRemoteGroup(remote, selectedGroup) {
     groupId: pickFirstString(selected?.id, selectedGroup.id, remote?.groupId),
     groupMultiplier: pickMultiplier(selected?.multiplier, selectedGroup.multiplier, remote?.groupMultiplier),
     groups: nextGroups
+  };
+}
+
+function normalizeCreatedKeyName(value) {
+  return pickFirstString(value, 'JuanProxy sync');
+}
+
+function buildModernV1KeyCreatePayload({ name, groupId }) {
+  return {
+    name,
+    ...(groupId ? { group_id: coerceNumericString(groupId) } : {})
+  };
+}
+
+function buildNewApiTokenCreatePayload({ name, groupId }) {
+  return {
+    name,
+    remain_quota: 0,
+    expired_time: -1,
+    unlimited_quota: true,
+    model_limits_enabled: false,
+    model_limits: '',
+    allow_ips: '',
+    group: pickFirstString(groupId, 'default'),
+    cross_group_retry: false
   };
 }
 
@@ -958,6 +1112,54 @@ function coerceNumericString(value) {
   }
   const number = Number(text);
   return Number.isSafeInteger(number) ? number : text;
+}
+
+function pickCreationGroupId(sync) {
+  return pickFirstString(
+    sync?.remote?.groupId,
+    sync?.remote?.keyGroup
+  );
+}
+
+function pickNewApiCreationGroupId(sync) {
+  return pickFirstString(
+    sync?.remote?.groupId,
+    sync?.remote?.keyGroup
+  );
+}
+
+function pickCreatedApiKey(payload) {
+  if (typeof payload === 'string') {
+    return payload.trim();
+  }
+
+  const direct = pickFirstString(
+    payload?.key,
+    payload?.apiKey,
+    payload?.api_key,
+    payload?.token,
+    payload?.tokenKey,
+    payload?.token_key,
+    payload?.keyValue,
+    payload?.key_value
+  );
+  if (direct) {
+    return direct;
+  }
+
+  const data = unwrapData(payload);
+  if (data && data !== payload) {
+    return pickCreatedApiKey(data);
+  }
+  return '';
+}
+
+function normalizeApiKeyScheme(value) {
+  const text = pickFirstString(value);
+  if (!text) {
+    return '';
+  }
+  return /^sk[-_]/i.test(text) ? text : `sk-${text}`;
 }
 
 function pickRemoteKeyId(key) {

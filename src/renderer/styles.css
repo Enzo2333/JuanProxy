@@ -436,6 +436,22 @@ summary {
   font-weight: 650;
 }
 
+.sync-group-id-switch {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.sync-group-id-switch label {
+  min-width: 0;
+}
+
+.sync-group-id-switch button {
+  white-space: nowrap;
+}
+
 .topbar-actions,
 .button-row,
 .toolbar,
@@ -447,6 +463,22 @@ summary {
 
 .topbar-actions {
   justify-content: flex-end;
+}
+
+.selection-mode-toggle {
+  min-height: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  padding: 0 11px;
+  font-weight: 750;
+}
+
+.selection-mode-toggle:has(input:checked) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary);
 }
 
 .app-body {
@@ -1412,6 +1444,7 @@ summary {
   position: fixed;
   right: 18px;
   bottom: 18px;
+  z-index: 35;
   max-width: 420px;
   border-radius: 8px;
   background: #111827;
@@ -1460,6 +1493,12 @@ summary {
 
   .context-panel {
     border-top: 1px solid var(--line);
+  }
+
+  .toast {
+    right: 12px;
+    bottom: 12px;
+    max-width: calc(100vw - 24px);
   }
 
   .content-header,

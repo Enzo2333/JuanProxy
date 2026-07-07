@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -99,6 +99,44 @@ test('runtime logger bounds circular and large context values', () => {
 
   assert.equal(sanitized.value.length, 4000 + '...[truncated]'.length);
   assert.match(sanitized.value, /\.\.\.\[truncated\]$/);
+});
+
+test('runtime logger prunes entries older than the retention window', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-runtime-log-retention-'));
+  const filePath = join(dir, 'runtime-errors.jsonl');
+  const logger = new RuntimeLogger({
+    filePath,
+    now: () => new Date('2026-06-16T00:00:00.000Z'),
+    retentionMs: 24 * 60 * 60 * 1000,
+    cleanupIntervalMs: 0
+  });
+
+  try {
+    await writeFile(filePath, [
+      JSON.stringify({
+        timestamp: '2026-06-14T23:59:59.000Z',
+        level: 'error',
+        source: 'old',
+        message: 'old entry'
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-15T00:00:01.000Z',
+        level: 'error',
+        source: 'recent',
+        message: 'recent entry'
+      }),
+      ''
+    ].join('\n'));
+
+    await logger.info('current', 'current entry');
+
+    const raw = await readFile(filePath, 'utf8');
+    assert.doesNotMatch(raw, /old entry/);
+    assert.match(raw, /recent entry/);
+    assert.match(raw, /current entry/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('runtime logger does not throw when a log write fails', async () => {

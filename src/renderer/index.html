@@ -57,7 +57,14 @@
         </div>
 
         <div class="topbar-actions">
-          <button id="smart-switch" type="button" class="secondary">智能选择</button>
+          <label class="toggle selection-mode-toggle" title="让独立悬浮窗保持在其他窗口前方">
+            <input id="floating-always-on-top" type="checkbox" />
+            悬浮窗置顶
+          </label>
+          <label class="toggle selection-mode-toggle" title="开启后每次请求按优先级、倍率和健康状态自动选择站点">
+            <input id="smart-switch" type="checkbox" />
+            自动选择
+          </label>
           <button id="restart-proxy" type="button">重启代理</button>
         </div>
       </header>
@@ -113,6 +120,10 @@
                 <input id="proxy-timeout-seconds" type="number" min="1" step="1" placeholder="120" />
               </label>
               <label>
+                请求体缓冲(MB)
+                <input id="proxy-replay-buffer-mb" type="number" min="1" max="512" step="1" placeholder="16" />
+              </label>
+              <label>
                 失败阈值
                 <input id="failure-threshold" type="number" min="0" />
               </label>
@@ -132,7 +143,15 @@
               </label>
               <label class="toggle">
                 <input id="smart-switching" type="checkbox" />
-                智能切换
+                自动选择请求站点
+              </label>
+              <label class="toggle">
+                <input id="auto-switch-multiplier-limit-enabled" type="checkbox" />
+                自动选择时跳过高于指定倍率的站点
+              </label>
+              <label>
+                最高自动使用倍率
+                <input id="auto-switch-max-multiplier" type="number" min="0" step="0.000001" placeholder="1" />
               </label>
               <label class="toggle">
                 <input id="global-model-mapping-enabled" type="checkbox" />
@@ -267,7 +286,7 @@
             <div class="toolbar">
               <button id="test-site" type="button" class="secondary">测试</button>
               <button id="toggle-selected-site" type="button" class="secondary">停用</button>
-              <button id="set-active" type="button" class="secondary">设为当前</button>
+              <button id="set-active" type="button" class="secondary">选择</button>
               <button id="clone-site" type="button" class="secondary">复制</button>
               <button id="delete-site" type="button" class="danger">删除</button>
             </div>
@@ -351,6 +370,10 @@
                   倍率
                   <input id="site-multiplier" type="text" inputmode="decimal" placeholder="1" />
                 </label>
+                <label class="toggle">
+                  <input id="site-multiplier-locked" type="checkbox" />
+                  锁定倍率
+                </label>
                 <label class="wide-field">
                   Base URL
                   <input
@@ -422,6 +445,7 @@
                     <input id="site-sync-enabled" type="checkbox" />
                     启用同步
                   </label>
+                  <button id="create-site-key" type="button" class="secondary">创建密钥</button>
                   <button id="sync-site" type="button" class="secondary">同步账号信息</button>
                 </div>
               </div>
@@ -492,6 +516,13 @@
                 </div>
               </div>
               <div id="site-sync-groups" class="sync-groups" aria-label="可切换分组"></div>
+              <div class="sync-group-id-switch">
+                <label>
+                  手动分组 ID
+                  <input id="site-sync-group-id" autocomplete="off" placeholder="输入远端分组 ID" />
+                </label>
+                <button id="switch-site-sync-group-id" type="button" class="secondary">切换 ID</button>
+              </div>
               <p id="site-sync-summary" class="sync-summary">未同步</p>
             </section>
 

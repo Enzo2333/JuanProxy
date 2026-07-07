@@ -1,5 +1,10 @@
-export function shouldPreserveEditorOnStateChange({ formDirty, selectedSiteId, nextSites }) {
-  if (!formDirty) {
+export function shouldPreserveEditorOnStateChange({
+  formDirty,
+  editorHasFocus = false,
+  selectedSiteId,
+  nextSites
+}) {
+  if (!formDirty && !editorHasFocus) {
     return false;
   }
 

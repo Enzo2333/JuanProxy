@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JuanProxy 悬浮窗</title>
+    <link rel="stylesheet" href="./floating.css" />
+  </head>
+  <body>
+    <main id="floating-shell" class="floating-shell">
+      <button id="floating-handle" class="floating-handle" type="button" aria-expanded="false">
+        <span id="floating-initial" class="floating-initial">-</span>
+        <span id="floating-name" class="floating-name">暂无站点</span>
+        <span id="floating-meta" class="floating-meta">-</span>
+      </button>
+
+      <section id="floating-panel" class="floating-panel" hidden>
+        <header class="floating-panel-header">
+          <div>
+            <span>当前使用站点</span>
+            <strong id="floating-panel-name">暂无当前站点</strong>
+          </div>
+          <span id="floating-status" class="status-pill idle">-</span>
+        </header>
+
+        <div id="floating-main" class="floating-main"></div>
+        <dl id="floating-details" class="floating-details"></dl>
+
+        <footer class="floating-actions">
+          <label class="toggle">
+            <input id="floating-always-on-top" type="checkbox" />
+            保持最前
+          </label>
+          <button id="floating-collapse" type="button">收起</button>
+        </footer>
+      </section>
+    </main>
+
+    <script src="./floating.js" type="module"></script>
+  </body>
+</html>

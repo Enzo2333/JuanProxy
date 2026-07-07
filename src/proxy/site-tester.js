@@ -1,6 +1,9 @@
 import { composeTargetUrl } from './proxy-server.js';
 import { DEFAULT_TEST_MODEL } from './switching-policy.js';
 
+export const CODEX_DESKTOP_USER_AGENT =
+  'Codex Desktop/0.142.5 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.623.101652)';
+
 export async function testSiteAvailability(site, { timeoutMs = 30000 } = {}) {
   const target = composeTargetUrl(site.baseUrl, '/v1/responses');
   const startedAt = Date.now();
@@ -9,7 +12,9 @@ export async function testSiteAvailability(site, { timeoutMs = 30000 } = {}) {
     const response = await fetch(target, {
       method: 'POST',
       headers: {
+        Accept: 'text/event-stream',
         'Content-Type': 'application/json',
+        'User-Agent': CODEX_DESKTOP_USER_AGENT,
         Authorization: `Bearer ${site.apiKey}`
       },
       body: JSON.stringify({
@@ -17,7 +22,7 @@ export async function testSiteAvailability(site, { timeoutMs = 30000 } = {}) {
         instructions: 'Reply briefly.',
         input: 'Hi',
         max_output_tokens: 1,
-        stream: false
+        stream: true
       }),
       signal: AbortSignal.timeout(timeoutMs)
     });

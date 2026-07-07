@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 
 import {
   DEFAULT_AUTO_RECOVERY_STATE,
+  DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT,
   DEFAULT_FAILURE_THRESHOLD,
   DEFAULT_GROUP_SYNC_SETTINGS,
   DEFAULT_MODEL_MAPPING,
@@ -26,6 +27,7 @@ import {
   normalizeSiteCapabilities,
   normalizeSiteSync,
   normalizeSiteSyncSettings,
+  normalizeAutoSwitchMultiplierLimit,
   nowIso,
   recordAvailabilityFailure,
   recordFailure,
@@ -39,17 +41,28 @@ const MAX_SITE_SYNC_PREHEAT_CANDIDATE_LIMIT = 10;
 const SITE_SYNC_PREHEAT_LEAD_RATIO = 0.25;
 const SITE_SYNC_PREHEAT_MIN_LEAD_MS = 5 * 60 * 1000;
 const SITE_SYNC_PREHEAT_MAX_LEAD_MS = 15 * 60 * 1000;
+const DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+const MIN_REPLAYABLE_REQUEST_BODY_BYTES = 1024 * 1024;
+const MAX_REPLAYABLE_REQUEST_BODY_BYTES = 512 * 1024 * 1024;
 
 export const DEFAULT_STATE = {
   version: 1,
+  appSettings: {
+    floatingWindow: {
+      alwaysOnTop: false,
+      position: null
+    }
+  },
   proxy: {
     port: 8787,
     timeoutMs: 120000,
+    maxReplayableRequestBodyBytes: DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES,
     failureThreshold: DEFAULT_FAILURE_THRESHOLD,
-    smartSwitching: true,
+    smartSwitching: false,
     priorityMode: DEFAULT_PRIORITY_MODE,
     samePriorityStrategy: 'round-robin',
-    lastSelectedSiteId: null
+    lastSelectedSiteId: null,
+    autoSwitchMultiplierLimit: DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT
   },
   modelMapping: DEFAULT_MODEL_MAPPING,
   siteSync: DEFAULT_SITE_SYNC_SETTINGS,
@@ -118,6 +131,10 @@ export class ConfigService extends EventEmitter {
 
   getProxyTimeoutMs() {
     return this.state.proxy.timeoutMs;
+  }
+
+  getMaxReplayableRequestBodyBytes() {
+    return this.state.proxy.maxReplayableRequestBodyBytes;
   }
 
   getSiteSyncSettings() {
@@ -216,6 +233,7 @@ export class ConfigService extends EventEmitter {
       testModel: source.testModel,
       priority: source.priority,
       multiplier: source.multiplier,
+      multiplierLocked: source.multiplierLocked,
       modelMapping: source.modelMapping,
       capabilities: source.capabilities,
       sync: source.sync,
@@ -309,6 +327,7 @@ export class ConfigService extends EventEmitter {
   async selectSiteForRequest(now = new Date(), options = {}) {
     this.refreshRateLimitWindows(now);
     const excludeSiteIds = new Set(options.excludeSiteIds ?? []);
+    const persistSelection = options.persistSelection !== false;
 
     if (!this.state.proxy.smartSwitching) {
       const active = this.getActiveSite();
@@ -321,6 +340,8 @@ export class ConfigService extends EventEmitter {
         await this.saveHotState();
         return structuredClone(active);
       }
+      await this.saveHotState();
+      return null;
     }
 
     const chosen = chooseBestSite(this.state.sites, {
@@ -332,8 +353,10 @@ export class ConfigService extends EventEmitter {
       return null;
     }
 
-    this.state.activeSiteId = chosen.id;
-    this.state.proxy.lastSelectedSiteId = chosen.id;
+    if (persistSelection) {
+      this.state.activeSiteId = chosen.id;
+      this.state.proxy.lastSelectedSiteId = chosen.id;
+    }
     this.consumeRateLimit(chosen.id, now);
     await this.saveHotState();
     return structuredClone(this.findSite(chosen.id));
@@ -347,14 +370,23 @@ export class ConfigService extends EventEmitter {
 
     const port = Number(next.port);
     const timeoutMs = Number(next.timeoutMs);
+    const maxReplayableRequestBodyBytes = Number(next.maxReplayableRequestBodyBytes);
     const failureThreshold = Number(next.failureThreshold);
     const priorityMode = normalizePriorityMode(next.priorityMode);
     const samePriorityStrategy = normalizeSamePriorityStrategy(next.samePriorityStrategy);
+    const autoSwitchMultiplierLimit = normalizeAutoSwitchMultiplierLimit(next.autoSwitchMultiplierLimit);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error('proxy port must be an integer between 1 and 65535');
     }
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) {
       throw new Error('upstream timeout must be an integer greater than or equal to 1000ms');
+    }
+    if (
+      !Number.isInteger(maxReplayableRequestBodyBytes) ||
+      maxReplayableRequestBodyBytes < MIN_REPLAYABLE_REQUEST_BODY_BYTES ||
+      maxReplayableRequestBodyBytes > MAX_REPLAYABLE_REQUEST_BODY_BYTES
+    ) {
+      throw new Error('request body replay buffer must be an integer between 1MB and 512MB');
     }
     if (!Number.isInteger(failureThreshold) || failureThreshold < 0) {
       throw new Error('failure threshold must be a non-negative integer');
@@ -363,10 +395,12 @@ export class ConfigService extends EventEmitter {
     this.state.proxy = {
       port,
       timeoutMs,
+      maxReplayableRequestBodyBytes,
       failureThreshold,
       smartSwitching: Boolean(next.smartSwitching),
       priorityMode,
       samePriorityStrategy,
+      autoSwitchMultiplierLimit,
       lastSelectedSiteId: next.lastSelectedSiteId ?? this.state.proxy.lastSelectedSiteId ?? null
     };
     this.disableLocalProxySites();
@@ -404,6 +438,19 @@ export class ConfigService extends EventEmitter {
     });
     await this.save();
     return structuredClone(this.state.modelMapping);
+  }
+
+  async updateAppSettings(patch = {}) {
+    this.state.appSettings = normalizeAppSettings({
+      ...this.state.appSettings,
+      ...patch,
+      floatingWindow: {
+        ...this.state.appSettings?.floatingWindow,
+        ...(patch?.floatingWindow ?? {})
+      }
+    });
+    await this.save();
+    return structuredClone(this.state.appSettings);
   }
 
   exportConfig(options = {}, now = new Date()) {
@@ -451,6 +498,7 @@ export class ConfigService extends EventEmitter {
     const importedSites = selectedSites.map((site) => createSite(site, now, nextProxy));
 
     if (importGlobalSettings) {
+      this.state.appSettings = normalizeAppSettings(payload.settings.appSettings);
       this.state.proxy = nextProxy;
       this.state.modelMapping = normalizeModelMapping(payload.settings.modelMapping);
       this.state.siteSync = normalizeSiteSyncSettings(payload.settings.siteSync);
@@ -511,7 +559,11 @@ export class ConfigService extends EventEmitter {
     let failed = recordFailure(previous, error, now);
     let disabled = false;
 
-    if (failed.manualEnabled && shouldSwitchAfterFailure(failed, this.state.proxy.failureThreshold)) {
+    if (
+      this.state.proxy.smartSwitching &&
+      failed.manualEnabled &&
+      shouldSwitchAfterFailure(failed, this.state.proxy.failureThreshold)
+    ) {
       failed = prepareAutoRecoverySchedule({
         ...failed,
         failureDisabled: true
@@ -525,15 +577,16 @@ export class ConfigService extends EventEmitter {
     this.state.sites[index] = failed;
 
     let switchedTo = null;
-    if (
-      this.state.proxy.smartSwitching &&
-      shouldSwitchAfterFailure(failed, this.state.proxy.failureThreshold)
-    ) {
+    const shouldFailover = shouldSwitchAfterFailure(failed, this.state.proxy.failureThreshold);
+    const activeSiteWasDisabled = this.state.activeSiteId === id && !failed.enabled;
+    if (this.state.proxy.smartSwitching && shouldFailover) {
       const failover = chooseFailoverSite(this.state.sites, id, this.getSelectionOptions());
       if (failover) {
         this.state.activeSiteId = failover.id;
         this.state.proxy.lastSelectedSiteId = failover.id;
         switchedTo = this.findSite(failover.id);
+      } else if (activeSiteWasDisabled) {
+        this.state.activeSiteId = null;
       }
     }
 
@@ -562,7 +615,9 @@ export class ConfigService extends EventEmitter {
       autoRecoveryState: {
         ...failure.autoRecoveryState,
         lastCheckedAt: at,
-        nextCheckAt: getNextAutoRecoveryCheckAt(failure, now),
+        nextCheckAt: failure.manualEnabled && failure.failureDisabled
+          ? getNextAutoRecoveryCheckAt(failure, now)
+          : null,
         lastResult: 'failure',
         lastMessage: error.message ?? 'Availability test failed'
       },
@@ -690,20 +745,18 @@ export class ConfigService extends EventEmitter {
 
   findGroupSyncRepresentativeSite(key) {
     const normalizedKey = normalizeWebsiteKey(key);
-    const site = this.state.sites
-      .map(normalizeSite)
-      .find((candidate) =>
-        isConfiguredGroupSyncSite(candidate) &&
-          getSiteSyncWebsiteKey(candidate) === normalizedKey
-      );
-    return site ? structuredClone(site) : null;
+    return this.getGroupSyncWebsiteSites(normalizedKey)
+      .find(isConfiguredGroupSyncSite) ?? null;
   }
 
   getGroupSyncWebsiteSites(key) {
     const normalizedKey = normalizeWebsiteKey(key);
     return this.state.sites
       .map(normalizeSite)
-      .filter((site) => getSiteSyncWebsiteKey(site) === normalizedKey)
+      .filter((site) =>
+        isConfiguredGroupSyncSite(site) &&
+          getSiteSyncWebsiteKey(site) === normalizedKey
+      )
       .map((site) => structuredClone(site));
   }
 
@@ -726,7 +779,10 @@ export class ConfigService extends EventEmitter {
 
     for (const [siteIndex, site] of this.state.sites.entries()) {
       const normalizedSite = normalizeSite(site);
-      if (getSiteSyncWebsiteKey(normalizedSite) !== normalizedKey) {
+      if (
+        getSiteSyncWebsiteKey(normalizedSite) !== normalizedKey ||
+        !isConfiguredGroupSyncSite(normalizedSite)
+      ) {
         continue;
       }
       const nextSite = mergeGroupSyncResultIntoSite(normalizedSite, {
@@ -859,7 +915,8 @@ export class ConfigService extends EventEmitter {
       samePriorityStrategy: this.state.proxy.samePriorityStrategy,
       priorityMode: this.state.proxy.priorityMode,
       lastSelectedSiteId: this.state.proxy.lastSelectedSiteId,
-      now
+      now,
+      autoSwitchMultiplierLimit: this.state.proxy.autoSwitchMultiplierLimit
     };
   }
 
@@ -1084,6 +1141,7 @@ function normalizeState(raw) {
       ...DEFAULT_STATE.proxy,
       ...(raw?.proxy ?? {})
     },
+    appSettings: normalizeAppSettings(raw?.appSettings ?? DEFAULT_STATE.appSettings),
     modelMapping: normalizeModelMapping(raw?.modelMapping ?? DEFAULT_STATE.modelMapping),
     siteSync: normalizeSiteSyncSettings(raw?.siteSync ?? DEFAULT_STATE.siteSync),
     groupSync: normalizeGroupSyncSettings(raw?.groupSync ?? DEFAULT_STATE.groupSync),
@@ -1095,12 +1153,19 @@ function normalizeState(raw) {
     Number.isInteger(Number(state.proxy.timeoutMs)) && Number(state.proxy.timeoutMs) >= 1000
       ? Number(state.proxy.timeoutMs)
       : DEFAULT_STATE.proxy.timeoutMs;
+  state.proxy.maxReplayableRequestBodyBytes = normalizeReplayableRequestBodyBytes(
+    state.proxy.maxReplayableRequestBodyBytes,
+    DEFAULT_STATE.proxy.maxReplayableRequestBodyBytes
+  );
   state.proxy.failureThreshold = Number.isInteger(Number(state.proxy.failureThreshold))
     ? Number(state.proxy.failureThreshold)
     : DEFAULT_FAILURE_THRESHOLD;
   state.proxy.smartSwitching = Boolean(state.proxy.smartSwitching);
   state.proxy.priorityMode = normalizePriorityMode(state.proxy.priorityMode);
   state.proxy.samePriorityStrategy = normalizeSamePriorityStrategy(state.proxy.samePriorityStrategy);
+  state.proxy.autoSwitchMultiplierLimit = normalizeAutoSwitchMultiplierLimit(
+    state.proxy.autoSwitchMultiplierLimit
+  );
   state.proxy.lastSelectedSiteId = state.proxy.lastSelectedSiteId ?? null;
   state.activeSiteId = state.activeSiteId ?? null;
 
@@ -1109,13 +1174,18 @@ function normalizeState(raw) {
 
 function serializeGlobalSettingsForExport(state) {
   return {
+    appSettings: normalizeAppSettings(state.appSettings),
     proxy: {
       port: state.proxy.port,
       timeoutMs: state.proxy.timeoutMs,
+      maxReplayableRequestBodyBytes: state.proxy.maxReplayableRequestBodyBytes,
       failureThreshold: state.proxy.failureThreshold,
       smartSwitching: state.proxy.smartSwitching,
       priorityMode: state.proxy.priorityMode,
-      samePriorityStrategy: state.proxy.samePriorityStrategy
+      samePriorityStrategy: state.proxy.samePriorityStrategy,
+      autoSwitchMultiplierLimit: normalizeAutoSwitchMultiplierLimit(
+        state.proxy.autoSwitchMultiplierLimit
+      )
     },
     modelMapping: structuredClone(normalizeModelMapping(state.modelMapping)),
     siteSync: structuredClone(normalizeSiteSyncSettings(state.siteSync)),
@@ -1142,6 +1212,7 @@ function serializeSiteForExport(site) {
     testModel: normalized.testModel,
     priority: normalized.priority,
     multiplier: normalized.multiplier,
+    multiplierLocked: normalized.multiplierLocked,
     modelMapping: structuredClone(normalized.modelMapping),
     sync: serializeSiteSyncForExport(normalized.sync),
     rateLimit: structuredClone(normalized.rateLimit),
@@ -1200,10 +1271,35 @@ function parseImportPayload(input) {
 
 function normalizeExportedSettings(settings = {}) {
   return {
+    appSettings: normalizeAppSettings(settings.appSettings),
     proxy: normalizeImportedProxySettings(settings.proxy, DEFAULT_STATE.proxy),
     modelMapping: normalizeModelMapping(settings.modelMapping),
     siteSync: normalizeSiteSyncSettings(settings.siteSync),
     groupSync: normalizeGroupSyncSettings(settings.groupSync)
+  };
+}
+
+function normalizeAppSettings(settings = {}) {
+  return {
+    floatingWindow: {
+      alwaysOnTop: Boolean(settings?.floatingWindow?.alwaysOnTop),
+      position: normalizeFloatingWindowPosition(settings?.floatingWindow?.position)
+    }
+  };
+}
+
+function normalizeFloatingWindowPosition(position) {
+  if (!position || typeof position !== 'object' || Array.isArray(position)) {
+    return null;
+  }
+  const x = Number(position.x);
+  const y = Number(position.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+  return {
+    x: Math.round(x),
+    y: Math.round(y)
   };
 }
 
@@ -1228,6 +1324,7 @@ function normalizeImportSite(site = {}) {
     testModel: normalized.testModel,
     priority: normalized.priority,
     multiplier: normalized.multiplier,
+    multiplierLocked: normalized.multiplierLocked,
     modelMapping: structuredClone(normalized.modelMapping),
     sync: serializeSiteSyncForExport(normalized.sync),
     rateLimit: structuredClone(normalized.rateLimit),
@@ -1245,10 +1342,15 @@ function normalizeImportedProxySettings(proxy = {}, currentProxy = DEFAULT_STATE
   const port = Number(source.port);
   const timeoutMs = Number(source.timeoutMs);
   const failureThreshold = Number(source.failureThreshold);
+  const maxReplayableRequestBodyBytes = normalizeReplayableRequestBodyBytes(
+    source.maxReplayableRequestBodyBytes,
+    fallback.maxReplayableRequestBodyBytes
+  );
 
   return {
     port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : fallback.port,
     timeoutMs: Number.isInteger(timeoutMs) && timeoutMs >= 1000 ? timeoutMs : fallback.timeoutMs,
+    maxReplayableRequestBodyBytes,
     failureThreshold: Number.isInteger(failureThreshold) && failureThreshold >= 0
       ? failureThreshold
       : fallback.failureThreshold,
@@ -1259,8 +1361,20 @@ function normalizeImportedProxySettings(proxy = {}, currentProxy = DEFAULT_STATE
     samePriorityStrategy: normalizeSamePriorityStrategy(
       source.samePriorityStrategy ?? fallback.samePriorityStrategy
     ),
+    autoSwitchMultiplierLimit: normalizeAutoSwitchMultiplierLimit(
+      source.autoSwitchMultiplierLimit ?? fallback.autoSwitchMultiplierLimit
+    ),
     lastSelectedSiteId: fallback.lastSelectedSiteId ?? null
   };
+}
+
+function normalizeReplayableRequestBodyBytes(value, fallback) {
+  const bytes = Number(value);
+  return Number.isInteger(bytes) &&
+    bytes >= MIN_REPLAYABLE_REQUEST_BODY_BYTES &&
+    bytes <= MAX_REPLAYABLE_REQUEST_BODY_BYTES
+    ? bytes
+    : fallback;
 }
 
 function normalizeOptionalIdSet(ids) {
@@ -1284,6 +1398,7 @@ function createSite(input, now = new Date(), proxy = DEFAULT_STATE.proxy) {
     testModel: input?.testModel,
     priority: input?.priority,
     multiplier: input?.multiplier,
+    multiplierLocked: input?.multiplierLocked,
     modelMapping: input?.modelMapping,
     capabilities: input?.capabilities,
     sync: input?.sync,
@@ -1314,6 +1429,7 @@ function sanitizePatch(patch = {}) {
     'testModel',
     'priority',
     'multiplier',
+    'multiplierLocked',
     'modelMapping',
     'capabilities',
     'sync',
@@ -1514,13 +1630,14 @@ function mergeGroupSyncResultIntoSite(site, { result, groups, representative, no
     const selectedGroups = markRemoteGroupsSelected(groupSource, { keyGroup, groupId });
     const selectedGroup = findMatchingRemoteGroup({ keyGroup, groupId }, selectedGroups);
     const groupMultiplier = selectedGroup?.multiplier ?? remotePatch.groupMultiplier ?? normalized.sync.remote.groupMultiplier;
+    const nextMultiplier = Number.isFinite(result?.multiplier) && result.multiplier >= 0
+      ? result.multiplier
+      : Number.isFinite(groupMultiplier)
+        ? groupMultiplier
+        : normalized.multiplier;
     return normalizeSite({
       ...normalized,
-      multiplier: Number.isFinite(result?.multiplier) && result.multiplier >= 0
-        ? result.multiplier
-        : Number.isFinite(groupMultiplier)
-          ? groupMultiplier
-          : normalized.multiplier,
+      ...(!normalized.multiplierLocked ? { multiplier: nextMultiplier } : {}),
       sync: {
         ...normalized.sync,
         ...result.syncPatch,
@@ -1540,7 +1657,7 @@ function mergeGroupSyncResultIntoSite(site, { result, groups, representative, no
   const nextGroupMultiplier = selectedGroup?.multiplier ?? normalized.sync.remote.groupMultiplier;
   return normalizeSite({
     ...normalized,
-    ...(Number.isFinite(selectedGroup?.multiplier)
+    ...(!normalized.multiplierLocked && Number.isFinite(selectedGroup?.multiplier)
       ? { multiplier: selectedGroup.multiplier }
       : {}),
     sync: {

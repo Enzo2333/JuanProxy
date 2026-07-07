@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  loginAndCreateSiteKey,
   loginAndFetchSiteSync,
   loginAndSwitchSiteGroup,
   parseMultiplierFromText
@@ -1820,4 +1821,186 @@ test('new api sync maps status endpoint, object group ratio and quota-unit balan
   assert.equal(result.syncPatch.remote.keyName, 'n');
   assert.equal(result.syncPatch.remote.keyGroup, '其他模型 1x');
   assert.equal(result.syncPatch.remote.groupMultiplier, 1);
+});
+
+test('modern api v1 creates a key and returns metadata for local import', async () => {
+  const fetchMock = createFetch({
+    'POST /api/v1/auth/login': {
+      data: {
+        auth_token: 'auth-token'
+      }
+    },
+    'POST /api/v1/keys': {
+      data: {
+        id: 37,
+        name: 'JuanProxy sync',
+        key: 'sk-created-modern',
+        group: {
+          id: 18,
+          name: 'Example Team',
+          rate_multiplier: 0.001
+        },
+        endpoint: 'https://api-us.example.com/'
+      }
+    },
+    'GET /api/v1/user/profile': {
+      data: {
+        email: 'user@example.com',
+        balance: '$1.47'
+      }
+    },
+    'GET /api/v1/keys': {
+      data: {
+        items: [
+          {
+            id: 37,
+            name: 'JuanProxy sync',
+            key: 'sk-created-modern',
+            group: 'Example Team',
+            endpoint: 'https://api-us.example.com/'
+          }
+        ]
+      }
+    },
+    'GET /api/v1/groups/available': {
+      data: [
+        {
+          id: 18,
+          name: 'Example Team',
+          rate_multiplier: 0.001
+        }
+      ]
+    },
+    'GET /api/v1/groups/rates': {
+      data: {
+        'Example Team': 0.001
+      }
+    }
+  });
+
+  const result = await loginAndCreateSiteKey({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1',
+      remote: {
+        groupId: '18',
+        keyGroup: 'Example Team'
+      }
+    },
+    name: 'JuanProxy sync',
+    fetch: fetchMock,
+    now: new Date('2026-06-09T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.apiKey, 'sk-created-modern');
+  assert.equal(result.multiplier, 0.001);
+  assert.equal(result.syncPatch.remote.providerType, 'modern-v1');
+  assert.equal(result.syncPatch.remote.keyName, 'JuanProxy sync');
+  assert.equal(result.syncPatch.remote.remoteKeyId, '37');
+
+  const createCall = fetchMock.calls.find((call) => call.pathname === '/api/v1/keys' && call.method === 'POST');
+  assert.deepEqual(createCall.body, {
+    name: 'JuanProxy sync',
+    group_id: 18
+  });
+  assert.equal(createCall.headers.Authorization, 'Bearer auth-token');
+});
+
+test('new api creates a token and fetches the generated key for local import', async () => {
+  const fetchMock = createFetch({
+    'POST /api/user/login': {
+      data: {
+        token: 'new-api-token'
+      }
+    },
+    'POST /api/token/': {
+      success: true,
+      data: {
+        id: 42,
+        name: 'JuanProxy sync',
+        group: 'default',
+        status: 1
+      }
+    },
+    'POST /api/token/42/key': {
+      success: true,
+      data: {
+        key: 'created-new-api'
+      }
+    },
+    'GET /api/user/self': {
+      data: {
+        username: 'sync-user',
+        quota: 0
+      }
+    },
+    'GET /api/token/': {
+      data: [
+        {
+          id: 42,
+          name: 'JuanProxy sync',
+          key: 'sk-cre...api',
+          group: 'default'
+        }
+      ]
+    },
+    'GET /api/user/self/groups': {
+      data: {
+        default: {
+          desc: 'Default 0.003x',
+          ratio: 0.003
+        }
+      }
+    },
+    'GET /api/status': {
+      data: {
+        server_address: 'https://relay.example.com',
+        quota_per_unit: 500000
+      }
+    }
+  });
+
+  const result = await loginAndCreateSiteKey({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/console/token',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api',
+      remote: {
+        groupId: 'default',
+        keyGroup: 'Default 0.003x'
+      }
+    },
+    name: 'JuanProxy sync',
+    fetch: fetchMock,
+    now: new Date('2026-06-09T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.apiKey, 'sk-created-new-api');
+  assert.equal(result.multiplier, 0.003);
+  assert.equal(result.syncPatch.remote.providerType, 'new-api');
+  assert.equal(result.syncPatch.remote.keyName, 'JuanProxy sync');
+  assert.equal(result.syncPatch.remote.remoteKeyId, '42');
+
+  const createCall = fetchMock.calls.find((call) => call.pathname === '/api/token/' && call.method === 'POST');
+  assert.deepEqual(createCall.body, {
+    name: 'JuanProxy sync',
+    remain_quota: 0,
+    expired_time: -1,
+    unlimited_quota: true,
+    model_limits_enabled: false,
+    model_limits: '',
+    allow_ips: '',
+    group: 'default',
+    cross_group_retry: false
+  });
+  assert.equal(createCall.headers.Authorization, 'Bearer new-api-token');
+
+  const keyCall = fetchMock.calls.find((call) => call.pathname === '/api/token/42/key');
+  assert.equal(keyCall.method, 'POST');
+  assert.equal(keyCall.headers.Authorization, 'Bearer new-api-token');
 });

@@ -16,6 +16,11 @@ test('persists add, update, clone and delete operations', async () => {
 
     assert.equal(service.getState().proxy.port, 8787);
     assert.equal(service.getState().proxy.timeoutMs, 120000);
+    assert.equal(service.getState().proxy.smartSwitching, false);
+    assert.deepEqual(service.getState().appSettings.floatingWindow, {
+      alwaysOnTop: false,
+      position: null
+    });
     assert.equal(service.getState().sites.length, 0);
 
     const created = await service.addSite({
@@ -42,6 +47,43 @@ test('persists add, update, clone and delete operations', async () => {
     assert.equal(state.sites[0].baseUrl, 'https://upstream.example.com/v1');
     assert.equal(state.sites[0].apiKey, 'sk-test');
     assert.equal(state.activeSiteId, cloned.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('persists floating window always-on-top app setting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-app-settings-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await service.updateAppSettings({
+      floatingWindow: {
+        alwaysOnTop: true,
+        position: {
+          x: 128,
+          y: 256
+        }
+      }
+    });
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+
+    assert.deepEqual(reloaded.getState().appSettings.floatingWindow, {
+      alwaysOnTop: true,
+      position: {
+        x: 128,
+        y: 256
+      }
+    });
+    assert.equal(reloaded.exportConfig().settings.appSettings.floatingWindow.alwaysOnTop, true);
+    assert.deepEqual(reloaded.exportConfig().settings.appSettings.floatingWindow.position, {
+      x: 128,
+      y: 256
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -487,13 +529,14 @@ test('does not make a disabled site active when adding or cloning it', async () 
   }
 });
 
-test('disables a failing active site after the failure threshold and switches to another enabled site', async () => {
+test('disables a failing active site after the failure threshold and switches in smart mode', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-disable-'));
   const filePath = join(dir, 'config.json');
 
   try {
     const service = new ConfigService({ filePath });
     await service.load();
+    await service.updateProxySettings({ smartSwitching: true });
     const bad = await service.addSite({
       name: 'bad',
       baseUrl: 'https://bad.example/v1',
@@ -523,13 +566,91 @@ test('disables a failing active site after the failure threshold and switches to
   }
 });
 
+test('manual selection mode keeps the selected site active after failure threshold', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-disable-smart-off-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await service.updateProxySettings({ smartSwitching: false, failureThreshold: 0 });
+    const bad = await service.addSite({
+      name: 'bad',
+      baseUrl: 'https://bad.example/v1',
+      apiKey: 'sk-bad',
+      priority: 1
+    });
+    const good = await service.addSite({
+      name: 'good',
+      baseUrl: 'https://good.example/v1',
+      apiKey: 'sk-good',
+      priority: 2
+    });
+    await service.setActiveSite(bad.id);
+
+    const result = await service.recordSiteFailure(
+      bad.id,
+      { statusCode: 500, message: 'failed' }
+    );
+
+    const state = service.getState();
+    const badState = state.sites.find((site) => site.id === bad.id);
+
+    assert.equal(result.disabled, false);
+    assert.equal(result.switchedTo, null);
+    assert.equal(badState.failureDisabled, false);
+    assert.equal(badState.enabled, true);
+    assert.equal(badState.status, 'error');
+    assert.equal(badState.consecutiveErrors, 1);
+    assert.equal(state.activeSiteId, bad.id);
+    assert.equal((await service.selectSiteForRequest()).id, bad.id);
+    assert.equal(service.getState().sites.find((site) => site.id === good.id).requestCount, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('manual selection mode does not fail over while the selected site remains enabled', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-manual-no-failover-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await service.updateProxySettings({ smartSwitching: false });
+    const selected = await service.addSite({
+      name: 'selected',
+      baseUrl: 'https://selected.example/v1',
+      apiKey: 'sk-selected',
+      priority: 1
+    });
+    const fallback = await service.addSite({
+      name: 'fallback',
+      baseUrl: 'https://fallback.example/v1',
+      apiKey: 'sk-fallback',
+      priority: 2
+    });
+    await service.setActiveSite(selected.id);
+
+    assert.equal((await service.selectSiteForRequest()).id, selected.id);
+    assert.equal(
+      await service.selectSiteForRequest(new Date(), { excludeSiteIds: [selected.id] }),
+      null
+    );
+    assert.equal(service.getState().activeSiteId, selected.id);
+    assert.equal(service.getState().sites.find((site) => site.id === fallback.id).requestCount, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('manual enable clears automatic disable and rate limit pause', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-manual-enable-'));
   const service = new ConfigService({ filePath: join(dir, 'config.json') });
 
   try {
     await service.load();
-    await service.updateProxySettings({ failureThreshold: 0 });
+    await service.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const site = await service.addSite({
       name: 'limited',
       baseUrl: 'https://limited.example/v1',
@@ -557,7 +678,7 @@ test('manual enable clears automatic disable and rate limit pause', async () => 
   }
 });
 
-test('persists priority mode, priority, multiplier and same-priority selection strategy', async () => {
+test('persists priority mode, priority, multiplier lock and same-priority selection strategy', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-priority-'));
   const filePath = join(dir, 'config.json');
 
@@ -570,7 +691,8 @@ test('persists priority mode, priority, multiplier and same-priority selection s
       baseUrl: 'https://priority.example/v1',
       apiKey: 'sk-priority',
       priority: 3,
-      multiplier: 0.25
+      multiplier: 0,
+      multiplierLocked: true
     });
 
     const reloaded = new ConfigService({ filePath });
@@ -580,7 +702,8 @@ test('persists priority mode, priority, multiplier and same-priority selection s
     assert.equal(state.proxy.priorityMode, 'multiplier');
     assert.equal(state.proxy.samePriorityStrategy, 'random');
     assert.equal(state.sites.find((site) => site.id === created.id).priority, 3);
-    assert.equal(state.sites.find((site) => site.id === created.id).multiplier, 0.25);
+    assert.equal(state.sites.find((site) => site.id === created.id).multiplier, 0);
+    assert.equal(state.sites.find((site) => site.id === created.id).multiplierLocked, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -762,6 +885,8 @@ test('maintains a deduplicated group sync website list from configured sync site
       name: 'primary',
       baseUrl: 'https://primary.example/v1',
       apiKey: 'sk-primary',
+      multiplier: 0,
+      multiplierLocked: true,
       sync: {
         enabled: true,
         dashboardUrl: 'https://relay.example.com/console/token',
@@ -821,6 +946,8 @@ test('maintains a deduplicated group sync website list from configured sync site
           lastSyncStatus: 'success',
           lastSyncError: null,
           remote: {
+            keyGroup: 'default',
+            groupMultiplier: 0.003,
             groups: [
               { id: 'default', name: 'default', multiplier: 0.003, selected: true }
             ]
@@ -829,6 +956,11 @@ test('maintains a deduplicated group sync website list from configured sync site
       },
       { representativeSiteId: first.id }
     );
+
+    const afterSync = service.getState().sites.find((site) => site.id === first.id);
+    assert.equal(afterSync.multiplier, 0);
+    assert.equal(afterSync.multiplierLocked, true);
+    assert.equal(afterSync.sync.remote.groupMultiplier, 0.003);
 
     await service.deleteSite(other.id);
     const afterDelete = service.getGroupSyncSettings();
@@ -1202,13 +1334,42 @@ test('persists and validates the unified upstream timeout setting', async () => 
   }
 });
 
+test('persists and validates the replayable request body buffer setting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-request-body-buffer-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+
+    await service.updateProxySettings({ maxReplayableRequestBodyBytes: 32 * 1024 * 1024 });
+    assert.equal(service.getState().proxy.maxReplayableRequestBodyBytes, 32 * 1024 * 1024);
+    assert.equal(service.getMaxReplayableRequestBodyBytes(), 32 * 1024 * 1024);
+    assert.equal(service.exportConfig().settings.proxy.maxReplayableRequestBodyBytes, 32 * 1024 * 1024);
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+    assert.equal(reloaded.getState().proxy.maxReplayableRequestBodyBytes, 32 * 1024 * 1024);
+
+    await assert.rejects(
+      () => service.updateProxySettings({ maxReplayableRequestBodyBytes: 1024 * 1024 - 1 }),
+      /request body replay buffer must be an integer between 1MB and 512MB/i
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('selects request sites by priority and round-robins same-priority sites', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-select-'));
   const service = new ConfigService({ filePath: join(dir, 'config.json') });
 
   try {
     await service.load();
-    await service.updateProxySettings({ samePriorityStrategy: 'round-robin' });
+    await service.updateProxySettings({
+      smartSwitching: true,
+      samePriorityStrategy: 'round-robin'
+    });
     await service.addSite({
       name: 'later',
       baseUrl: 'https://later.example/v1',
@@ -1242,7 +1403,10 @@ test('selects request sites by multiplier and uses lower priority when multiplie
 
   try {
     await service.load();
-    await service.updateProxySettings({ priorityMode: 'multiplier' });
+    await service.updateProxySettings({
+      smartSwitching: true,
+      priorityMode: 'multiplier'
+    });
     await service.addSite({
       name: 'priority-only',
       baseUrl: 'https://priority-only.example/v1',
@@ -1266,6 +1430,75 @@ test('selects request sites by multiplier and uses lower priority when multiplie
     });
 
     assert.equal((await service.selectSiteForRequest()).id, preferred.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('automatic site selection can exclude sites above the configured multiplier limit', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-select-multiplier-limit-'));
+  const filePath = join(dir, 'config.json');
+  const service = new ConfigService({ filePath });
+
+  try {
+    await service.load();
+    await service.updateProxySettings({
+      smartSwitching: true,
+      priorityMode: 'priority',
+      autoSwitchMultiplierLimit: {
+        enabled: true,
+        maxMultiplier: 1
+      }
+    });
+    await service.addSite({
+      name: 'priority-expensive',
+      baseUrl: 'https://priority-expensive.example/v1',
+      apiKey: 'sk-priority-expensive',
+      priority: 1,
+      multiplier: 2
+    });
+    const allowed = await service.addSite({
+      name: 'allowed',
+      baseUrl: 'https://allowed.example/v1',
+      apiKey: 'sk-allowed',
+      priority: 2,
+      multiplier: 1
+    });
+
+    assert.equal((await service.selectSiteForRequest()).id, allowed.id);
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+    assert.deepEqual(reloaded.getState().proxy.autoSwitchMultiplierLimit, {
+      enabled: true,
+      maxMultiplier: 1
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('manual active site remains usable when automatic multiplier limit is enabled', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-manual-multiplier-limit-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const expensive = await service.addSite({
+      name: 'manual-expensive',
+      baseUrl: 'https://manual-expensive.example/v1',
+      apiKey: 'sk-manual-expensive',
+      multiplier: 2
+    });
+    await service.updateProxySettings({
+      smartSwitching: false,
+      autoSwitchMultiplierLimit: {
+        enabled: true,
+        maxMultiplier: 1
+      }
+    });
+
+    assert.equal((await service.selectSiteForRequest()).id, expensive.id);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1314,6 +1547,7 @@ test('schedules disabled-site auto recovery after failure threshold disables a s
 
   try {
     await service.load();
+    await service.updateProxySettings({ smartSwitching: true });
     const bad = await service.addSite({
       name: 'bad',
       baseUrl: 'https://bad.example/v1',
@@ -1396,7 +1630,7 @@ test('returns due failure-disabled sites but skips manually disabled sites', asy
 
   try {
     await service.load();
-    await service.updateProxySettings({ failureThreshold: 0 });
+    await service.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const autoDisabled = await service.addSite({
       name: 'auto-disabled',
       baseUrl: 'https://auto-disabled.example/v1',
@@ -1434,6 +1668,46 @@ test('returns due failure-disabled sites but skips manually disabled sites', asy
     );
 
     assert.deepEqual(dueSites.map((site) => site.id), [autoDisabled.id]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('does not schedule disabled-site auto recovery for enabled availability-only failures', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-auto-recovery-enabled-availability-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'enabled',
+      baseUrl: 'https://enabled.example/v1',
+      apiKey: 'sk-enabled',
+      autoRecovery: {
+        enabled: true,
+        intervalValue: 1,
+        intervalUnit: 'minute'
+      }
+    });
+
+    await service.recordSiteAvailabilityFailure(
+      site.id,
+      {
+        statusCode: 400,
+        message: 'Availability test failed HTTP 400',
+        affectsSiteHealth: false
+      },
+      new Date('2026-06-03T08:00:00.000Z')
+    );
+
+    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(updated.enabled, true);
+    assert.equal(updated.failureDisabled, false);
+    assert.equal(updated.autoRecoveryState.nextCheckAt, null);
+    assert.deepEqual(
+      service.getDueDisabledAutoRecoverySites(new Date('2026-06-03T08:01:00.000Z')),
+      []
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

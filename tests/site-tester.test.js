@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 
-import { testSiteAvailability } from '../src/proxy/site-tester.js';
+import {
+  CODEX_DESKTOP_USER_AGENT,
+  testSiteAvailability
+} from '../src/proxy/site-tester.js';
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -21,6 +24,8 @@ test('tests a site with a responses request compatible with stricter relays', as
         method: req.method,
         url: req.url,
         authorization: req.headers.authorization,
+        accept: req.headers.accept,
+        userAgent: req.headers['user-agent'],
         body: JSON.parse(body)
       };
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -40,11 +45,13 @@ test('tests a site with a responses request compatible with stricter relays', as
     assert.equal(observed.method, 'POST');
     assert.equal(observed.url, '/v1/responses');
     assert.equal(observed.authorization, 'Bearer sk-test');
+    assert.equal(observed.accept, 'text/event-stream');
+    assert.equal(observed.userAgent, CODEX_DESKTOP_USER_AGENT);
     assert.equal(observed.body.model, 'gpt-test');
     assert.equal(observed.body.instructions, 'Reply briefly.');
     assert.equal(observed.body.input, 'Hi');
     assert.equal(observed.body.max_output_tokens, 1);
-    assert.equal(observed.body.stream, false);
+    assert.equal(observed.body.stream, true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

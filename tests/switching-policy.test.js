@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   DEFAULT_GROUP_SYNC_SETTINGS,
+  DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT,
   DEFAULT_SITE_SYNC_SETTINGS,
   chooseBestSite,
   chooseFailoverSite,
@@ -12,6 +13,7 @@ import {
   normalizeSite,
   normalizeSiteCapabilities,
   normalizeGroupSyncSettings,
+  normalizeAutoSwitchMultiplierLimit,
   normalizeSiteSyncSettings,
   recordFailure,
   recordRequestFailure,
@@ -528,6 +530,41 @@ test('chooseBestSite uses lower priority as the multiplier-mode tie breaker', ()
   ], { priorityMode: 'multiplier' });
 
   assert.equal(chosen.id, 'multiplier-tie-low-priority');
+});
+
+test('chooseBestSite can skip sites above the automatic switch multiplier limit', () => {
+  assert.deepEqual(DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT, {
+    enabled: false,
+    maxMultiplier: 1
+  });
+  assert.deepEqual(normalizeAutoSwitchMultiplierLimit({
+    enabled: true,
+    maxMultiplier: '0.5'
+  }), {
+    enabled: true,
+    maxMultiplier: 0.5
+  });
+
+  const chosen = chooseBestSite([
+    site({ id: 'too-expensive', priority: 1, multiplier: 2 }),
+    site({ id: 'allowed', priority: 2, multiplier: 0.5 })
+  ], {
+    autoSwitchMultiplierLimit: {
+      enabled: true,
+      maxMultiplier: 1
+    }
+  });
+
+  assert.equal(chosen.id, 'allowed');
+  assert.equal(
+    chooseBestSite([site({ id: 'blocked', multiplier: 2 })], {
+      autoSwitchMultiplierLimit: {
+        enabled: true,
+        maxMultiplier: 1
+      }
+    }),
+    null
+  );
 });
 
 test('chooseBestSite round-robins sites with the same priority', () => {

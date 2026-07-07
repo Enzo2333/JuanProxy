@@ -25,6 +25,18 @@ test('does not preserve the editor when the form is clean', () => {
   );
 });
 
+test('preserves a focused editor before the form becomes dirty', () => {
+  assert.equal(
+    shouldPreserveEditorOnStateChange({
+      formDirty: false,
+      editorHasFocus: true,
+      selectedSiteId: 'selected',
+      nextSites: [{ id: 'selected' }]
+    }),
+    true
+  );
+});
+
 test('does not preserve a dirty editor if its selected site was deleted', () => {
   assert.equal(
     shouldPreserveEditorOnStateChange({

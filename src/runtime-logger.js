@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 const DEFAULT_FILE_NAME = 'runtime-errors.jsonl';
@@ -6,6 +6,9 @@ const DEFAULT_MAX_DEPTH = 6;
 const DEFAULT_MAX_STRING_LENGTH = 4000;
 const DEFAULT_MAX_ARRAY_ITEMS = 50;
 const DEFAULT_MAX_OBJECT_KEYS = 80;
+const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const REDACTED = '[REDACTED]';
 const TRUNCATED = '...[truncated]';
 
@@ -18,6 +21,14 @@ export class RuntimeLogger {
     appVersion = null,
     makeDirectory = mkdir,
     append = appendFile,
+    read = readFile,
+    write = writeFile,
+    move = rename,
+    remove = unlink,
+    getStat = stat,
+    retentionMs = DEFAULT_RETENTION_MS,
+    maxFileBytes = DEFAULT_MAX_FILE_BYTES,
+    cleanupIntervalMs = DEFAULT_CLEANUP_INTERVAL_MS,
     console: consoleLike = globalThis.console
   } = {}) {
     if (!filePath && !directory) {
@@ -29,6 +40,15 @@ export class RuntimeLogger {
     this.appVersion = appVersion;
     this.makeDirectory = makeDirectory;
     this.append = append;
+    this.read = read;
+    this.writeFile = write;
+    this.move = move;
+    this.remove = remove;
+    this.getStat = getStat;
+    this.retentionMs = retentionMs;
+    this.maxFileBytes = maxFileBytes;
+    this.cleanupIntervalMs = cleanupIntervalMs;
+    this.lastCleanupAt = 0;
     this.console = consoleLike;
     this.writeQueue = Promise.resolve();
   }
@@ -98,6 +118,7 @@ export class RuntimeLogger {
     const run = this.writeQueue.then(async () => {
       await this.makeDirectory(dirname(this.filePath), { recursive: true });
       await this.append(this.filePath, line, 'utf8');
+      await this.cleanupIfNeeded();
       return {
         ok: true,
         filePath: this.filePath
@@ -114,6 +135,67 @@ export class RuntimeLogger {
         filePath: this.filePath,
         error: serializeErrorForLog(writeError)
       };
+    }
+  }
+
+  async cleanupIfNeeded() {
+    if (this.retentionMs <= 0 && this.maxFileBytes <= 0) {
+      return;
+    }
+
+    const nowMs = this.now().getTime();
+    if (
+      this.cleanupIntervalMs > 0 &&
+      this.lastCleanupAt > 0 &&
+      nowMs - this.lastCleanupAt < this.cleanupIntervalMs
+    ) {
+      return;
+    }
+    this.lastCleanupAt = nowMs;
+
+    let stats;
+    try {
+      stats = await this.getStat(this.filePath);
+    } catch {
+      return;
+    }
+
+    const shouldCheckSize = this.maxFileBytes > 0 && stats.size > this.maxFileBytes;
+    const shouldCheckAge = this.retentionMs > 0;
+    if (!shouldCheckAge && !shouldCheckSize) {
+      return;
+    }
+
+    try {
+      await this.pruneLogFile({ nowMs });
+    } catch (error) {
+      this.console?.warn?.('Failed to prune runtime log:', error);
+    }
+  }
+
+  async pruneLogFile({ nowMs }) {
+    const raw = await this.read(this.filePath, 'utf8');
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    let kept = this.retentionMs > 0
+      ? lines.filter((line) => !isExpiredLogLine(line, nowMs, this.retentionMs))
+      : lines;
+
+    if (this.maxFileBytes > 0) {
+      kept = trimLinesToMaxBytes(kept, this.maxFileBytes);
+    }
+
+    if (kept.length === lines.length) {
+      return;
+    }
+
+    const payload = kept.length > 0 ? `${kept.join('\n')}\n` : '';
+    const tempPath = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
+    await this.writeFile(tempPath, payload, 'utf8');
+    try {
+      await this.move(tempPath, this.filePath);
+    } catch (error) {
+      await this.remove(tempPath).catch(() => {});
+      throw error;
     }
   }
 
@@ -328,6 +410,33 @@ function boundText(value, maxLength) {
   return value.length > maxLength
     ? `${value.slice(0, maxLength)}${TRUNCATED}`
     : value;
+}
+
+function isExpiredLogLine(line, nowMs, retentionMs) {
+  try {
+    const entry = JSON.parse(line);
+    const timestampMs = Date.parse(entry?.timestamp);
+    return Number.isFinite(timestampMs) && nowMs - timestampMs > retentionMs;
+  } catch {
+    return false;
+  }
+}
+
+function trimLinesToMaxBytes(lines, maxBytes) {
+  const kept = [];
+  let total = 0;
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const bytes = Buffer.byteLength(`${line}\n`, 'utf8');
+    if (kept.length > 0 && total + bytes > maxBytes) {
+      break;
+    }
+    kept.push(line);
+    total += bytes;
+  }
+
+  return kept.reverse();
 }
 
 function isErrorLike(value) {

@@ -1,6 +1,8 @@
 import { shouldPreserveEditorOnStateChange } from './editor-preservation.js';
 
 const api = window.openApiProxy;
+const BYTES_PER_MEGABYTE = 1024 * 1024;
+const DEFAULT_PROXY_REPLAY_BUFFER_MB = 16;
 
 let state = null;
 let selectedSiteId = null;
@@ -20,10 +22,13 @@ const elements = {
   proxyError: document.querySelector('#proxy-error'),
   proxyPort: document.querySelector('#proxy-port'),
   proxyTimeoutSeconds: document.querySelector('#proxy-timeout-seconds'),
+  proxyReplayBufferMb: document.querySelector('#proxy-replay-buffer-mb'),
   failureThreshold: document.querySelector('#failure-threshold'),
   smartSwitching: document.querySelector('#smart-switching'),
   priorityMode: document.querySelector('#priority-mode'),
   samePriorityStrategy: document.querySelector('#same-priority-strategy'),
+  autoSwitchMultiplierLimitEnabled: document.querySelector('#auto-switch-multiplier-limit-enabled'),
+  autoSwitchMaxMultiplier: document.querySelector('#auto-switch-max-multiplier'),
   globalModelMappingEnabled: document.querySelector('#global-model-mapping-enabled'),
   globalModelMappingRows: document.querySelector('#global-model-mapping-rows'),
   addGlobalModelMapping: document.querySelector('#add-global-model-mapping'),
@@ -55,6 +60,7 @@ const elements = {
   editorSubtitle: document.querySelector('#editor-subtitle'),
   configPath: document.querySelector('#config-path'),
   toolbar: document.querySelector('.toolbar'),
+  floatingAlwaysOnTop: document.querySelector('#floating-always-on-top'),
   smartSwitch: document.querySelector('#smart-switch'),
   testSite: document.querySelector('#test-site'),
   detectSiteCapabilities: document.querySelector('#detect-site-capabilities'),
@@ -87,6 +93,7 @@ const elements = {
   siteModelMapping: document.querySelector('#site-model-mapping'),
   priority: document.querySelector('#site-priority'),
   multiplier: document.querySelector('#site-multiplier'),
+  multiplierLocked: document.querySelector('#site-multiplier-locked'),
   remark: document.querySelector('#site-remark'),
   syncEnabled: document.querySelector('#site-sync-enabled'),
   syncDashboardUrl: document.querySelector('#site-sync-dashboard-url'),
@@ -96,6 +103,7 @@ const elements = {
   syncIntervalMode: document.querySelector('#site-sync-interval-mode'),
   syncIntervalValue: document.querySelector('#site-sync-interval-value'),
   syncIntervalUnit: document.querySelector('#site-sync-interval-unit'),
+  createSiteKey: document.querySelector('#create-site-key'),
   syncSite: document.querySelector('#sync-site'),
   syncSummary: document.querySelector('#site-sync-summary'),
   syncBalance: document.querySelector('#site-sync-balance'),
@@ -104,6 +112,8 @@ const elements = {
   syncMultiplier: document.querySelector('#site-sync-multiplier'),
   syncLastAt: document.querySelector('#site-sync-last-at'),
   syncGroups: document.querySelector('#site-sync-groups'),
+  syncGroupId: document.querySelector('#site-sync-group-id'),
+  switchSyncGroupId: document.querySelector('#switch-site-sync-group-id'),
   capabilitySummary: document.querySelector('#site-capability-summary'),
   capabilityFeatures: document.querySelector('#site-capability-features'),
   capabilityModels: document.querySelector('#site-capability-models'),
@@ -196,15 +206,17 @@ function applyState(nextState, { preserveDirtyEditor = false } = {}) {
     preserveDirtyEditor &&
     shouldPreserveEditorOnStateChange({
       formDirty,
+      editorHasFocus: isSiteEditorFocused(),
       selectedSiteId,
       nextSites: nextState.sites
     });
+  const preserveProxyControls = isProxyControlFocused();
 
   state = nextState;
   if (selectedSiteId && !state.sites.some((site) => site.id === selectedSiteId) && !preserveEditor) {
     selectedSiteId = state.activeSiteId ?? state.sites[0]?.id ?? null;
   }
-  render({ preserveEditor });
+  render({ preserveEditor, preserveProxyControls });
 }
 
 function applySitePatch(patch = {}) {
@@ -224,14 +236,21 @@ function applySitePatch(patch = {}) {
     sites: state.sites.map((site, siteIndex) => (siteIndex === index ? patch.site : site))
   };
 
-  renderProxy();
+  const preserveEditor = shouldPreserveEditorOnStateChange({
+    formDirty,
+    editorHasFocus: isSiteEditorFocused(),
+    selectedSiteId,
+    nextSites: state.sites
+  });
+
+  renderProxy({ preserveControls: isProxyControlFocused() });
   renderDashboard();
   renderSiteList();
   renderActiveSite();
   renderTopbarSyncGroups();
 
   const selectedSite = getSelectedSite();
-  if (formDirty) {
+  if (preserveEditor) {
     renderOverview(selectedSite);
     renderStatus(selectedSite);
     renderErrorLog(selectedSite);
@@ -240,8 +259,8 @@ function applySitePatch(patch = {}) {
   }
 }
 
-function render({ preserveEditor = false } = {}) {
-  renderProxy();
+function render({ preserveEditor = false, preserveProxyControls = false } = {}) {
+  renderProxy({ preserveControls: preserveProxyControls });
   renderDashboard();
   renderSiteList();
   renderActiveSite();
@@ -256,21 +275,31 @@ function render({ preserveEditor = false } = {}) {
   }
 }
 
-function renderProxy() {
-  elements.proxyPort.value = state.proxy.port;
-  elements.proxyTimeoutSeconds.value = Math.round((state.proxy.timeoutMs ?? 120000) / 1000);
-  elements.failureThreshold.value = state.proxy.failureThreshold;
-  elements.smartSwitching.checked = state.proxy.smartSwitching;
-  elements.priorityMode.value = state.proxy.priorityMode ?? 'priority';
-  elements.samePriorityStrategy.value = state.proxy.samePriorityStrategy ?? 'round-robin';
-  elements.globalModelMappingEnabled.checked = state.modelMapping?.enabled ?? false;
-  renderModelMappingEditor({
-    rowsElement: elements.globalModelMappingRows,
-    textElement: elements.globalModelMapping,
-    modelMapping: state.modelMapping
-  });
-  renderSiteSyncSettings();
-  renderConfigTransfer();
+function renderProxy({ preserveControls = false } = {}) {
+  if (!preserveControls) {
+    elements.proxyPort.value = state.proxy.port;
+    elements.proxyTimeoutSeconds.value = Math.round((state.proxy.timeoutMs ?? 120000) / 1000);
+    elements.proxyReplayBufferMb.value = toReplayBufferMegabytes(
+      state.proxy.maxReplayableRequestBodyBytes
+    );
+    elements.failureThreshold.value = state.proxy.failureThreshold;
+    elements.smartSwitch.checked = Boolean(state.proxy.smartSwitching);
+    elements.smartSwitching.checked = Boolean(state.proxy.smartSwitching);
+    elements.priorityMode.value = state.proxy.priorityMode ?? 'priority';
+    elements.samePriorityStrategy.value = state.proxy.samePriorityStrategy ?? 'round-robin';
+    elements.autoSwitchMultiplierLimitEnabled.checked =
+      Boolean(state.proxy.autoSwitchMultiplierLimit?.enabled);
+    elements.autoSwitchMaxMultiplier.value = state.proxy.autoSwitchMultiplierLimit?.maxMultiplier ?? 1;
+    elements.floatingAlwaysOnTop.checked = Boolean(state.appSettings?.floatingWindow?.alwaysOnTop);
+    elements.globalModelMappingEnabled.checked = state.modelMapping?.enabled ?? false;
+    renderModelMappingEditor({
+      rowsElement: elements.globalModelMappingRows,
+      textElement: elements.globalModelMapping,
+      modelMapping: state.modelMapping
+    });
+    renderSiteSyncSettings();
+    renderConfigTransfer();
+  }
   elements.configPath.textContent = `配置文件：${state.configPath}`;
 
   const running = state.proxyStatus.running;
@@ -525,29 +554,52 @@ function renderSiteListItem(item = document.createElement('div'), site) {
 
   const actions = document.createElement('div');
   actions.className = 'site-actions';
-  const toggleAction = getSiteToggleAction(site);
 
   const testButton = document.createElement('button');
   testButton.type = 'button';
   testButton.className = 'secondary test-site-action';
   testButton.textContent = '测试';
   testButton.title = '测试该站点';
-  testButton.addEventListener('click', () => testSiteById(site.id));
+  testButton.addEventListener('click', async (event) => {
+    event.stopPropagation?.();
+    await testSiteFromList(site.id);
+  });
 
-  const toggleButton = document.createElement('button');
-  toggleButton.type = 'button';
-  toggleButton.className =
-    toggleAction.nextManualEnabled ? 'manual-toggle' : 'secondary manual-toggle';
-  toggleButton.textContent = toggleAction.label;
-  toggleButton.title =
-    toggleAction.nextManualEnabled ? '启用该站点' : '手动停用该站点';
-  toggleButton.addEventListener('click', () =>
-    toggleSiteById(site.id, toggleAction.nextManualEnabled)
-  );
-
-  actions.append(testButton, toggleButton);
+  actions.append(testButton, renderSiteListAction(site));
   replaceChildren(item, [main, actions]);
   return item;
+}
+
+function renderSiteListAction(site) {
+  if (state.proxy.smartSwitching) {
+    const toggleAction = getSiteToggleAction(site);
+    const toggleButton = document.createElement('button');
+    toggleButton.type = 'button';
+    toggleButton.className =
+      toggleAction.nextManualEnabled ? 'manual-toggle' : 'secondary manual-toggle';
+    toggleButton.textContent = toggleAction.label;
+    toggleButton.title =
+      toggleAction.nextManualEnabled ? '启用该站点' : '手动停用该站点';
+    toggleButton.addEventListener('click', () =>
+      toggleSiteById(site.id, toggleAction.nextManualEnabled)
+    );
+    return toggleButton;
+  }
+
+  const selected = site.id === state.activeSiteId;
+  const available = getAvailabilityState(site) === 'enabled';
+  const selectButton = document.createElement('button');
+  selectButton.type = 'button';
+  selectButton.className = selected || !available ? 'secondary manual-select' : 'manual-select';
+  selectButton.textContent = selected ? '已选择' : '选择';
+  selectButton.disabled = selected || !available;
+  selectButton.title = selected
+    ? '当前手动选择的站点'
+    : available
+      ? '手动选择该站点用于后续请求'
+      : '该站点当前不可用，不能选择';
+  selectButton.addEventListener('click', () => selectSiteById(site.id));
+  return selectButton;
 }
 
 function replaceChildren(element, children) {
@@ -562,6 +614,109 @@ function replaceChildren(element, children) {
 
 function getElementChildren(element) {
   return Array.from(element.children ?? []);
+}
+
+function isSiteEditorFocused() {
+  const activeElement = document.activeElement;
+  if (!isEditableControl(activeElement)) {
+    return false;
+  }
+
+  return (
+    isElementInTree(activeElement, elements.form) ||
+    getSiteEditorControlRoots().some((root) => isElementInTree(activeElement, root))
+  );
+}
+
+function isProxyControlFocused() {
+  const activeElement = document.activeElement;
+  if (!isEditableControl(activeElement)) {
+    return false;
+  }
+
+  return getProxyControlRoots().some((root) => isElementInTree(activeElement, root));
+}
+
+function getSiteEditorControlRoots() {
+  return [
+    elements.siteId,
+    elements.name,
+    elements.baseUrl,
+    elements.apiKey,
+    elements.testModel,
+    elements.siteModelMappingEnabled,
+    elements.siteModelMappingRows,
+    elements.siteModelMapping,
+    elements.priority,
+    elements.multiplier,
+    elements.multiplierLocked,
+    elements.remark,
+    elements.syncEnabled,
+    elements.syncDashboardUrl,
+    elements.syncUsername,
+    elements.syncPassword,
+    elements.syncProviderType,
+    elements.syncIntervalMode,
+    elements.syncIntervalValue,
+    elements.syncIntervalUnit,
+    elements.syncGroupId,
+    elements.rateLimitEnabled,
+    elements.rateLimitCount,
+    elements.rateLimitWindowValue,
+    elements.rateLimitWindowUnit,
+    elements.autoRecoveryEnabled,
+    elements.autoRecoveryIntervalValue,
+    elements.autoRecoveryIntervalUnit,
+    elements.enabled
+  ].filter(Boolean);
+}
+
+function getProxyControlRoots() {
+  return [
+    elements.proxyPort,
+    elements.proxyTimeoutSeconds,
+    elements.proxyReplayBufferMb,
+    elements.failureThreshold,
+    elements.smartSwitching,
+    elements.priorityMode,
+    elements.samePriorityStrategy,
+    elements.autoSwitchMultiplierLimitEnabled,
+    elements.autoSwitchMaxMultiplier,
+    elements.globalModelMappingEnabled,
+    elements.globalModelMappingRows,
+    elements.globalModelMapping,
+    elements.siteSyncGlobalIntervalValue,
+    elements.siteSyncGlobalIntervalUnit,
+    elements.siteSyncIntelligentScheduling,
+    elements.groupSyncIntervalValue,
+    elements.groupSyncIntervalUnit,
+    elements.configExportGlobalSettings,
+    elements.configExportMode,
+    elements.configExportSelectedSites,
+    elements.configImportGlobalSettings,
+    elements.configImportSites
+  ].filter(Boolean);
+}
+
+function isEditableControl(element) {
+  const tagName = element?.tagName?.toLowerCase?.();
+  return (
+    tagName === 'input' ||
+    tagName === 'textarea' ||
+    tagName === 'select' ||
+    Boolean(element?.isContentEditable)
+  );
+}
+
+function isElementInTree(element, root) {
+  let current = element;
+  while (current) {
+    if (current === root) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
 }
 
 function renderActiveSite() {
@@ -671,6 +826,7 @@ function renderEditor() {
   });
   elements.priority.value = site?.priority ?? 100;
   elements.multiplier.value = site?.multiplier ?? 1;
+  elements.multiplierLocked.checked = site?.multiplierLocked ?? false;
   elements.remark.value = site?.remark ?? '';
   elements.syncEnabled.checked = site?.sync?.enabled ?? false;
   elements.syncDashboardUrl.value = site?.sync?.dashboardUrl ?? '';
@@ -681,6 +837,7 @@ function renderEditor() {
   elements.syncIntervalValue.value = site?.sync?.intervalValue ?? 30;
   elements.syncIntervalUnit.value = site?.sync?.intervalUnit ?? 'minute';
   updateSyncIntervalModeState();
+  elements.createSiteKey.disabled = !hasSite;
   elements.syncSite.disabled = !hasSite;
   renderSyncRemote(site?.sync);
   renderCapabilities(site?.capabilities);
@@ -693,8 +850,7 @@ function renderEditor() {
   elements.autoRecoveryIntervalUnit.value = site?.autoRecovery?.intervalUnit ?? 'minute';
   elements.enabled.checked = site?.manualEnabled ?? site?.enabled ?? true;
 
-  elements.setActive.disabled =
-    !hasSite || site.id === state.activeSiteId || getAvailabilityState(site) !== 'enabled';
+  renderSetActiveAction(site);
   elements.testSite.disabled = !hasSite;
   elements.detectSiteCapabilities.disabled = !hasSite;
   elements.toggleSelectedSite.disabled = !hasSite;
@@ -718,6 +874,37 @@ function renderEditor() {
   renderErrorLog(site);
 }
 
+function renderSetActiveAction(site) {
+  const hasSite = Boolean(site);
+  const automaticSelection = Boolean(state.proxy.smartSwitching);
+  elements.setActive.className = 'secondary';
+
+  if (!hasSite) {
+    elements.setActive.textContent = '选择';
+    elements.setActive.disabled = true;
+    elements.setActive.title = '';
+    return;
+  }
+
+  if (automaticSelection) {
+    elements.setActive.textContent = '自动选择中';
+    elements.setActive.disabled = true;
+    elements.setActive.title = '关闭自动选择后可以手动选择当前站点';
+    return;
+  }
+
+  const selected = site.id === state.activeSiteId;
+  const available = getAvailabilityState(site) === 'enabled';
+  elements.setActive.textContent = selected ? '已选择' : '选择';
+  elements.setActive.disabled = selected || !available;
+  elements.setActive.className = selected || !available ? 'secondary' : '';
+  elements.setActive.title = selected
+    ? '当前手动选择的站点'
+    : available
+      ? '手动选择该站点用于后续请求'
+      : '该站点当前不可用，不能选择';
+}
+
 function renderSyncRemote(sync) {
   const remote = sync?.remote ?? {};
 
@@ -727,6 +914,7 @@ function renderSyncRemote(sync) {
   elements.syncKeyGroup.textContent = remote.keyGroup || '-';
   elements.syncMultiplier.textContent = formatOptionalMultiplier(remote.groupMultiplier);
   elements.syncLastAt.textContent = formatLocalDateTime(sync?.lastSyncAt);
+  elements.switchSyncGroupId.disabled = !getSelectedSite();
   renderSiteSyncGroups(sync);
 }
 
@@ -809,6 +997,7 @@ function readSiteFormPayload(existingSite = null) {
     ),
     priority: Number(elements.priority.value || 100),
     multiplier: readSiteMultiplier(),
+    multiplierLocked: elements.multiplierLocked.checked,
     remark: elements.remark.value.trim(),
     sync: readSyncFormPayload(existingSite?.sync),
     rateLimit: {
@@ -849,7 +1038,7 @@ function renderSiteSyncGroupButton(group) {
   ].filter(Boolean).join(' ');
   button.title = `切换到 ${group.name}，倍率 ${formatGroupMultiplierText(group.multiplier)}`;
   button.textContent = formatGroupChipLabel(group);
-  button.addEventListener('click', () => switchSelectedSiteGroup(group.name));
+  button.addEventListener('click', () => switchSelectedSiteGroup({ groupName: group.name }));
   return button;
 }
 
@@ -1191,27 +1380,95 @@ elements.syncSite.addEventListener('click', async () => {
   });
 });
 
-async function switchSelectedSiteGroup(groupName) {
+elements.createSiteKey.addEventListener('click', async () => {
   const site = getSelectedSite();
-  if (!site || !api.switchSiteGroup) {
+  if (!site || !api.createSiteKey) {
     return;
   }
-  if (!confirm(formatSwitchGroupConfirmMessage(site, groupName))) {
+  if (!confirm(`确认在 ${site.name} 的远端账号中新建密钥并导入本地？`)) {
     return;
   }
 
   await runAction(async () => {
-    state = await api.switchSiteGroup(site.id, groupName);
+    const id = site.id;
+    state = await api.updateSite(id, {
+      sync: {
+        ...site.sync,
+        ...readSyncFormPayload(site.sync)
+      }
+    });
+    selectedSiteId = id;
+    formDirty = false;
+    render();
+
+    state = await api.createSiteKey(id);
+    selectedSiteId = id;
+    formDirty = false;
+    render();
+    showToast(state.createKeyResult?.ok ? '远端密钥已创建' : '远端密钥创建失败');
+  });
+});
+
+elements.switchSyncGroupId.addEventListener('click', async () => {
+  const groupId = elements.syncGroupId.value.trim();
+  if (!groupId) {
+    showToast('请输入分组 ID');
+    elements.syncGroupId.focus();
+    return;
+  }
+  await switchSelectedSiteGroup({ groupId });
+});
+
+async function switchSelectedSiteGroup(group) {
+  const site = getSelectedSite();
+  if (!site || !api.switchSiteGroup) {
+    return;
+  }
+  const normalizedGroup = normalizeSwitchGroupInput(site, group);
+  if (!normalizedGroup.groupName && !normalizedGroup.groupId) {
+    showToast('请输入分组 ID');
+    return;
+  }
+  if (!confirm(formatSwitchGroupConfirmMessage(site, normalizedGroup))) {
+    return;
+  }
+
+  await runAction(async () => {
+    const switchPayload = normalizedGroup.groupId
+      ? normalizedGroup
+      : normalizedGroup.groupName;
+    state = await api.switchSiteGroup(site.id, switchPayload);
     selectedSiteId = site.id;
     formDirty = false;
     render();
+    if (group?.groupId && elements.syncGroupId) {
+      elements.syncGroupId.value = '';
+    }
     showToast('分组已切换');
   });
 }
 
-function formatSwitchGroupConfirmMessage(site, groupName) {
+function normalizeSwitchGroupInput(site, group = {}) {
+  const groupName = String(group?.groupName ?? group?.name ?? '').trim();
+  const groupId = String(group?.groupId ?? group?.id ?? '').trim();
+  const matchedGroup = groupId
+    ? normalizeRemoteGroups(site?.sync?.remote?.groups)
+        .find((candidate) => candidate.id === groupId)
+    : null;
+  const normalizedGroupName = groupName || matchedGroup?.name || '';
+  return {
+    groupName: normalizedGroupName,
+    ...(groupId && (!groupName || Object.hasOwn(group, 'groupId')) ? { groupId } : {})
+  };
+}
+
+function formatSwitchGroupConfirmMessage(site, group = {}) {
   const currentGroup = site?.sync?.remote?.keyGroup || '-';
-  return `确认将 ${site.name} 的远端分组从 ${currentGroup} 切换到 ${groupName}？`;
+  const target = group.groupName || group.groupId || '-';
+  const suffix = group.groupId && group.groupName
+    ? `（ID: ${group.groupId}）`
+    : '';
+  return `确认将 ${site.name} 的远端分组从 ${currentGroup} 切换到 ${target}${suffix}？`;
 }
 
 elements.resetForm.addEventListener('click', () => {
@@ -1266,6 +1523,18 @@ async function testSiteById(siteId) {
   });
 }
 
+async function testSiteFromList(siteId) {
+  const site = state.sites.find((candidate) => candidate.id === siteId);
+  if (!site) {
+    return;
+  }
+  if (!formDirty && selectedSiteId !== siteId) {
+    selectedSiteId = siteId;
+    render();
+  }
+  await testSiteById(siteId);
+}
+
 async function detectCapabilitiesById(siteId) {
   await runAction(async () => {
     await detectCapabilitiesByIdUnsafe(siteId);
@@ -1311,26 +1580,57 @@ async function toggleSiteById(siteId, nextManualEnabled) {
   });
 }
 
-elements.setActive.addEventListener('click', async () => {
-  const site = getSelectedSite();
-  if (!site) {
+async function selectSiteById(siteId) {
+  const site = state.sites.find((candidate) => candidate.id === siteId);
+  if (
+    !site ||
+    state.proxy.smartSwitching ||
+    site.id === state.activeSiteId ||
+    getAvailabilityState(site) !== 'enabled'
+  ) {
     return;
   }
   await runAction(async () => {
     state = await api.setActiveSite(site.id);
+    selectedSiteId = site.id;
     formDirty = false;
     render();
     showToast('当前站点已更新');
   });
+}
+
+elements.setActive.addEventListener('click', async () => {
+  const site = getSelectedSite();
+  if (site) {
+    await selectSiteById(site.id);
+  }
 });
 
-elements.smartSwitch.addEventListener('click', async () => {
+elements.smartSwitch.addEventListener('change', async () => {
+  const smartSwitching = elements.smartSwitch.checked;
   await runAction(async () => {
-    state = await api.smartSwitchSite();
-    selectedSiteId = state.activeSiteId;
-    formDirty = false;
-    render();
-    showToast('已完成智能选择');
+    state = await api.updateProxy({
+      ...state.proxy,
+      smartSwitching
+    });
+    render({ preserveEditor: formDirty });
+    if (formDirty) {
+      renderSetActiveAction(getSelectedSite());
+    }
+    showToast(smartSwitching ? '已开启自动选择' : '已切换为手动选择');
+  });
+});
+
+elements.floatingAlwaysOnTop.addEventListener('change', async () => {
+  const alwaysOnTop = elements.floatingAlwaysOnTop.checked;
+  await runAction(async () => {
+    state = await api.updateAppSettings({
+      floatingWindow: {
+        alwaysOnTop
+      }
+    });
+    render({ preserveEditor: formDirty });
+    showToast(alwaysOnTop ? '悬浮窗已保持最前' : '悬浮窗已取消置顶');
   });
 });
 
@@ -1362,10 +1662,15 @@ elements.saveProxy.addEventListener('click', async () => {
     state = await api.updateProxy({
       port: Number(elements.proxyPort.value),
       timeoutMs: Number(elements.proxyTimeoutSeconds.value) * 1000,
+      maxReplayableRequestBodyBytes: toReplayBufferBytes(elements.proxyReplayBufferMb.value),
       failureThreshold: Number(elements.failureThreshold.value),
       smartSwitching: elements.smartSwitching.checked,
       priorityMode: elements.priorityMode.value,
-      samePriorityStrategy: elements.samePriorityStrategy.value
+      samePriorityStrategy: elements.samePriorityStrategy.value,
+      autoSwitchMultiplierLimit: {
+        enabled: elements.autoSwitchMultiplierLimitEnabled.checked,
+        maxMultiplier: Number(elements.autoSwitchMaxMultiplier.value || 1)
+      }
     });
     state = await api.updateModelMapping(
       readModelMappingFormPayload(
@@ -1588,6 +1893,18 @@ export function formatMultiplier(multiplier) {
     return '1';
   }
   return Number.isInteger(number) ? number.toFixed(0) : String(number);
+}
+
+function toReplayBufferMegabytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) {
+    return DEFAULT_PROXY_REPLAY_BUFFER_MB;
+  }
+  return Math.round(value / BYTES_PER_MEGABYTE);
+}
+
+function toReplayBufferBytes(megabytes) {
+  return Number(megabytes) * BYTES_PER_MEGABYTE;
 }
 
 function renderBalanceBadge(site) {

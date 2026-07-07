@@ -4,17 +4,22 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const rendererHtmlPath = fileURLToPath(new URL('../src/renderer/index.html', import.meta.url));
+const floatingHtmlPath = fileURLToPath(new URL('../src/renderer/floating.html', import.meta.url));
+const mainJsPath = fileURLToPath(new URL('../src/main.js', import.meta.url));
 let rendererImportCounter = 0;
 
-function createElementStub() {
+function createElementStub(tagName = 'div') {
   const listeners = new Map();
+  const attributes = new Map();
   return {
+    tagName: String(tagName).toUpperCase(),
     _innerHTML: '',
     _className: '',
     children: [],
     checked: false,
     dataset: {},
     hidden: false,
+    style: {},
     _textContent: '',
     title: '',
     type: '',
@@ -62,7 +67,11 @@ function createElementStub() {
       this.parentElement = null;
     },
     setAttribute(name, value) {
+      attributes.set(name, String(value));
       this[name] = value;
+    },
+    getAttribute(name) {
+      return attributes.get(name);
     },
     async dispatchEvent(type, event = {}) {
       for (const listener of listeners.get(type) ?? []) {
@@ -72,8 +81,83 @@ function createElementStub() {
         });
       }
     },
-    focus() {}
+    focus() {
+      if (globalThis.document) {
+        globalThis.document.activeElement = this;
+      }
+    }
   };
+}
+
+function tagNameForSelector(selector) {
+  const selectSelectors = new Set([
+    '#priority-mode',
+    '#same-priority-strategy',
+    '#site-sync-global-interval-unit',
+    '#group-sync-interval-unit',
+    '#config-export-mode',
+    '#site-sync-provider-type',
+    '#site-sync-interval-mode',
+    '#site-sync-interval-unit',
+    '#rate-limit-window-unit',
+    '#auto-recovery-interval-unit',
+    '#site-status-filter',
+    '#site-sort'
+  ]);
+  const textareaSelectors = new Set([
+    '#global-model-mapping',
+    '#site-model-mapping',
+    '#site-remark'
+  ]);
+  const inputSelectors = new Set([
+    '#proxy-port',
+    '#proxy-timeout-seconds',
+    '#proxy-replay-buffer-mb',
+    '#failure-threshold',
+    '#smart-switching',
+    '#auto-switch-multiplier-limit-enabled',
+    '#auto-switch-max-multiplier',
+    '#global-model-mapping-enabled',
+    '#site-sync-global-interval-value',
+    '#site-sync-intelligent-scheduling',
+    '#group-sync-interval-value',
+    '#config-export-global-settings',
+    '#config-import-global-settings',
+    '#floating-always-on-top',
+    '#smart-switch',
+    '#site-id',
+    '#site-name',
+    '#site-base-url',
+    '#site-api-key',
+    '#site-test-model',
+    '#site-model-mapping-enabled',
+    '#site-priority',
+    '#site-multiplier',
+    '#site-multiplier-locked',
+    '#site-sync-enabled',
+    '#site-sync-dashboard-url',
+    '#site-sync-username',
+    '#site-sync-password',
+    '#site-sync-interval-value',
+    '#site-sync-group-id',
+    '#rate-limit-enabled',
+    '#rate-limit-count',
+    '#rate-limit-window-value',
+    '#auto-recovery-enabled',
+    '#auto-recovery-interval-value',
+    '#site-enabled'
+  ]);
+
+  if (selectSelectors.has(selector)) {
+    return 'select';
+  }
+  if (textareaSelectors.has(selector)) {
+    return 'textarea';
+  }
+  if (inputSelectors.has(selector)) {
+    return 'input';
+  }
+  return 'div';
 }
 
 async function setupRendererApp({
@@ -82,8 +166,9 @@ async function setupRendererApp({
   proxy = {
     port: 8787,
     timeoutMs: 120000,
+    maxReplayableRequestBodyBytes: 16 * 1024 * 1024,
     failureThreshold: 3,
-    smartSwitching: true,
+    smartSwitching: false,
     priorityMode: 'priority',
     samePriorityStrategy: 'round-robin'
   },
@@ -105,6 +190,11 @@ async function setupRendererApp({
   modelMapping = {
     enabled: false,
     mappings: []
+  },
+  appSettings = {
+    floatingWindow: {
+      alwaysOnTop: false
+    }
   },
   importPreviewResult = {
     canceled: false,
@@ -139,8 +229,10 @@ async function setupRendererApp({
   const siteSyncUpdates = [];
   const groupSyncUpdates = [];
   const modelMappingUpdates = [];
+  const appSettingsUpdates = [];
   const appState = {
     configPath: 'test-config.json',
+    appSettings,
     proxy,
     modelMapping,
     siteSync,
@@ -152,10 +244,13 @@ async function setupRendererApp({
   const siteTestCalls = [];
   const capabilityDetectionCalls = [];
   const siteSyncCalls = [];
+  const siteCreateKeyCalls = [];
   const refreshAllSiteSyncCalls = [];
   const siteAdds = [];
   const siteUpdates = [];
+  const setActiveSiteCalls = [];
   const siteEnabledUpdates = [];
+  const smartSwitchCalls = [];
   const copyTextCalls = [];
   const configExportCalls = [];
   const configImportPreviewCalls = [];
@@ -166,6 +261,8 @@ async function setupRendererApp({
   const siteChangedListeners = [];
 
   globalThis.window = {
+    innerWidth: 900,
+    innerHeight: 700,
     openApiProxy: {
       async getState() {
         return appState;
@@ -196,6 +293,11 @@ async function setupRendererApp({
               }
             : site
         );
+        return appState;
+      },
+      async setActiveSite(id) {
+        setActiveSiteCalls.push(id);
+        appState.activeSiteId = id;
         return appState;
       },
       async updateProxy(patch) {
@@ -230,6 +332,18 @@ async function setupRendererApp({
         };
         return appState;
       },
+      async updateAppSettings(patch) {
+        appSettingsUpdates.push(patch);
+        appState.appSettings = {
+          ...appState.appSettings,
+          ...patch,
+          floatingWindow: {
+            ...appState.appSettings.floatingWindow,
+            ...(patch?.floatingWindow ?? {})
+          }
+        };
+        return appState;
+      },
       async setSiteEnabled(id, enabled) {
         siteEnabledUpdates.push({ id, enabled });
         appState.sites = appState.sites.map((site) =>
@@ -246,6 +360,23 @@ async function setupRendererApp({
       },
       async testSite(id) {
         siteTestCalls.push(id);
+        appState.sites = appState.sites.map((site) =>
+          site.id === id
+            ? {
+                ...site,
+                status: 'success',
+                requestCount: (site.requestCount ?? 0) + 1,
+                successCount: (site.successCount ?? 0) + 1,
+                lastRequestAt: '2026-06-10T08:00:00.000Z',
+                lastSuccessAt: '2026-06-10T08:00:00.000Z',
+                lastSuccess: {
+                  at: '2026-06-10T08:00:00.000Z',
+                  statusCode: 200,
+                  message: 'ok'
+                }
+              }
+            : site
+        );
         return {
           ...appState,
           testResult: {
@@ -355,14 +486,68 @@ async function setupRendererApp({
           }
         };
       },
-      async switchSiteGroup(id, groupName) {
-        siteUpdates.push({ id, switchGroupName: groupName });
+      async createSiteKey(id) {
+        siteCreateKeyCalls.push(id);
+        appState.sites = appState.sites.map((site) =>
+          site.id === id
+            ? {
+                ...site,
+                apiKey: 'sk-created',
+                multiplier: 0.001,
+                sync: {
+                  ...site.sync,
+                  lastSyncAt: '2026-06-09T08:00:00.000Z',
+                  lastSyncStatus: 'success',
+                  lastSyncError: null,
+                  remote: {
+                    ...site.sync?.remote,
+                    providerType: site.sync?.providerType ?? 'modern-v1',
+                    keyName: site.name,
+                    remoteKeyId: '37',
+                    keyGroup: 'Example Team',
+                    groupId: '18',
+                    groupMultiplier: 0.001
+                  }
+                }
+              }
+            : site
+        );
+        return {
+          ...appState,
+          createKeyResult: {
+            ok: true,
+            multiplier: 0.001,
+            keyName: 'site'
+          }
+        };
+      },
+      async smartSwitchSite() {
+        smartSwitchCalls.push(true);
+        const chosen = appState.sites.find((site) =>
+          (site.manualEnabled ?? site.enabled ?? true) &&
+            !site.failureDisabled &&
+            site.enabled !== false
+        );
+        appState.activeSiteId = chosen?.id ?? null;
+        return appState;
+      },
+      async switchSiteGroup(id, group) {
+        const groupName = typeof group === 'object' ? group.groupName : group;
+        const groupId = typeof group === 'object' ? group.groupId : '';
+        siteUpdates.push({
+          id,
+          switchGroupName: groupName,
+          ...(groupId ? { switchGroupId: groupId } : {})
+        });
         appState.sites = appState.sites.map((site) => {
           if (site.id !== id) {
             return site;
           }
           const groups = site.sync?.remote?.groups ?? [];
-          const selectedGroup = groups.find((group) => group.name === groupName);
+          const selectedGroup = groups.find((candidate) =>
+            (groupId && candidate.id === groupId) ||
+            candidate.name === groupName
+          );
           return {
             ...site,
             multiplier: selectedGroup?.multiplier ?? site.multiplier,
@@ -371,10 +556,11 @@ async function setupRendererApp({
               remote: {
                 ...site.sync?.remote,
                 keyGroup: selectedGroup?.name ?? site.sync?.remote?.keyGroup ?? '',
+                groupId: selectedGroup?.id ?? site.sync?.remote?.groupId ?? '',
                 groupMultiplier: selectedGroup?.multiplier ?? site.sync?.remote?.groupMultiplier ?? null,
                 groups: groups.map((group) => ({
                   ...group,
-                  selected: group.name === groupName
+                  selected: (groupId && group.id === groupId) || group.name === groupName
                 }))
               }
             }
@@ -464,6 +650,12 @@ async function setupRendererApp({
     addEventListener(type, listener) {
       windowListeners.set(type, [...(windowListeners.get(type) ?? []), listener]);
     },
+    removeEventListener(type, listener) {
+      windowListeners.set(
+        type,
+        (windowListeners.get(type) ?? []).filter((candidate) => candidate !== listener)
+      );
+    },
     dispatchEvent(event) {
       for (const listener of windowListeners.get(event.type) ?? []) {
         listener(event);
@@ -471,14 +663,15 @@ async function setupRendererApp({
     }
   };
   globalThis.document = {
+    activeElement: null,
     querySelector(selector) {
       if (!elements.has(selector)) {
-        elements.set(selector, createElementStub());
+        elements.set(selector, createElementStub(tagNameForSelector(selector)));
       }
       return elements.get(selector);
     },
-    createElement() {
-      return createElementStub();
+    createElement(tagName) {
+      return createElementStub(tagName);
     }
   };
   globalThis.confirm = (message) => {
@@ -497,13 +690,17 @@ async function setupRendererApp({
     siteSyncUpdates,
     groupSyncUpdates,
     modelMappingUpdates,
+    appSettingsUpdates,
     siteTestCalls,
     capabilityDetectionCalls,
     siteSyncCalls,
+    siteCreateKeyCalls,
     refreshAllSiteSyncCalls,
     siteAdds,
     siteUpdates,
+    setActiveSiteCalls,
     siteEnabledUpdates,
+    smartSwitchCalls,
     copyTextCalls,
     configExportCalls,
     configImportPreviewCalls,
@@ -556,6 +753,74 @@ function formatExpectedLocalDateTime(value) {
 function getMappingRowField(row, field) {
   return row.children.find((child) => child.dataset?.field === field);
 }
+
+test('renderer preserves a focused site editor when background state updates arrive', async () => {
+  const site = {
+    id: 'site-1',
+    name: 'Saved Site',
+    baseUrl: 'https://site.example/v1',
+    apiKey: 'sk-site',
+    manualEnabled: true,
+    failureDisabled: false,
+    enabled: true,
+    status: 'idle',
+    priority: 20,
+    multiplier: 1,
+    requestCount: 0,
+    successCount: 0,
+    errorCount: 0,
+    consecutiveErrors: 0,
+    errorLog: []
+  };
+  const { elements, dispatchStateChanged } = await setupRendererApp({
+    activeSiteId: site.id,
+    sites: [site]
+  });
+
+  const nameInput = elements.get('#site-name');
+  nameInput.focus();
+  nameInput.value = 'Draft Site Name';
+
+  dispatchStateChanged({
+    activeSiteId: site.id,
+    sites: [
+      {
+        ...site,
+        requestCount: 1,
+        lastRequestAt: '2026-06-03T08:00:00.000Z'
+      }
+    ]
+  });
+
+  assert.equal(nameInput.value, 'Draft Site Name');
+});
+
+test('renderer preserves focused proxy settings while still updating proxy status', async () => {
+  const { elements, dispatchStateChanged } = await setupRendererApp();
+  const portInput = elements.get('#proxy-port');
+
+  portInput.focus();
+  portInput.value = '9999';
+
+  dispatchStateChanged({
+    proxy: {
+      port: 8788,
+      timeoutMs: 120000,
+      failureThreshold: 3,
+      smartSwitching: false,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    },
+    proxyStatus: {
+      running: true,
+      port: 8788,
+      error: null
+    }
+  });
+
+  assert.equal(portInput.value, '9999');
+  assert.equal(elements.get('#proxy-url').textContent, 'http://127.0.0.1:8788/v1');
+});
 
 test('formats last request time as relative elapsed text', async () => {
   const { formatLastRequestText } = await importRendererApp();
@@ -1373,15 +1638,32 @@ test('renderer renders the active site in the top navigation bar', async () => {
         multiplier: 0.00001,
         sync: {
           lastSyncStatus: 'success',
+          lastSyncAt: '2026-06-03T08:01:00.000Z',
           remote: {
-            balance: '$1.07'
+            balance: '$1.07',
+            keyGroup: 'pro-group'
           }
+        },
+        rateLimit: {
+          enabled: true,
+          limit: 60,
+          windowValue: 1,
+          windowUnit: 'minute'
+        },
+        rateLimitState: {
+          used: 7
+        },
+        autoRecoveryState: {
+          nextCheckAt: '2026-06-03T08:30:00.000Z'
         },
         requestCount: 4,
         successCount: 3,
         errorCount: 1,
         consecutiveErrors: 0,
         lastRequestAt: '2026-06-03T08:00:00.000Z',
+        lastError: {
+          message: 'temporary upstream error'
+        },
         errorLog: []
       }
     ]
@@ -1480,6 +1762,42 @@ test('renderer styles active-site balance and multiplier badges with color accen
   assert.match(css, /overflow-wrap: anywhere/);
 });
 
+test('floating window exposes a circular independent active-site surface', async () => {
+  const html = await readFile(floatingHtmlPath, 'utf8');
+  const css = await readFile(fileURLToPath(new URL('../src/renderer/floating.css', import.meta.url)), 'utf8');
+  const js = await readFile(fileURLToPath(new URL('../src/renderer/floating.js', import.meta.url)), 'utf8');
+
+  assert.match(html, /id="floating-handle"/);
+  assert.match(html, /id="floating-always-on-top"/);
+  assert.match(html, /floating\.js/);
+  assert.match(css, /background: transparent/);
+  assert.match(css, /\.floating-handle/);
+  assert.match(css, /border-radius: 50%/);
+  assert.match(css, /inset 0 1px 0/);
+  assert.match(css, /\.floating-shell\.is-expanded/);
+  assert.match(js, /setFloatingWindowExpanded/);
+  assert.match(js, /setFloatingWindowBounds/);
+  assert.match(js, /updateAppSettings/);
+  assert.match(js, /return `\$\{formatMultiplier\(site\?\.multiplier\)\}x`/);
+  assert.doesNotMatch(js, /return site\?\.sync\?\.remote\?\.balance \|\| `\$\{formatMultiplier/);
+  assert.match(js, /pointerenter/);
+  assert.match(js, /scheduleHoverExpand/);
+  assert.doesNotMatch(js, /handle\.addEventListener\('click'/);
+});
+
+test('main process creates an independent always-on-top capable floating window', async () => {
+  const source = await readFile(mainJsPath, 'utf8');
+
+  assert.match(source, /let floatingWindow = null/);
+  assert.match(source, /new BrowserWindow\(\{/);
+  assert.match(source, /floating\.html/);
+  assert.match(source, /setAlwaysOnTop/);
+  assert.match(source, /floating-window:set-expanded/);
+  assert.match(source, /floating-window:set-bounds/);
+  assert.match(source, /getInitialFloatingWindowBounds/);
+  assert.match(source, /scheduleFloatingWindowPositionSave/);
+});
+
 test('renderer exposes request dashboard controls', async () => {
   const html = await readFile(rendererHtmlPath, 'utf8');
 
@@ -1502,7 +1820,126 @@ test('renderer exposes site status filter and topbar active site panel', async (
   assert.match(html, /class="topbar-active-site"/);
   assert.match(html, /id="active-site-name"/);
   assert.match(html, /id="active-site-status"/);
+  assert.match(html, /id="floating-always-on-top"/);
+  assert.doesNotMatch(html, /id="floating-active-site"/);
   assert.doesNotMatch(html, /id="active-site-url"/);
+});
+
+test('renderer toggles the independent floating window always-on-top setting', async () => {
+  const { elements, appSettingsUpdates } = await setupRendererApp({
+    appSettings: {
+      floatingWindow: {
+        alwaysOnTop: false
+      }
+    }
+  });
+
+  assert.equal(elements.get('#floating-always-on-top').checked, false);
+
+  elements.get('#floating-always-on-top').checked = true;
+  await elements.get('#floating-always-on-top').dispatchEvent('change');
+
+  assert.deepEqual(appSettingsUpdates.at(-1), {
+    floatingWindow: {
+      alwaysOnTop: true
+    }
+  });
+  assert.equal(elements.get('#floating-always-on-top').checked, true);
+});
+
+test('renderer uses an auto-selection switch and manual select action labels', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+
+  assert.match(html, /id="smart-switch"[^>]*type="checkbox"|type="checkbox"[^>]*id="smart-switch"/);
+  assert.doesNotMatch(html, /<button[^>]+id="smart-switch"/);
+
+  const {
+    elements,
+    proxyUpdates,
+    setActiveSiteCalls,
+    smartSwitchCalls
+  } = await setupRendererApp({
+    activeSiteId: 'site-1',
+    proxy: {
+      port: 8787,
+      timeoutMs: 120000,
+      failureThreshold: 3,
+      smartSwitching: false,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    },
+    sites: [
+      {
+        id: 'site-1',
+        name: 'selected',
+        baseUrl: 'https://selected.example/v1',
+        apiKey: 'sk-selected',
+        manualEnabled: true,
+        failureDisabled: false,
+        enabled: true,
+        status: 'idle',
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        consecutiveErrors: 0,
+        errorLog: []
+      },
+      {
+        id: 'site-2',
+        name: 'candidate',
+        baseUrl: 'https://candidate.example/v1',
+        apiKey: 'sk-candidate',
+        manualEnabled: true,
+        failureDisabled: false,
+        enabled: true,
+        status: 'idle',
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        consecutiveErrors: 0,
+        errorLog: []
+      }
+    ]
+  });
+
+  assert.equal(elements.get('#smart-switch').checked, false);
+  assert.equal(elements.get('#smart-switching').checked, false);
+  assert.equal(elements.get('#set-active').textContent, '已选择');
+  assert.equal(elements.get('#set-active').disabled, true);
+
+  const firstActions = elements.get('#site-list').children[0].children.find(
+    (child) => child.className === 'site-actions'
+  );
+  const secondActions = elements.get('#site-list').children[1].children.find(
+    (child) => child.className === 'site-actions'
+  );
+  assert.equal(firstActions.children[1].textContent, '已选择');
+  assert.equal(firstActions.children[1].disabled, true);
+  assert.equal(secondActions.children[1].textContent, '选择');
+  assert.equal(secondActions.children[1].disabled, false);
+
+  await secondActions.children[1].dispatchEvent('click');
+
+  assert.deepEqual(setActiveSiteCalls, ['site-2']);
+  assert.equal(
+    elements.get('#site-list').children[1].children.find(
+      (child) => child.className === 'site-actions'
+    ).children[1].textContent,
+    '已选择'
+  );
+  assert.equal(elements.get('#set-active').textContent, '已选择');
+
+  elements.get('#smart-switch').checked = true;
+  await elements.get('#smart-switch').dispatchEvent('change');
+
+  assert.equal(proxyUpdates.at(-1).smartSwitching, true);
+  assert.equal(
+    elements.get('#site-list').children[1].children.find(
+      (child) => child.className === 'site-actions'
+    ).children[1].textContent,
+    '停用'
+  );
+  assert.deepEqual(smartSwitchCalls, []);
 });
 
 test('renderer exposes selected-site one-click test and toggle buttons', async () => {
@@ -1544,8 +1981,58 @@ test('selected-site test and toggle buttons call the selected site actions', asy
   assert.deepEqual(siteEnabledUpdates, [{ id: 'site-1', enabled: false }]);
 });
 
+test('renderer can manually test a manually disabled site without enabling it first', async () => {
+  const { elements, siteTestCalls } = await setupRendererApp({
+    activeSiteId: null,
+    sites: [
+      {
+        id: 'site-1',
+        name: 'disabled site',
+        baseUrl: 'https://disabled.example/v1',
+        apiKey: 'sk-disabled',
+        manualEnabled: false,
+        failureDisabled: false,
+        enabled: false,
+        status: 'idle',
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        consecutiveErrors: 0,
+        errorLog: []
+      }
+    ]
+  });
+
+  assert.equal(elements.get('#test-site').disabled, false);
+
+  await elements.get('#test-site').dispatchEvent('click');
+
+  assert.deepEqual(siteTestCalls, ['site-1']);
+  assert.equal(elements.get('#context-site-status').textContent, '成功');
+  assert.equal(elements.get('#overview-availability').textContent, '人工停用');
+  assert.equal(elements.get('#site-enabled').checked, false);
+
+  const siteItem = elements.get('#site-list').children[0];
+  const actions = siteItem.children.find((child) => child.className === 'site-actions');
+
+  await actions.children[0].dispatchEvent('click');
+
+  assert.deepEqual(siteTestCalls, ['site-1', 'site-1']);
+  assert.equal(elements.get('#context-site-status').textContent, '成功');
+  assert.equal(elements.get('#overview-availability').textContent, '人工停用');
+  assert.equal(elements.get('#site-enabled').checked, false);
+});
+
 test('site list exposes per-site test and toggle actions', async () => {
   const { elements } = await setupRendererApp({
+    proxy: {
+      port: 8787,
+      timeoutMs: 120000,
+      failureThreshold: 3,
+      smartSwitching: true,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    },
     sites: [
       {
         id: 'site-1',
@@ -1825,6 +2312,7 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
 
   assert.match(html, /id="priority-mode"/);
   assert.match(html, /id="site-multiplier" type="text"/);
+  assert.match(html, /id="site-multiplier-locked"/);
   assert.match(html, /按优先级/);
   assert.match(html, /按倍率/);
 
@@ -1850,6 +2338,7 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
         status: 'idle',
         priority: 20,
         multiplier: 0.25,
+        multiplierLocked: true,
         requestCount: 0,
         successCount: 0,
         errorCount: 0,
@@ -1861,6 +2350,7 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
 
   assert.equal(elements.get('#priority-mode').value, 'multiplier');
   assert.equal(elements.get('#site-multiplier').value, 0.25);
+  assert.equal(elements.get('#site-multiplier-locked').checked, true);
 
   elements.get('#priority-mode').value = 'priority';
   await elements.get('#save-proxy').dispatchEvent('click');
@@ -1870,9 +2360,11 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
   await elements.get('#site-form').dispatchEvent('submit');
   assert.equal(siteUpdates.at(-1).patch.multiplier, 0.75);
 
-  elements.get('#site-multiplier').value = '0.001';
+  elements.get('#site-multiplier').value = '0';
+  elements.get('#site-multiplier-locked').checked = false;
   await elements.get('#site-form').dispatchEvent('submit');
-  assert.equal(siteUpdates.at(-1).patch.multiplier, 0.001);
+  assert.equal(siteUpdates.at(-1).patch.multiplier, 0);
+  assert.equal(siteUpdates.at(-1).patch.multiplierLocked, false);
 });
 
 test('renderer hides the API key input unless it is focused', async () => {
@@ -2359,6 +2851,67 @@ test('renderer sync button calls remote sync and fills multiplier from returned 
   assert.match(elements.get('#site-status').innerHTML, /AAA\.限时白嫖GPT 0\.003x/);
 });
 
+test('renderer creates and imports a remote key from the current panel after confirmation', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+  assert.match(html, /id="create-site-key"/);
+
+  const { elements, siteUpdates, siteCreateKeyCalls, confirmMessages } = await setupRendererApp({
+    activeSiteId: 'site-1',
+    sites: [
+      {
+        id: 'site-1',
+        name: 'site',
+        baseUrl: 'https://site.example/v1',
+        apiKey: 'sk-old',
+        manualEnabled: true,
+        failureDisabled: false,
+        enabled: true,
+        status: 'idle',
+        priority: 20,
+        multiplier: 1,
+        sync: {
+          enabled: true,
+          dashboardUrl: 'https://relay.example.com/keys',
+          username: 'sync-user',
+          password: 'secret',
+          providerType: 'modern-v1',
+          intervalMode: 'global',
+          intervalValue: 30,
+          intervalUnit: 'minute',
+          remote: {
+            keyGroup: 'Example Team',
+            groupId: '18',
+            groupMultiplier: 1,
+            groups: []
+          }
+        },
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        consecutiveErrors: 0,
+        errorLog: []
+      }
+    ]
+  });
+
+  elements.get('#site-sync-dashboard-url').value = 'https://sync.example.com/keys';
+  elements.get('#site-sync-username').value = 'user@example.com';
+  elements.get('#site-sync-password').value = 'secret-2';
+  await elements.get('#create-site-key').dispatchEvent('click');
+
+  assert.match(confirmMessages.at(-1), /确认在 site 的远端账号中新建密钥并导入本地/);
+  assert.equal(siteUpdates.at(-1).id, 'site-1');
+  assert.equal(siteUpdates.at(-1).patch.sync.dashboardUrl, 'https://sync.example.com/keys');
+  assert.equal(siteUpdates.at(-1).patch.sync.username, 'user@example.com');
+  assert.equal(siteUpdates.at(-1).patch.sync.password, 'secret-2');
+  assert.deepEqual(siteCreateKeyCalls, ['site-1']);
+  assert.equal(elements.get('#site-api-key').value, 'sk-created');
+  assert.equal(elements.get('#site-multiplier').value, 0.001);
+  assert.equal(elements.get('#site-sync-key-name').textContent, 'site');
+  assert.equal(elements.get('#site-sync-key-group').textContent, 'Example Team');
+  assert.equal(elements.get('#site-sync-multiplier').textContent, '0.001');
+});
+
 test('renderer switches the selected site group from the current panel after confirmation', async () => {
   const { elements, siteUpdates, confirmMessages, setConfirmHandler } = await setupRendererApp({
     activeSiteId: 'site-1',
@@ -2452,6 +3005,31 @@ test('renderer proxy settings expose and save unified upstream timeout seconds',
   await elements.get('#save-proxy').dispatchEvent('click');
 
   assert.equal(proxyUpdates.at(-1).timeoutMs, 45000);
+});
+
+test('renderer proxy settings expose and save request body replay buffer megabytes', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+  assert.match(html, /id="proxy-replay-buffer-mb"/);
+
+  const { elements, proxyUpdates } = await setupRendererApp({
+    proxy: {
+      port: 8787,
+      timeoutMs: 120000,
+      maxReplayableRequestBodyBytes: 32 * 1024 * 1024,
+      failureThreshold: 3,
+      smartSwitching: true,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    }
+  });
+  const bufferInput = elements.get('#proxy-replay-buffer-mb');
+
+  assert.equal(bufferInput.value, 32);
+
+  bufferInput.value = '64';
+  await elements.get('#save-proxy').dispatchEvent('click');
+
+  assert.equal(proxyUpdates.at(-1).maxReplayableRequestBodyBytes, 64 * 1024 * 1024);
 });
 
 test('renderer shows fixed proxy port startup errors without changing the endpoint', async () => {

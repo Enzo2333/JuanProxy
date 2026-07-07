@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { ConfigService } from '../src/proxy/config-service.js';
 import {
+  createConfiguredSiteKey,
   switchConfiguredSiteGroup,
   syncAllConfiguredSites,
   syncConfiguredSite
@@ -60,6 +61,56 @@ test('syncConfiguredSite writes remote metadata and fills site multiplier', asyn
     assert.equal(updated.multiplier, 0.003);
     assert.equal(updated.sync.username, 'sync-user');
     assert.equal(updated.sync.lastSyncStatus, 'success');
+    assert.equal(updated.sync.remote.keyName, 'qa');
+    assert.equal(updated.sync.remote.groupMultiplier, 0.003);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('syncConfiguredSite keeps locked site multiplier while updating remote metadata', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-locked-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'locked-sync',
+      baseUrl: 'https://locked.example/v1',
+      apiKey: 'sk-locked',
+      multiplier: 0,
+      multiplierLocked: true,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'new-api'
+      }
+    });
+
+    await syncConfiguredSite({
+      configService: service,
+      siteId: site.id,
+      fetchRemoteSync: async () => ({
+        ok: true,
+        multiplier: 0.003,
+        syncPatch: {
+          lastSyncAt: '2026-06-09T08:00:00.000Z',
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+          remote: {
+            keyName: 'qa',
+            keyGroup: 'default',
+            groupMultiplier: 0.003
+          }
+        }
+      })
+    });
+
+    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(updated.multiplier, 0);
+    assert.equal(updated.multiplierLocked, true);
     assert.equal(updated.sync.remote.keyName, 'qa');
     assert.equal(updated.sync.remote.groupMultiplier, 0.003);
   } finally {
@@ -220,6 +271,212 @@ test('syncAllConfiguredSites refreshes each website once and applies groups to r
   }
 });
 
+test('syncAllConfiguredSites tries another site from the same website when the representative fails', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-website-fallback-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  const syncCalls = [];
+
+  try {
+    await service.load();
+    const failing = await service.addSite({
+      name: 'failing-representative',
+      baseUrl: 'https://failing.example/v1',
+      apiKey: 'sk-failing',
+      multiplier: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'failing-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'default',
+          groupId: 'default',
+          groupMultiplier: 1
+        }
+      }
+    });
+    const fallback = await service.addSite({
+      name: 'fallback-representative',
+      baseUrl: 'https://fallback.example/v1',
+      apiKey: 'sk-fallback',
+      multiplier: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/profile',
+        username: 'fallback-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'plus',
+          groupId: 'plus',
+          groupMultiplier: 1
+        }
+      }
+    });
+
+    const result = await syncAllConfiguredSites({
+      configService: service,
+      fetchRemoteSync: async ({ sync }) => {
+        syncCalls.push(sync.username);
+        if (sync.username === 'failing-user') {
+          return {
+            ok: false,
+            syncPatch: {
+              lastSyncAt: '2026-06-09T08:00:00.000Z',
+              lastSyncStatus: 'failure',
+              lastSyncError: 'login failed'
+            },
+            error: new Error('login failed')
+          };
+        }
+        return {
+          ok: true,
+          multiplier: 0.045,
+          syncPatch: {
+            lastSyncAt: '2026-06-09T08:01:00.000Z',
+            lastSyncStatus: 'success',
+            lastSyncError: null,
+            remote: {
+              keyGroup: 'plus',
+              groupId: 'plus',
+              groupMultiplier: 0.045,
+              groups: [
+                {
+                  id: 'default',
+                  name: 'default',
+                  multiplier: 0.003,
+                  selected: false
+                },
+                {
+                  id: 'plus',
+                  name: 'plus',
+                  multiplier: 0.045,
+                  selected: true
+                }
+              ]
+            }
+          }
+        };
+      }
+    });
+
+    const state = service.getState();
+    const updatedFailing = state.sites.find((site) => site.id === failing.id);
+    const updatedFallback = state.sites.find((site) => site.id === fallback.id);
+
+    assert.deepEqual(syncCalls, ['failing-user', 'fallback-user']);
+    assert.deepEqual(result.failedSites, []);
+    assert.deepEqual(result.syncedSites.map((site) => site.id).sort(), [failing.id, fallback.id].sort());
+    assert.equal(updatedFailing.multiplier, 0.003);
+    assert.equal(updatedFallback.multiplier, 0.045);
+    assert.equal(updatedFallback.sync.lastSyncStatus, 'success');
+    assert.equal(updatedFallback.sync.lastSyncAt, '2026-06-09T08:01:00.000Z');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('syncAllConfiguredSites does not apply groups to sites with account sync disabled', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-disabled-account-sync-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const enabled = await service.addSite({
+      name: 'enabled-sync',
+      baseUrl: 'https://enabled.example/v1',
+      apiKey: 'sk-enabled',
+      multiplier: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'default',
+          groupId: 'default',
+          groupMultiplier: 1,
+          groups: []
+        }
+      }
+    });
+    const disabled = await service.addSite({
+      name: 'disabled-sync',
+      baseUrl: 'https://disabled.example/v1',
+      apiKey: 'sk-disabled',
+      multiplier: 0.5,
+      sync: {
+        enabled: false,
+        dashboardUrl: 'https://relay.example.com/console/profile',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'local-only',
+          groupId: 'local-only',
+          groupMultiplier: 0.5,
+          groups: [
+            {
+              id: 'local-only',
+              name: 'local-only',
+              multiplier: 0.5,
+              selected: true
+            }
+          ]
+        }
+      }
+    });
+
+    const result = await syncAllConfiguredSites({
+      configService: service,
+      fetchRemoteSync: async () => ({
+        ok: true,
+        multiplier: 0.003,
+        syncPatch: {
+          lastSyncAt: '2026-06-09T08:00:00.000Z',
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+          remote: {
+            keyGroup: 'default',
+            groupId: 'default',
+            groupMultiplier: 0.003,
+            groups: [
+              {
+                id: 'default',
+                name: 'default',
+                multiplier: 0.003,
+                selected: true
+              },
+              {
+                id: 'plus',
+                name: 'GPT Plus',
+                multiplier: 0.045,
+                selected: false
+              }
+            ]
+          }
+        }
+      })
+    });
+
+    const state = service.getState();
+    const updatedEnabled = state.sites.find((site) => site.id === enabled.id);
+    const updatedDisabled = state.sites.find((site) => site.id === disabled.id);
+
+    assert.deepEqual(result.syncedSites.map((site) => site.id), [enabled.id]);
+    assert.equal(updatedEnabled.multiplier, 0.003);
+    assert.equal(updatedDisabled.multiplier, 0.5);
+    assert.equal(updatedDisabled.sync.lastSyncAt, null);
+    assert.equal(updatedDisabled.sync.lastSyncStatus, null);
+    assert.equal(updatedDisabled.sync.remote.groupMultiplier, 0.5);
+    assert.deepEqual(updatedDisabled.sync.remote.groups.map((group) => group.name), ['local-only']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('switchConfiguredSiteGroup selects a synced group and updates multiplier', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-group-switch-'));
   const service = new ConfigService({ filePath: join(dir, 'config.json') });
@@ -310,6 +567,103 @@ test('switchConfiguredSiteGroup selects a synced group and updates multiplier', 
       [
         ['AAA.限时白嫖GPT 0.003x', false],
         ['GPT Plus 0.045x', true]
+      ]
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('switchConfiguredSiteGroup can select a synced group by id', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-group-switch-id-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  const remoteSwitches = [];
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'sync',
+      baseUrl: 'https://sync.example/v1',
+      apiKey: 'sk-sync',
+      multiplier: 0.003,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          remoteKeyId: '101',
+          keyGroup: 'Default Group',
+          groupId: 'default',
+          groupMultiplier: 0.003,
+          groups: [
+            {
+              id: 'default',
+              name: 'Default Group',
+              multiplier: 0.003,
+              selected: true
+            },
+            {
+              id: '18',
+              name: 'GPT Plus 0.045x',
+              multiplier: 0.045,
+              selected: false
+            }
+          ]
+        }
+      }
+    });
+
+    await switchConfiguredSiteGroup({
+      configService: service,
+      siteId: site.id,
+      groupId: '18',
+      switchRemoteGroup: async ({ group }) => {
+        remoteSwitches.push(group);
+        return {
+          ok: true,
+          multiplier: group.multiplier,
+          syncPatch: {
+            lastSyncAt: '2026-06-09T08:10:00.000Z',
+            lastSyncStatus: 'success',
+            lastSyncError: null,
+            remote: {
+              keyGroup: group.name,
+              groupId: group.id,
+              groupMultiplier: group.multiplier,
+              groups: [
+                {
+                  id: 'default',
+                  name: 'Default Group',
+                  multiplier: 0.003,
+                  selected: false
+                },
+                {
+                  id: '18',
+                  name: 'GPT Plus 0.045x',
+                  multiplier: 0.045,
+                  selected: true
+                }
+              ]
+            }
+          }
+        };
+      }
+    });
+
+    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(remoteSwitches.length, 1);
+    assert.equal(remoteSwitches[0].id, '18');
+    assert.equal(remoteSwitches[0].name, 'GPT Plus 0.045x');
+    assert.equal(updated.sync.remote.groupId, '18');
+    assert.equal(updated.sync.remote.keyGroup, 'GPT Plus 0.045x');
+    assert.equal(updated.multiplier, 0.045);
+    assert.deepEqual(
+      updated.sync.remote.groups.map((group) => [group.id, group.selected]),
+      [
+        ['default', false],
+        ['18', true]
       ]
     );
   } finally {
@@ -667,6 +1021,113 @@ test('syncConfiguredSite persists failure status without changing multiplier', a
     assert.equal(updated.multiplier, 0.5);
     assert.equal(updated.sync.lastSyncStatus, 'failure');
     assert.equal(updated.sync.lastSyncError, 'login failed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createConfiguredSiteKey writes the generated key and remote metadata', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-create-key-action-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'sync',
+      baseUrl: 'https://sync.example/v1',
+      apiKey: 'sk-old',
+      multiplier: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/keys',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'modern-v1',
+        remote: {
+          keyGroup: 'Example Team',
+          groupId: '18'
+        }
+      }
+    });
+
+    const result = await createConfiguredSiteKey({
+      configService: service,
+      siteId: site.id,
+      createRemoteKey: async ({ sync, name }) => ({
+        ok: true,
+        apiKey: 'sk-created',
+        multiplier: 0.001,
+        keyName: name,
+        syncPatch: {
+          lastSyncAt: '2026-06-09T08:00:00.000Z',
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+          remote: {
+            providerType: sync.providerType,
+            keyName: name,
+            remoteKeyId: '37',
+            keyGroup: 'Example Team',
+            groupId: '18',
+            groupMultiplier: 0.001
+          }
+        }
+      })
+    });
+
+    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(result.ok, true);
+    assert.equal(updated.apiKey, 'sk-created');
+    assert.equal(updated.multiplier, 0.001);
+    assert.equal(updated.sync.lastSyncStatus, 'success');
+    assert.equal(updated.sync.remote.keyName, 'sync');
+    assert.equal(updated.sync.remote.remoteKeyId, '37');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createConfiguredSiteKey keeps the existing api key when remote creation fails', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-create-key-action-failure-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'sync',
+      baseUrl: 'https://sync.example/v1',
+      apiKey: 'sk-existing',
+      multiplier: 0.5,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/keys',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+
+    const result = await createConfiguredSiteKey({
+      configService: service,
+      siteId: site.id,
+      createRemoteKey: async () => ({
+        ok: false,
+        apiKey: '',
+        multiplier: null,
+        syncPatch: {
+          lastSyncAt: '2026-06-09T08:00:00.000Z',
+          lastSyncStatus: 'failure',
+          lastSyncError: 'create failed'
+        },
+        error: new Error('create failed')
+      })
+    });
+
+    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    assert.equal(result.ok, false);
+    assert.equal(updated.apiKey, 'sk-existing');
+    assert.equal(updated.multiplier, 0.5);
+    assert.equal(updated.sync.lastSyncStatus, 'failure');
+    assert.equal(updated.sync.lastSyncError, 'create failed');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

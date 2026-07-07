@@ -4,6 +4,10 @@ export const MAX_ERROR_DETAIL_LENGTH = 1000;
 export const DEFAULT_TEST_MODEL = 'example-chat-model';
 export const DEFAULT_SITE_MULTIPLIER = 1;
 export const DEFAULT_PRIORITY_MODE = 'priority';
+export const DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT = {
+  enabled: false,
+  maxMultiplier: 1
+};
 export const DEFAULT_RATE_LIMIT = {
   enabled: false,
   limit: 60,
@@ -116,6 +120,7 @@ export function normalizeSite(site = {}) {
     testModel: site.testModel?.trim() || DEFAULT_TEST_MODEL,
     priority: Number.isFinite(Number(site.priority)) ? Number(site.priority) : 100,
     multiplier: normalizeSiteMultiplier(site.multiplier),
+    multiplierLocked: Boolean(site.multiplierLocked),
     modelMapping: normalizeModelMapping(site.modelMapping),
     capabilities: normalizeSiteCapabilities(site.capabilities),
     sync: normalizeSiteSync(site.sync),
@@ -746,6 +751,7 @@ export function chooseBestSite(sites = [], options = {}) {
   const now = options.now ? new Date(options.now) : new Date();
   const excludeSiteIds = new Set(options.excludeSiteIds ?? []);
   const priorityMode = normalizePriorityMode(options.priorityMode);
+  const autoSwitchMultiplierLimit = normalizeAutoSwitchMultiplierLimit(options.autoSwitchMultiplierLimit);
   let topRank = null;
   let candidateGroup = [];
 
@@ -756,6 +762,12 @@ export function chooseBestSite(sites = [], options = {}) {
 
     const site = normalizeSite(candidate);
     if (!isUsableNormalizedSite(site) || isRateLimitPausedNormalized(site, now)) {
+      continue;
+    }
+    if (
+      autoSwitchMultiplierLimit.enabled &&
+      site.multiplier > autoSwitchMultiplierLimit.maxMultiplier
+    ) {
       continue;
     }
 
@@ -804,6 +816,18 @@ export function chooseBestSite(sites = [], options = {}) {
   }
 
   return best;
+}
+
+export function normalizeAutoSwitchMultiplierLimit(limit = {}) {
+  const source = limit && typeof limit === 'object' ? limit : {};
+  const maxMultiplier = Number(source.maxMultiplier);
+
+  return {
+    enabled: Boolean(source.enabled),
+    maxMultiplier: Number.isFinite(maxMultiplier) && maxMultiplier >= 0
+      ? maxMultiplier
+      : DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT.maxMultiplier
+  };
 }
 
 function normalizePriorityMode(value) {

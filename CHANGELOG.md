@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project uses semantic versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- Sensitive-word upstream 500 responses now retry other matching sites only for the current request without changing the globally selected site.
+
 ### Added
 
 - Open source project metadata, security policy, contribution guide, and CI test workflow.

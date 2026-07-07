@@ -13,7 +13,7 @@ test('enables every passing non-manual site when every usable site is disabled',
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const first = await config.addSite({
       name: 'first',
       baseUrl: 'https://first.example/v1',
@@ -78,13 +78,13 @@ test('enables every passing non-manual site when every usable site is disabled',
   }
 });
 
-test('adds health failures for availability test HTTP errors', async () => {
+test('keeps request-scoped availability test HTTP errors out of health failures', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-recover-request-error-'));
   const config = new ConfigService({ filePath: join(dir, 'config.json') });
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const site = await config.addSite({
       name: 'target',
       baseUrl: 'https://target.example/v1',
@@ -113,10 +113,10 @@ test('adds health failures for availability test HTTP errors', async () => {
     assert.deepEqual(result.enabledSites, []);
     assert.deepEqual(result.failedSites.map((failedSite) => failedSite.id), [site.id]);
     assert.equal(after.failureDisabled, true);
-    assert.equal(after.consecutiveErrors, before.consecutiveErrors + 1);
-    assert.equal(after.errorCount, before.errorCount + 1);
+    assert.equal(after.consecutiveErrors, before.consecutiveErrors);
+    assert.equal(after.errorCount, before.errorCount);
     assert.equal(after.lastError.statusCode, 400);
-    assert.equal(after.lastError.affectsSiteHealth, true);
+    assert.equal(after.lastError.affectsSiteHealth, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

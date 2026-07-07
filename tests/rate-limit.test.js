@@ -45,6 +45,7 @@ test('pauses a site after its call limit and restores it in the next window', as
 
   try {
     await service.load();
+    await service.updateProxySettings({ smartSwitching: true });
     const limited = await service.addSite({
       name: 'limited',
       baseUrl: 'https://limited.example/v1',

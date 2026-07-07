@@ -302,7 +302,7 @@ test('records incomplete responses streams as site health failures', async () =>
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const site = await config.addSite({ name: 'primary', baseUrl: upstream.baseUrl, apiKey: 'sk-proxy' });
     const port = await proxy.start(0);
 
@@ -443,6 +443,7 @@ test('switches to another enabled site within each request when upstream errors 
 
   try {
     await config.load();
+    await config.updateProxySettings({ smartSwitching: true });
     const badSite = await config.addSite({
       name: 'bad',
       baseUrl: bad.baseUrl,
@@ -495,7 +496,7 @@ test('returns the final upstream error when every usable site fails within a req
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     await config.addSite({
       name: 'first',
       baseUrl: first.baseUrl,
@@ -515,6 +516,194 @@ test('returns the final upstream error when every usable site fails within a req
     assert.equal(response.status, 429);
     assert.deepEqual(JSON.parse(text), { error: 'second failed' });
     assert.equal(config.getState().sites.every((site) => site.failureDisabled), true);
+  } finally {
+    await proxy.stop();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('retries rate-limited upstream responses with large replayable request bodies', async () => {
+  let firstRequests = 0;
+  let secondRequests = 0;
+  const first = await createUpstream((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      firstRequests += 1;
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate limited' }));
+    });
+  });
+  const second = await createUpstream((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      secondRequests += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        upstream: 'second',
+        bodyLength: body.length
+      }));
+    });
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-rate-limit-large-body-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ smartSwitching: true });
+    await config.addSite({
+      name: 'first',
+      baseUrl: first.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    await config.addSite({
+      name: 'second',
+      baseUrl: second.baseUrl,
+      apiKey: 'sk-second',
+      priority: 2
+    });
+    const port = await proxy.start(0);
+    const payload = {
+      model: 'gpt-large',
+      input: 'x'.repeat(1024 * 1024 + 1)
+    };
+    const expectedBodyLength = JSON.stringify(payload).length;
+
+    const { response, text } = await postJson(
+      `http://127.0.0.1:${port}/v1/responses`,
+      payload
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), {
+      ok: true,
+      upstream: 'second',
+      bodyLength: expectedBodyLength
+    });
+    assert.equal(firstRequests, 1);
+    assert.equal(secondRequests, 1);
+  } finally {
+    await proxy.stop();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('buffers large 429 response bodies long enough to try another site', async () => {
+  let secondRequests = 0;
+  const firstError = JSON.stringify({ error: 'x'.repeat(512) });
+  const first = await createUpstream((_req, res) => {
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(firstError)
+    });
+    res.end(firstError);
+  });
+  const second = await createUpstream((_req, res) => {
+    secondRequests += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'second' }));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-rate-limit-large-error-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({
+    configService: config,
+    maxBufferedErrorBodyBytes: 64
+  });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ smartSwitching: true });
+    await config.addSite({
+      name: 'first',
+      baseUrl: first.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    await config.addSite({
+      name: 'second',
+      baseUrl: second.baseUrl,
+      apiKey: 'sk-second',
+      priority: 2
+    });
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-test',
+      input: 'hello'
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true, upstream: 'second' });
+    assert.equal(secondRequests, 1);
+  } finally {
+    await proxy.stop();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('drains oversized 429 response bodies before trying another site', async () => {
+  let secondRequests = 0;
+  const firstError = JSON.stringify({ error: 'x'.repeat(512) });
+  const first = await createUpstream((_req, res) => {
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(firstError)
+    });
+    res.end(firstError);
+  });
+  const second = await createUpstream((_req, res) => {
+    secondRequests += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'second' }));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-rate-limit-oversized-error-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({
+    configService: config,
+    maxBufferedErrorBodyBytes: 64,
+    maxBufferedRetryableErrorBodyBytes: 64
+  });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ smartSwitching: true });
+    await config.addSite({
+      name: 'first',
+      baseUrl: first.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    await config.addSite({
+      name: 'second',
+      baseUrl: second.baseUrl,
+      apiKey: 'sk-second',
+      priority: 2
+    });
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-test',
+      input: 'hello'
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true, upstream: 'second' });
+    assert.equal(secondRequests, 1);
   } finally {
     await proxy.stop();
     await first.close();
@@ -551,7 +740,7 @@ test('retries a failed upstream response on another site within the same client 
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const badSite = await config.addSite({
       name: 'bad',
       baseUrl: bad.baseUrl,
@@ -597,7 +786,64 @@ test('retries a failed upstream response on another site within the same client 
   }
 });
 
-test('retries and disables sites for upstream HTTP errors', async () => {
+test('manual selection returns the selected upstream error without switching sites', async () => {
+  const bad = await createUpstream((_req, res) => {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'manual site failed' }));
+  });
+  let goodRequests = 0;
+  const good = await createUpstream((_req, res) => {
+    goodRequests += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'good' }));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-manual-no-switch-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: false });
+    const badSite = await config.addSite({
+      name: 'bad',
+      baseUrl: bad.baseUrl,
+      apiKey: 'sk-bad',
+      priority: 1
+    });
+    await config.addSite({
+      name: 'good',
+      baseUrl: good.baseUrl,
+      apiKey: 'sk-good',
+      priority: 2
+    });
+    await config.setActiveSite(badSite.id);
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    assert.equal(response.status, 500);
+    assert.deepEqual(JSON.parse(text), { error: 'manual site failed' });
+    assert.equal(goodRequests, 0);
+
+    const state = config.getState();
+    const updatedBad = state.sites.find((site) => site.id === badSite.id);
+    assert.equal(state.activeSiteId, badSite.id);
+    assert.equal(updatedBad.failureDisabled, false);
+    assert.equal(updatedBad.enabled, true);
+    assert.equal(updatedBad.consecutiveErrors, 1);
+    assert.equal(updatedBad.errorCount, 1);
+  } finally {
+    await proxy.stop();
+    await bad.close();
+    await good.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('retries model-specific upstream errors without disabling the site', async () => {
   let firstRequests = 0;
   let secondRequests = 0;
   const modelError = {
@@ -624,7 +870,7 @@ test('retries and disables sites for upstream HTTP errors', async () => {
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const firstSite = await config.addSite({
       name: 'first',
       baseUrl: first.baseUrl,
@@ -653,12 +899,12 @@ test('retries and disables sites for upstream HTTP errors', async () => {
     const state = config.getState();
     const updatedFirst = state.sites.find((site) => site.id === firstSite.id);
     const updatedSecond = state.sites.find((site) => site.id === secondSite.id);
-    assert.equal(updatedFirst.failureDisabled, true);
-    assert.equal(updatedFirst.enabled, false);
-    assert.equal(updatedFirst.consecutiveErrors, 1);
+    assert.equal(updatedFirst.failureDisabled, false);
+    assert.equal(updatedFirst.enabled, true);
+    assert.equal(updatedFirst.consecutiveErrors, 0);
     assert.equal(updatedFirst.errorCount, 1);
     assert.equal(updatedFirst.lastError.statusCode, 503);
-    assert.equal(updatedFirst.lastError.affectsSiteHealth, true);
+    assert.equal(updatedFirst.lastError.affectsSiteHealth, false);
     assert.equal(updatedSecond.status, 'success');
     assert.equal(state.activeSiteId, secondSite.id);
   } finally {
@@ -669,7 +915,7 @@ test('retries and disables sites for upstream HTTP errors', async () => {
   }
 });
 
-test('retries and disables sites for upstream feature permission errors', async () => {
+test('retries feature permission errors without disabling the site', async () => {
   let firstRequests = 0;
   let secondRequests = 0;
   const imagePermissionError = {
@@ -695,7 +941,7 @@ test('retries and disables sites for upstream feature permission errors', async 
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const firstSite = await config.addSite({
       name: 'first',
       baseUrl: first.baseUrl,
@@ -724,14 +970,97 @@ test('retries and disables sites for upstream feature permission errors', async 
     const state = config.getState();
     const updatedFirst = state.sites.find((site) => site.id === firstSite.id);
     const updatedSecond = state.sites.find((site) => site.id === secondSite.id);
-    assert.equal(updatedFirst.failureDisabled, true);
-    assert.equal(updatedFirst.enabled, false);
-    assert.equal(updatedFirst.consecutiveErrors, 1);
+    assert.equal(updatedFirst.failureDisabled, false);
+    assert.equal(updatedFirst.enabled, true);
+    assert.equal(updatedFirst.consecutiveErrors, 0);
     assert.equal(updatedFirst.errorCount, 1);
     assert.equal(updatedFirst.lastError.statusCode, 403);
-    assert.equal(updatedFirst.lastError.affectsSiteHealth, true);
+    assert.equal(updatedFirst.lastError.affectsSiteHealth, false);
     assert.equal(updatedSecond.status, 'success');
     assert.equal(state.activeSiteId, secondSite.id);
+  } finally {
+    await proxy.stop();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('retries sensitive-words errors within one request without changing active site', async () => {
+  let firstRequests = 0;
+  let secondRequests = 0;
+  const sensitiveWordsError = {
+    error: {
+      code: 'sensitive_words_detected',
+      message: 'sensitive_words_detected',
+      type: 'new_api_error'
+    }
+  };
+  const first = await createUpstream((_req, res) => {
+    firstRequests += 1;
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(sensitiveWordsError));
+  });
+  const second = await createUpstream((_req, res) => {
+    secondRequests += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'second' }));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-content-error-no-disable-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
+    const firstSite = await config.addSite({
+      name: 'first',
+      baseUrl: first.baseUrl,
+      apiKey: 'sk-first',
+      priority: 1
+    });
+    const secondSite = await config.addSite({
+      name: 'second',
+      baseUrl: second.baseUrl,
+      apiKey: 'sk-second',
+      priority: 2
+    });
+    await config.setActiveSite(firstSite.id);
+    const port = await proxy.start(0);
+
+    const { response, text } = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-5.5',
+      input: 'blocked content'
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true, upstream: 'second' });
+    assert.equal(firstRequests, 1);
+    assert.equal(secondRequests, 1);
+
+    const state = config.getState();
+    const updatedFirst = state.sites.find((site) => site.id === firstSite.id);
+    const updatedSecond = state.sites.find((site) => site.id === secondSite.id);
+    assert.equal(updatedFirst.failureDisabled, false);
+    assert.equal(updatedFirst.enabled, true);
+    assert.equal(updatedFirst.consecutiveErrors, 0);
+    assert.equal(updatedFirst.errorCount, 1);
+    assert.equal(updatedFirst.lastError.statusCode, 500);
+    assert.equal(updatedFirst.lastError.affectsSiteHealth, false);
+    assert.equal(updatedSecond.status, 'success');
+    assert.equal(state.activeSiteId, firstSite.id);
+    assert.equal(state.proxy.lastSelectedSiteId, firstSite.id);
+
+    const secondTry = await postJson(`http://127.0.0.1:${port}/v1/responses`, {
+      model: 'gpt-5.5',
+      input: 'blocked content again'
+    });
+
+    assert.equal(secondTry.response.status, 200);
+    assert.equal(firstRequests, 2);
+    assert.equal(secondRequests, 2);
+    assert.equal(config.getState().activeSiteId, firstSite.id);
   } finally {
     await proxy.stop();
     await first.close();
@@ -834,7 +1163,7 @@ test('does not replay oversized request bodies to another site', async () => {
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     await config.addSite({ name: 'bad', baseUrl: bad.baseUrl, apiKey: 'sk-bad', priority: 1 });
     await config.addSite({ name: 'good', baseUrl: good.baseUrl, apiKey: 'sk-good', priority: 2 });
     const port = await proxy.start(0);
@@ -848,6 +1177,60 @@ test('does not replay oversized request bodies to another site', async () => {
 
     assert.equal(response.status, 500);
     assert.deepEqual(JSON.parse(text), { error: 'large body failed' });
+    assert.equal(badRequests, 1);
+    assert.equal(goodRequests, 0);
+  } finally {
+    await proxy.stop();
+    await bad.close();
+    await good.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('uses configured replayable request body buffer size for each request', async () => {
+  let badRequests = 0;
+  let goodRequests = 0;
+  const bad = await createUpstream((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      badRequests += 1;
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'configured buffer too small' }));
+    });
+  });
+  const good = await createUpstream((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      goodRequests += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-configured-body-buffer-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+
+  try {
+    await config.load();
+    await config.updateProxySettings({
+      failureThreshold: 0,
+      smartSwitching: true,
+      maxReplayableRequestBodyBytes: 1024 * 1024
+    });
+    await config.addSite({ name: 'bad', baseUrl: bad.baseUrl, apiKey: 'sk-bad', priority: 1 });
+    await config.addSite({ name: 'good', baseUrl: good.baseUrl, apiKey: 'sk-good', priority: 2 });
+    const port = await proxy.start(0);
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'x'.repeat(1024 * 1024 + 1) })
+    });
+    const text = await response.text();
+
+    assert.equal(response.status, 500);
+    assert.deepEqual(JSON.parse(text), { error: 'configured buffer too small' });
     assert.equal(badRequests, 1);
     assert.equal(goodRequests, 0);
   } finally {
@@ -883,7 +1266,7 @@ test('streams oversized upstream error responses instead of buffering them for f
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     await config.addSite({ name: 'bad', baseUrl: bad.baseUrl, apiKey: 'sk-bad', priority: 1 });
     await config.addSite({ name: 'good', baseUrl: good.baseUrl, apiKey: 'sk-good', priority: 2 });
     const port = await proxy.start(0);
@@ -983,7 +1366,7 @@ test('retries an unreachable upstream on another site within the same client req
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const badSite = await config.addSite({
       name: 'bad',
       baseUrl: `http://127.0.0.1:${unreachablePort}/v1`,
@@ -1030,7 +1413,7 @@ test('recovers automatically disabled sites by testing configs before proxying a
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0 });
+    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
     const badSite = await config.addSite({
       name: 'bad',
       baseUrl: bad.baseUrl,
@@ -1083,7 +1466,10 @@ test('round-robins same-priority sites while proxying requests', async () => {
 
   try {
     await config.load();
-    await config.updateProxySettings({ samePriorityStrategy: 'round-robin' });
+    await config.updateProxySettings({
+      smartSwitching: true,
+      samePriorityStrategy: 'round-robin'
+    });
     await config.addSite({
       name: 'first',
       baseUrl: first.baseUrl,
