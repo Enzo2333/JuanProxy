@@ -828,8 +828,26 @@ function extractScriptUrls(html, baseUrl) {
 }
 
 function extractAbsoluteModernApiBaseUrl(script) {
-  const match = stringValue(script).match(/https?:\/\/[^"'`\s)]+\/api\/v1\b/);
-  return match ? stripTrailingSlash(match[0]) : '';
+  const source = stringValue(script);
+  const directMatch = source.match(/https?:\/\/[^"'`\s)]+\/api\/v1\b/);
+  if (directMatch) {
+    return stripTrailingSlash(directMatch[0]);
+  }
+
+  const absoluteOrigins = new Map();
+  const assignmentPattern = /(?:\b(?:const|let|var)\s+|[,;])\s*([A-Za-z_$][\w$]*)\s*=\s*["'](https?:\/\/[^"'`\s)]+)["']/g;
+  let assignment = assignmentPattern.exec(source);
+  while (assignment) {
+    absoluteOrigins.set(assignment[1], stripTrailingSlash(assignment[2]));
+    assignment = assignmentPattern.exec(source);
+  }
+
+  for (const [identifier, origin] of absoluteOrigins) {
+    if (source.includes(`\${${identifier}}/api/v1`)) {
+      return `${origin}/api/v1`;
+    }
+  }
+  return '';
 }
 
 function parseJson(text, url) {

@@ -961,6 +961,59 @@ test('modern api v1 sync discovers absolute api base from dashboard assets', asy
   assert.equal(fetchMock.calls.some((call) => call.url === 'https://cf-api.example.com/api/v1/auth/login'), true);
 });
 
+test('modern api v1 sync discovers api base assembled from dashboard asset constants', async () => {
+  const fetchMock = createFetch({
+    'GET https://dashboard.example.com/api/v1/settings/public': '<!doctype html><title>app</title>',
+    'GET https://dashboard.example.com/': '<!doctype html><script type="module" src="/assets/index.js"></script>',
+    'GET https://dashboard.example.com/assets/index.js':
+      'const dashboard="https://dashboard.example.com",apiOrigin="https://api.example.com",apiBase=`${apiOrigin}/api/v1`;',
+    'GET https://api.example.com/api/v1/settings/public': {
+      data: {
+        api_base_url: 'https://api.example.com'
+      }
+    },
+    'POST https://api.example.com/api/v1/auth/login': {
+      data: {
+        auth_token: 'auth-token'
+      }
+    },
+    'GET https://api.example.com/api/v1/user/profile': {
+      data: {
+        email: 'user@example.com',
+        balance: '$1.79'
+      }
+    },
+    'GET https://api.example.com/api/v1/keys': {
+      data: {
+        items: []
+      }
+    },
+    'GET https://api.example.com/api/v1/groups/available': {
+      data: []
+    },
+    'GET https://api.example.com/api/v1/groups/rates': {
+      data: {}
+    }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://dashboard.example.com/',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    fetch: fetchMock,
+    now: new Date('2026-06-09T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    fetchMock.calls.some((call) => call.url === 'https://api.example.com/api/v1/auth/login'),
+    true
+  );
+});
+
 test('new api sync logs in and maps token, group and multiplier metadata', async () => {
   const fetchMock = createFetch({
     'POST /api/user/login': {
