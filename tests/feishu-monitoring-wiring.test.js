@@ -59,5 +59,8 @@ test('Electron UI and background task entries wire the Feishu watchdog end to en
   assert.match(releaseWorkflow, /GOOS=windows GOARCH=amd64/);
   assert.match(releaseWorkflow, /GOOS=darwin GOARCH=arm64/);
   assert.match(releaseWorkflow, /GOOS=darwin GOARCH=amd64/);
+  assert.match(releaseWorkflow, /JuanProxy-Remote-Codex-Monitor-Windows-x64\.exe/);
+  assert.match(releaseWorkflow, /JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon/);
+  assert.match(releaseWorkflow, /body_path: \.github\/release-remote-monitor\.md/);
   assert.match(releaseWorkflow, /softprops\/action-gh-release/);
 });

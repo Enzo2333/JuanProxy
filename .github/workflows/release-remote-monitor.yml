@@ -42,14 +42,17 @@ jobs:
           mkdir -p dist/windows-x64 dist/macos-apple-silicon dist/macos-intel
 
           cd remote-monitor
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=${version}" -o ../dist/windows-x64/JuanProxy-Remote-Codex-Monitor.exe .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=${version}" -o ../dist/macos-apple-silicon/JuanProxy-Remote-Codex-Monitor .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=${version}" -o ../dist/macos-intel/JuanProxy-Remote-Codex-Monitor .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=${version}" -o ../dist/JuanProxy-Remote-Codex-Monitor-Windows-x64.exe .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=${version}" -o ../dist/JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=${version}" -o ../dist/JuanProxy-Remote-Codex-Monitor-macOS-Intel .
           cd ..
 
+          cp dist/JuanProxy-Remote-Codex-Monitor-Windows-x64.exe dist/windows-x64/JuanProxy-Remote-Codex-Monitor.exe
+          cp dist/JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon dist/macos-apple-silicon/JuanProxy-Remote-Codex-Monitor
+          cp dist/JuanProxy-Remote-Codex-Monitor-macOS-Intel dist/macos-intel/JuanProxy-Remote-Codex-Monitor
           cp scripts/install-remote-codex-monitor.command dist/macos-apple-silicon/Install-JuanProxy-Remote-Monitor.command
           cp scripts/install-remote-codex-monitor.command dist/macos-intel/Install-JuanProxy-Remote-Monitor.command
-          chmod +x dist/macos-*/*
+          chmod +x dist/JuanProxy-Remote-Codex-Monitor-macOS-* dist/macos-*/*
 
           printf 'Double-click JuanProxy-Remote-Codex-Monitor.exe to install and start.\n' > dist/windows-x64/README.txt
           printf 'Double-click Install-JuanProxy-Remote-Monitor.command to install and start.\n' > dist/macos-apple-silicon/README.txt
@@ -58,14 +61,17 @@ jobs:
           (cd dist/windows-x64 && zip -9 -r ../JuanProxy-Remote-Codex-Monitor-Windows-x64.zip .)
           (cd dist/macos-apple-silicon && zip -9 -r ../JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon.zip .)
           (cd dist/macos-intel && zip -9 -r ../JuanProxy-Remote-Codex-Monitor-macOS-Intel.zip .)
-          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          (cd dist && sha256sum ./JuanProxy-Remote-Codex-Monitor-* > SHA256SUMS.txt)
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          body_path: .github/release-remote-monitor.md
           files: |
+            dist/JuanProxy-Remote-Codex-Monitor-Windows-x64.exe
+            dist/JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon
+            dist/JuanProxy-Remote-Codex-Monitor-macOS-Intel
             dist/JuanProxy-Remote-Codex-Monitor-Windows-x64.zip
             dist/JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon.zip
             dist/JuanProxy-Remote-Codex-Monitor-macOS-Intel.zip
