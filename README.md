@@ -368,7 +368,9 @@ Watchdog 默认每 30 秒检查一次；开启 Codex 回答或目标通知后，
 
 macOS 首次启动若被系统拦截，在 Finder 中按住 Control 点击 `.command` 后选择 **打开**。安装后程序位于 `~/Library/Application Support/JuanProxy`，并注册当前用户 LaunchAgent。
 
-监控程序每 5 秒读取远程 `~/.codex/config.toml` 中当前生效的 `model_provider`、`base_url` 和 `env_key`，API key 从该环境变量、`OPENAI_API_KEY` 或 `~/.codex/auth.json` 获取。它扫描本机 Codex rollout，只把根任务的普通回答完成以及目标完成/暂停事件上报到当前 JuanProxy 地址；目标运行中的单轮完成不通知。JuanProxy 使用同一份本地 API key 校验上报、持久化去重并由本机 Watchdog 发送飞书通知；上报失败时远端保留事件并重试。
+监控程序每 5 秒读取远程 `~/.codex/config.toml` 中当前生效的 `model_provider`、`base_url` 和 `env_key`，API key 从该环境变量、`OPENAI_API_KEY` 或 `~/.codex/auth.json` 获取，并在安装时保存为仅当前用户可读的后台配置，避免登录任务丢失终端环境变量。它扫描本机 Codex rollout，只把根任务的普通回答完成以及目标完成/暂停事件上报到当前 JuanProxy 地址；目标运行中的单轮完成不通知。JuanProxy 使用同一份本地 API key 校验上报、持久化去重并由本机 Watchdog 发送飞书通知；上报失败时远端保留事件并重试。
+
+安装完成后会自动打开仅监听本机 `http://127.0.0.1:43121` 的状态页，显示后台 PID、版本、启动时间、最近检查、最近成功、当前站点和具体错误；点击 **立即检查** 可马上重新检查配置、鉴权、JuanProxy 远程通知开关和事件扫描。关闭页面不影响后台监控，再次双击同版本程序或运行 `--status` 可重新打开。
 
 远端状态和错误日志分别保存在 `%LOCALAPPDATA%\JuanProxy`（Windows）或 `~/Library/Application Support/JuanProxy`（macOS）。卸载后台监控可运行：
 

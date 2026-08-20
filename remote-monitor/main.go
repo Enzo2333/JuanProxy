@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +27,9 @@ const (
 	taskName    = "JuanProxy Remote Codex Monitor"
 	launchLabel = "com.juanproxy.remote-codex-monitor"
 	pollEvery   = 5 * time.Second
+	configFile  = "remote-codex-monitor-config.json"
+	healthFile  = "remote-codex-monitor-health.json"
+	statusAddr  = "127.0.0.1:43121"
 )
 
 var version = "dev"
@@ -54,6 +58,24 @@ type remoteEvent struct {
 type monitorState struct {
 	Keys  []string `json:"keys"`
 	Since string   `json:"since"`
+}
+
+type installedConfig struct {
+	CodexHome string `json:"codexHome"`
+	Provider  string `json:"provider"`
+	BaseURL   string `json:"baseUrl"`
+	APIKey    string `json:"apiKey"`
+}
+
+type monitorHealth struct {
+	PID           int    `json:"pid"`
+	Version       string `json:"version"`
+	StartedAt     string `json:"startedAt"`
+	LastCheckAt   string `json:"lastCheckAt"`
+	LastSuccessAt string `json:"lastSuccessAt,omitempty"`
+	LastError     string `json:"lastError,omitempty"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	StatusURL     string `json:"statusUrl,omitempty"`
 }
 
 type envelope struct {
@@ -101,8 +123,14 @@ func main() {
 	case "--version":
 		notifyUser(monitorName+" "+version, false)
 		return
+	case "--status":
+		message, err = "状态页已在默认浏览器中打开。", openStatusPage()
 	default:
-		message, err = installMonitor()
+		if health, running := activeMonitorHealth(); running && health.Version == version {
+			message, err = fmt.Sprintf("后台监控正在运行。\n后台 PID：%d\n状态页：%s", health.PID, statusPageURL()), openStatusPage()
+		} else {
+			message, err = installMonitor()
+		}
 	}
 	if err != nil {
 		notifyUser("操作失败："+err.Error(), true)
@@ -119,7 +147,11 @@ func firstArg() string {
 }
 
 func installMonitor() (string, error) {
-	settings, err := loadProviderSettings()
+	codexDir, err := codexHome()
+	if err != nil {
+		return "", err
+	}
+	settings, err := loadProviderSettingsFrom(codexDir, nil)
 	if err != nil {
 		return "", err
 	}
@@ -134,6 +166,17 @@ func installMonitor() (string, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return "", err
 	}
+	if err := saveJSON(filepath.Join(dataDir, configFile), installedConfig{
+		CodexHome: codexDir,
+		Provider:  settings.Provider,
+		BaseURL:   settings.BaseURL,
+		APIKey:    settings.APIKey,
+	}); err != nil {
+		return "", fmt.Errorf("保存后台运行配置失败：%w", err)
+	}
+	healthPath := filepath.Join(dataDir, healthFile)
+	_ = os.Remove(healthPath)
+	installStartedAt := time.Now().UTC()
 	current, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -173,7 +216,16 @@ func installMonitor() (string, error) {
 		return "", fmt.Errorf("不支持的系统：%s", runtime.GOOS)
 	}
 
-	return fmt.Sprintf("已安装并启动。\n版本：%s\n站点：%s\n日志：%s", version, settings.BaseURL, filepath.Join(dataDir, "remote-codex-monitor.log")), nil
+	health, err := waitForMonitorHealth(healthPath, installStartedAt, 20*time.Second)
+	if err != nil {
+		if health.PID != 0 {
+			_ = openStatusPage()
+			return fmt.Sprintf("已安装并启动，当前检查异常：%s\n请在状态页查看并重试。\n后台 PID：%d\n状态页：%s\n日志：%s", err, health.PID, statusPageURL(), filepath.Join(dataDir, "remote-codex-monitor.log")), nil
+		}
+		return "", fmt.Errorf("后台自检失败：%w\n日志：%s", err, filepath.Join(dataDir, "remote-codex-monitor.log"))
+	}
+	_ = openStatusPage()
+	return fmt.Sprintf("已安装并通过后台自检。\n安装器现在退出，监控进程会持续运行。\n后台 PID：%d\n版本：%s\n站点：%s\n状态页：%s\n日志：%s", health.PID, version, settings.BaseURL, statusPageURL(), filepath.Join(dataDir, "remote-codex-monitor.log")), nil
 }
 
 func uninstallMonitor() (string, error) {
@@ -208,6 +260,18 @@ func runMonitor() error {
 		return err
 	}
 	statePath := filepath.Join(dataDir, "remote-codex-monitor-state.json")
+	healthPath := filepath.Join(dataDir, healthFile)
+	checkNow := make(chan struct{}, 1)
+	statusURL, err := startStatusUI(healthPath, checkNow)
+	if err != nil {
+		return fmt.Errorf("启动本地状态页失败：%w", err)
+	}
+	health := monitorHealth{
+		PID:       os.Getpid(),
+		Version:   version,
+		StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		StatusURL: statusURL,
+	}
 	state := readState(statePath)
 	if state.Since == "" {
 		state.Since = time.Now().UTC().Format(time.RFC3339Nano)
@@ -219,7 +283,9 @@ func runMonitor() error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	lastError := ""
 	for {
-		if err := pollOnce(client, &state, statePath); err != nil {
+		err := checkMonitor(client, &state, statePath)
+		recordMonitorHealth(healthPath, &health, err)
+		if err != nil {
 			if err.Error() != lastError {
 				appendLog(err)
 				lastError = err.Error()
@@ -227,12 +293,29 @@ func runMonitor() error {
 		} else {
 			lastError = ""
 		}
-		time.Sleep(pollEvery)
+		timer := time.NewTimer(pollEvery)
+		select {
+		case <-timer.C:
+		case <-checkNow:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
 	}
 }
 
+func checkMonitor(client *http.Client, state *monitorState, statePath string) error {
+	if err := preflightMonitor(client); err != nil {
+		return err
+	}
+	return pollOnce(client, state, statePath)
+}
+
 func pollOnce(client *http.Client, state *monitorState, statePath string) error {
-	settings, err := loadProviderSettings()
+	settings, err := loadRuntimeProviderSettings()
 	if err != nil {
 		return err
 	}
@@ -274,6 +357,221 @@ func pollOnce(client *http.Client, state *monitorState, statePath string) error 
 	state.Since = since.UTC().Format(time.RFC3339Nano)
 	return saveState(statePath, *state)
 }
+
+func preflightMonitor(client *http.Client) error {
+	settings, err := loadRuntimeProviderSettings()
+	if err != nil {
+		return err
+	}
+	endpoint, err := eventEndpoint(settings.BaseURL)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+settings.APIKey)
+	request.Header.Set("User-Agent", "JuanProxy-Remote-Codex-Monitor/"+version)
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("监控站点不可达：%w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return fmt.Errorf("监控站点检查失败：HTTP %d %s", response.StatusCode, strings.TrimSpace(string(detail)))
+	}
+	var probe struct {
+		OK      bool `json:"ok"`
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&probe); err != nil || !probe.OK {
+		return errors.New("监控站点返回了无效的检查结果")
+	}
+	if !probe.Enabled {
+		return errors.New("JuanProxy 的远程完成通知未启用")
+	}
+	return nil
+}
+
+func statusPageURL() string {
+	return "http://" + statusAddr
+}
+
+func startStatusUI(healthPath string, checkNow chan<- struct{}) (string, error) {
+	listener, err := net.Listen("tcp", statusAddr)
+	if err != nil {
+		return "", err
+	}
+	server := &http.Server{Handler: statusUIHandler(healthPath, checkNow)}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			appendLog(fmt.Errorf("本地状态页异常退出：%w", err))
+		}
+	}()
+	return statusPageURL(), nil
+}
+
+func openStatusPage() error {
+	url := statusPageURL()
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	default:
+		return nil
+	}
+}
+
+func activeMonitorHealth() (monitorHealth, bool) {
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get(statusPageURL() + "/api/status")
+	if err != nil {
+		return monitorHealth{}, false
+	}
+	defer response.Body.Close()
+	var health monitorHealth
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&health) != nil || health.PID == 0 {
+		return monitorHealth{}, false
+	}
+	return health, true
+}
+
+func statusUIHandler(healthPath string, checkNow chan<- struct{}) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/status", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			http.Error(writer, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeStatusJSON(writer, http.StatusOK, readMonitorHealth(healthPath))
+	})
+	mux.HandleFunc("/api/check", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			writer.Header().Set("Allow", http.MethodPost)
+			http.Error(writer, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		select {
+		case checkNow <- struct{}{}:
+		default:
+		}
+		writeStatusJSON(writer, http.StatusAccepted, map[string]bool{"accepted": true})
+	})
+	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/" || request.Method != http.MethodGet {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+		writer.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(writer, statusPageHTML)
+	})
+	return mux
+}
+
+func readMonitorHealth(path string) monitorHealth {
+	var health monitorHealth
+	raw, err := os.ReadFile(path)
+	if err == nil && json.Unmarshal(raw, &health) == nil {
+		return health
+	}
+	health.LastError = "尚未收到后台进程状态"
+	return health
+}
+
+func writeStatusJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+const statusPageHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>JuanProxy 远程 Codex 监控</title>
+<style>
+:root { color: #17212b; background: #f4f7f8; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; }
+main { max-width: 760px; margin: 0 auto; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+h1 { margin: 0; font-size: 22px; font-weight: 650; }
+button { min-width: 96px; height: 36px; border: 1px solid #126d67; border-radius: 5px; color: #fff; background: #126d67; font: inherit; cursor: pointer; }
+button:hover { background: #0d5752; }
+button:disabled { cursor: wait; opacity: .65; }
+.summary { display: flex; align-items: center; gap: 10px; padding: 16px 0; border-top: 1px solid #d6dce0; border-bottom: 1px solid #d6dce0; font-size: 16px; font-weight: 600; }
+.dot { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 50%; background: #87949c; }
+.ok .dot { background: #16803b; }
+.bad .dot { background: #b42318; }
+dl { display: grid; grid-template-columns: 144px minmax(0, 1fr); margin: 0; }
+dt, dd { min-height: 42px; padding: 11px 0; border-bottom: 1px solid #d6dce0; }
+dt { color: #52616b; }
+dd { margin: 0; overflow-wrap: anywhere; }
+.error { display: none; margin-top: 18px; padding: 12px; border-left: 3px solid #b42318; background: #fff1ef; color: #7a271a; overflow-wrap: anywhere; }
+.error.visible { display: block; }
+.updated { margin: 14px 0 0; color: #66747c; font-size: 13px; }
+@media (max-width: 520px) { body { padding: 16px; } header { align-items: flex-start; } h1 { font-size: 20px; } dl { grid-template-columns: 1fr; } dt { min-height: auto; padding-bottom: 3px; border-bottom: 0; } dd { padding-top: 3px; } }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>JuanProxy 远程 Codex 监控</h1><button id="check" type="button">立即检查</button></header>
+  <section id="summary" class="summary"><span class="dot"></span><span id="status">正在读取状态</span></section>
+  <dl>
+    <dt>后台进程</dt><dd id="pid">-</dd>
+    <dt>版本</dt><dd id="version">-</dd>
+    <dt>启动时间</dt><dd id="startedAt">-</dd>
+    <dt>最近检查</dt><dd id="lastCheckAt">-</dd>
+    <dt>最近成功</dt><dd id="lastSuccessAt">-</dd>
+    <dt>监控站点</dt><dd id="endpoint">-</dd>
+  </dl>
+  <div id="error" class="error"></div>
+  <p id="updated" class="updated"></p>
+</main>
+<script>
+const ids = ['pid', 'version', 'startedAt', 'lastCheckAt', 'lastSuccessAt', 'endpoint'];
+const text = (id, value) => document.getElementById(id).textContent = value || '-';
+const formatTime = value => value ? new Date(value).toLocaleString() : '-';
+async function refresh() {
+  try {
+    const response = await fetch('/api/status', { cache: 'no-store' });
+    const health = await response.json();
+    ids.forEach(id => text(id, id.endsWith('At') ? formatTime(health[id]) : health[id]));
+    const failed = Boolean(health.lastError);
+    document.getElementById('summary').className = 'summary ' + (failed ? 'bad' : 'ok');
+    text('status', failed ? '后台运行，检查异常' : health.lastSuccessAt ? '后台运行正常' : '后台运行，等待首次检查');
+    const error = document.getElementById('error');
+    error.textContent = health.lastError || '';
+    error.className = failed ? 'error visible' : 'error';
+    text('updated', '页面更新：' + new Date().toLocaleTimeString());
+  } catch (error) {
+    document.getElementById('summary').className = 'summary bad';
+    text('status', '状态页读取失败');
+    const element = document.getElementById('error');
+    element.textContent = error.message;
+    element.className = 'error visible';
+  }
+}
+document.getElementById('check').addEventListener('click', async event => {
+	 const button = event.currentTarget;
+	 button.disabled = true;
+	 await fetch('/api/check', { method: 'POST' });
+	 setTimeout(refresh, 500);
+	 setTimeout(() => button.disabled = false, 750);
+});
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>`
 
 func findEvents(sessionsDir string, since time.Time, known map[string]bool) ([]remoteEvent, error) {
 	events := make([]remoteEvent, 0)
@@ -411,11 +709,23 @@ func postEvents(client *http.Client, endpoint, apiKey string, events []remoteEve
 	return nil
 }
 
-func loadProviderSettings() (providerSettings, error) {
-	home, err := codexHome()
+func loadRuntimeProviderSettings() (providerSettings, error) {
+	dataDir, err := monitorDataDir()
 	if err != nil {
 		return providerSettings{}, err
 	}
+	installed := readInstalledConfig(filepath.Join(dataDir, configFile))
+	home := installed.CodexHome
+	if home == "" {
+		home, err = codexHome()
+		if err != nil {
+			return providerSettings{}, err
+		}
+	}
+	return loadProviderSettingsFrom(home, &installed)
+}
+
+func loadProviderSettingsFrom(home string, installed *installedConfig) (providerSettings, error) {
 	raw, err := os.ReadFile(filepath.Join(home, "config.toml"))
 	if err != nil {
 		return providerSettings{}, fmt.Errorf("读取 Codex 配置失败：%w", err)
@@ -438,6 +748,10 @@ func loadProviderSettings() (providerSettings, error) {
 				settings.APIKey = ""
 			}
 		}
+	}
+	if settings.APIKey == "" && installed != nil &&
+		settings.Provider == installed.Provider && settings.BaseURL == installed.BaseURL {
+		settings.APIKey = strings.TrimSpace(installed.APIKey)
 	}
 	if settings.APIKey == "" {
 		return providerSettings{}, errors.New("未在生效环境变量或 ~/.codex/auth.json 中找到 API key")
@@ -518,7 +832,11 @@ func readState(path string) monitorState {
 }
 
 func saveState(path string, state monitorState) error {
-	raw, err := json.MarshalIndent(state, "", "  ")
+	return saveJSON(path, state)
+}
+
+func saveJSON(path string, value any) error {
+	raw, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -528,6 +846,48 @@ func saveState(path string, state monitorState) error {
 	}
 	_ = os.Remove(path)
 	return os.Rename(temporary, path)
+}
+
+func readInstalledConfig(path string) installedConfig {
+	var config installedConfig
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(raw, &config)
+	}
+	return config
+}
+
+func recordMonitorHealth(path string, health *monitorHealth, checkErr error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	health.LastCheckAt = now
+	if settings, err := loadRuntimeProviderSettings(); err == nil {
+		health.Endpoint, _ = eventEndpoint(settings.BaseURL)
+	}
+	if checkErr != nil {
+		health.LastError = checkErr.Error()
+	} else {
+		health.LastError = ""
+		health.LastSuccessAt = now
+	}
+	_ = saveJSON(path, *health)
+}
+
+func waitForMonitorHealth(path string, after time.Time, timeout time.Duration) (monitorHealth, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var health monitorHealth
+		raw, err := os.ReadFile(path)
+		if err == nil && json.Unmarshal(raw, &health) == nil && !parseTime(health.LastCheckAt).Before(after) {
+			if health.LastError != "" {
+				return health, errors.New(health.LastError)
+			}
+			if health.LastSuccessAt != "" {
+				return health, nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return monitorHealth{}, errors.New("20 秒内未收到后台进程状态")
 }
 
 func monitorDataDir() (string, error) {
@@ -555,9 +915,17 @@ func codexHome() (string, error) {
 }
 
 func codexSessionsDir() (string, error) {
-	home, err := codexHome()
+	dataDir, err := monitorDataDir()
 	if err != nil {
 		return "", err
+	}
+	installed := readInstalledConfig(filepath.Join(dataDir, configFile))
+	home := installed.CodexHome
+	if home == "" {
+		home, err = codexHome()
+		if err != nil {
+			return "", err
+		}
 	}
 	return filepath.Join(home, "sessions"), nil
 }

@@ -906,8 +906,16 @@ export class OpenApiProxyServer extends EventEmitter {
   }
 
   async handleRemoteCodexEvents(req, res) {
+    const monitoring = this.configService.getState().monitoring;
+    if (req.method === 'GET') {
+      this.sendJson(res, 200, {
+        ok: true,
+        enabled: Boolean(monitoring?.enabled && monitoring.notifications?.remoteCompletion)
+      });
+      return;
+    }
     if (req.method !== 'POST') {
-      this.sendJson(res, 405, { error: { message: 'Method not allowed' } }, { Allow: 'POST' });
+      this.sendJson(res, 405, { error: { message: 'Method not allowed' } }, { Allow: 'GET, POST' });
       return;
     }
     if (!isJsonContentType(req.headers['content-type'])) {
@@ -926,7 +934,6 @@ export class OpenApiProxyServer extends EventEmitter {
       this.sendJson(res, 400, { error: { message: 'events must contain 1 to 100 items' } });
       return;
     }
-    const monitoring = this.configService.getState().monitoring;
     if (!monitoring?.enabled || !monitoring.notifications?.remoteCompletion) {
       this.sendJson(res, 202, { accepted: 0, ignored: payload.events.length });
       return;

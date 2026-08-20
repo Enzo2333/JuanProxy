@@ -180,6 +180,14 @@ test('accepts deduplicated remote Codex completion events with the local API key
       }]
     };
 
+    const unauthorizedProbe = await fetch(url);
+    assert.equal(unauthorizedProbe.status, 401);
+    const probe = await fetch(url, {
+      headers: { Authorization: `Bearer ${TEST_LOCAL_API_KEY}` }
+    });
+    assert.equal(probe.status, 200);
+    assert.deepEqual(await probe.json(), { ok: true, enabled: true });
+
     const first = await postJson(url, payload);
     const duplicate = await postJson(url, payload);
     assert.equal(first.response.status, 202);
@@ -190,6 +198,10 @@ test('accepts deduplicated remote Codex completion events with the local API key
     const stored = JSON.parse(await readFile(join(dir, 'remote-codex-events', names[0]), 'utf8'));
     assert.equal(stored.key, 'remote:remote-pc:thread-1:turn-1');
     await config.updateMonitoringSettings({ notifications: { remoteCompletion: false } });
+    const disabledProbe = await fetch(url, {
+      headers: { Authorization: `Bearer ${TEST_LOCAL_API_KEY}` }
+    });
+    assert.deepEqual(await disabledProbe.json(), { ok: true, enabled: false });
     payload.events[0].turnId = 'turn-2';
     const disabled = await postJson(url, payload);
     assert.deepEqual(JSON.parse(disabled.text), { accepted: 0, ignored: 1 });

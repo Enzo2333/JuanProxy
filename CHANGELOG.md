@@ -8,6 +8,7 @@ The format is based on Keep a Changelog, and this project uses semantic versioni
 
 ### Fixed
 
+- Remote Codex monitor installation now persists the active credential for background launches, validates the authenticated JuanProxy endpoint before reporting success, and follows custom `CODEX_HOME` session directories.
 - Codex completion notifications now poll within 10 seconds and stop waiting for thread-name metadata after 3 seconds before sending with a fallback title.
 - No-usable-site and recovery notifications now apply the same manual selection, rate-limit pause, and automatic multiplier-limit rules as proxy routing.
 - Codex completion monitoring now separates rollout modification time from event time so delayed writes are still discovered.
@@ -19,6 +20,7 @@ The format is based on Keep a Changelog, and this project uses semantic versioni
 
 ### Added
 
+- The remote Codex monitor now opens a loopback-only status UI with live health details, actionable errors, automatic refresh, and an immediate-check control.
 - Dependency-free Windows x64, macOS Apple Silicon, and macOS Intel remote Codex monitors are published as double-click installers on GitHub Releases; they follow the active Codex API configuration and report deduplicated answer and goal completion events through an independent Feishu notification switch.
 - Independent Feishu Watchdog monitoring now uses event-specific card titles and provides separate switches for effective-multiplier changes, per-account low balances, prolonged lack of usable sites, program outages, ordinary Codex answers, and Codex goal completion or pause.
 - Optional Codex task recovery now waits for replayable requests during temporary site outages and resumes matching stopped Windows Codex App tasks after a site recovers, controlled by one default-off switch.

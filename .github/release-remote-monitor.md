@@ -12,6 +12,8 @@ JuanProxy Remote Codex Monitor 是用于 Windows 和 macOS 的独立原生后台
 
 目标运行期间的单轮回答不会触发通知。事件会在本机持久化、去重，并在网络或飞书发送失败后重试。需要先在 JuanProxy 中开启“远程 Codex 回答或目标完成/暂停”。
 
+安装完成后会自动打开仅限本机访问的状态界面，显示后台运行状态、最近检查、当前监控站点和具体错误，并提供“立即检查”按钮。关闭界面不会停止后台监控；再次双击同版本程序即可重新打开。
+
 ### 下载选择
 
 | 系统 | 芯片 | 推荐下载 | 独立程序 |
@@ -33,6 +35,8 @@ It reads the active Codex provider configuration and API key from the current us
 - Goal pause
 
 Individual turns do not generate notifications while a goal is active. Events are persisted locally, deduplicated, and retried after network or Feishu delivery failures. Enable **Remote Codex answer or goal completion/pause** in JuanProxy first.
+
+After installation, a local-only status UI opens automatically. It shows the background process, recent checks, current endpoint, and actionable errors, and includes a **Check now** control. Closing the page does not stop monitoring; launch the same version again to reopen it.
 
 ### Downloads
 
