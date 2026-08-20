@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,7 @@ import {
   runWatchdogCheck,
   sendFeishuWebhook
 } from '../src/monitoring/feishu-watchdog.js';
+import { storeRemoteCodexEvents } from '../src/monitoring/remote-codex-event-inbox.js';
 
 function site(overrides = {}) {
   return {
@@ -211,6 +212,54 @@ test('waits for the configured no-usable-site duration before alerting', () => {
     now: new Date('2026-08-11T10:05:00.000Z')
   });
   assert.equal(result.events[0].type, 'alert');
+});
+
+test('uses the proxy selection policy for no-usable-site alerts and recovery', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'juanproxy-no-selectable-site-watchdog-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'watchdog-state.json');
+  const input = {
+    proxy: {
+      port: 8787,
+      smartSwitching: true,
+      priorityMode: 'multiplier',
+      samePriorityStrategy: 'round-robin',
+      autoSwitchMultiplierLimit: { enabled: true, maxMultiplier: 0.08 }
+    },
+    ...config([site({ groupMultiplier: 0.1 })], [], {
+      noUsableSiteDelayMinutes: 1,
+      notifications: {
+        multiplierChanged: false,
+        lowBalance: false,
+        noUsableSite: true,
+        programIssues: false,
+        answerCompleted: false,
+        goalStatusChanged: false
+      }
+    })
+  };
+  const cards = [];
+  const fetchImpl = async (url, options) => {
+    if (String(url).includes('/__proxy/health')) {
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    cards.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ code: 0, msg: 'success' }), { status: 200 });
+  };
+
+  try {
+    await writeFile(configPath, JSON.stringify(input), 'utf8');
+    await runWatchdogCheck({ configPath, statePath, fetchImpl, now: new Date('2026-08-20T03:30:00.000Z') });
+    await runWatchdogCheck({ configPath, statePath, fetchImpl, now: new Date('2026-08-20T03:31:00.000Z') });
+    assert.equal(cards[0].card.header.title.content, '无可用站点：已持续 1 分钟');
+
+    input.sites[0].sync.remote.groupMultiplier = 0.05;
+    await writeFile(configPath, JSON.stringify(input), 'utf8');
+    await runWatchdogCheck({ configPath, statePath, fetchImpl, now: new Date('2026-08-20T03:31:30.000Z') });
+    assert.equal(cards[1].card.header.title.content, '无可用站点：已持续 1 分钟（已恢复）');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('deduplicates active alerts, reminds after 30 minutes, and notifies recovery once', () => {
@@ -443,7 +492,11 @@ test('splits ordinary answer and goal status notifications without notifying goa
       logger: { error() {} }
     };
 
-    await runWatchdogCheck({ ...options, now: new Date('2026-08-11T10:00:00.000Z') });
+    const initial = await runWatchdogCheck({
+      ...options,
+      now: new Date('2026-08-11T10:00:00.000Z')
+    });
+    assert.equal(initial.intervalMs, 10_000);
     assert.equal(cards.length, 0);
 
     await runWatchdogCheck({ ...options, now: new Date('2026-08-11T10:01:00.000Z') });
@@ -468,6 +521,139 @@ test('splits ordinary answer and goal status notifications without notifying goa
     assert.equal(state.codexCompletions.answerEnabledAt, null);
     assert.equal(state.codexCompletions.goalEnabledAt, null);
     assert.deepEqual(state.codexCompletions.delivered, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('delivers remote answer completions through its independent switch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'juanproxy-remote-completion-watchdog-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'watchdog-state.json');
+  const remoteEventsDir = join(dir, 'remote-codex-events');
+  const cards = [];
+  const fetchImpl = async (url, options) => {
+    if (String(url).includes('/__proxy/health')) {
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    cards.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ code: 0, msg: 'success' }), { status: 200 });
+  };
+  const input = {
+    proxy: { port: 8787 },
+    ...config([site()], [], {
+      notifications: {
+        multiplierChanged: false,
+        lowBalance: false,
+        noUsableSite: false,
+        programIssues: false,
+        answerCompleted: false,
+        goalStatusChanged: false,
+        remoteCompletion: true
+      }
+    })
+  };
+  try {
+    await writeFile(configPath, JSON.stringify(input), 'utf8');
+    await runWatchdogCheck({
+      configPath,
+      statePath,
+      remoteEventsDir,
+      fetchImpl,
+      now: new Date('2026-08-20T10:00:00.000Z')
+    });
+    await storeRemoteCodexEvents({
+      inboxDir: remoteEventsDir,
+      source: { id: 'remote-pc', name: 'REMOTE-PC' },
+      events: [
+        {
+          threadId: 'thread-remote',
+          turnId: 'turn-remote',
+          cwd: 'E:\\RemoteProject',
+          completedAt: '2026-08-20T10:01:00.000Z',
+          receivedAt: '2026-08-20T10:01:01.000Z',
+          durationMs: 12_000
+        },
+        {
+          type: 'goal',
+          threadId: 'thread-goal',
+          cwd: 'E:\\GoalProject',
+          status: 'complete',
+          createdAt: '2026-08-20T10:00:10.000Z',
+          updatedAt: '2026-08-20T10:01:02.000Z',
+          receivedAt: '2026-08-20T10:01:03.000Z'
+        }
+      ]
+    });
+
+    const result = await runWatchdogCheck({
+      configPath,
+      statePath,
+      remoteEventsDir,
+      fetchImpl,
+      now: new Date('2026-08-20T10:01:05.000Z')
+    });
+    assert.equal(result.delivered, 2);
+    assert.deepEqual(cards.map((card) => card.card.header.title.content), [
+      '回答完成：REMOTE-PC / RemoteProject',
+      '目标完成：REMOTE-PC / GoalProject'
+    ]);
+    assert.deepEqual(await readdir(remoteEventsDir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeps remote completion events queued until Feishu delivery succeeds', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'juanproxy-remote-completion-retry-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'watchdog-state.json');
+  const remoteEventsDir = join(dir, 'remote-codex-events');
+  let fail = true;
+  const fetchImpl = async (url, options) => {
+    if (String(url).includes('/__proxy/health')) {
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    if (fail) {
+      throw new Error('Feishu offline');
+    }
+    return new Response(JSON.stringify({ code: 0, msg: 'success' }), { status: 200 });
+  };
+  const input = {
+    proxy: { port: 8787 },
+    ...config([site()], [], {
+      notifications: {
+        multiplierChanged: false,
+        lowBalance: false,
+        noUsableSite: false,
+        programIssues: false,
+        answerCompleted: false,
+        goalStatusChanged: false,
+        remoteCompletion: true
+      }
+    })
+  };
+  try {
+    await writeFile(configPath, JSON.stringify(input), 'utf8');
+    await runWatchdogCheck({ configPath, statePath, remoteEventsDir, fetchImpl, now: new Date('2026-08-20T11:00:00.000Z') });
+    await storeRemoteCodexEvents({
+      inboxDir: remoteEventsDir,
+      source: { id: 'remote-pc', name: 'REMOTE-PC' },
+      events: [{
+        threadId: 'thread-retry',
+        turnId: 'turn-retry',
+        cwd: 'E:\\RetryProject',
+        completedAt: '2026-08-20T11:01:00.000Z',
+        receivedAt: '2026-08-20T11:01:01.000Z'
+      }]
+    });
+    const failed = await runWatchdogCheck({ configPath, statePath, remoteEventsDir, fetchImpl, now: new Date('2026-08-20T11:01:05.000Z') });
+    assert.equal(failed.delivered, 0);
+    assert.equal(Object.keys(failed.state.codexCompletions.pending).length, 1);
+    fail = false;
+    const retried = await runWatchdogCheck({ configPath, statePath, remoteEventsDir, fetchImpl, now: new Date('2026-08-20T11:01:10.000Z') });
+    assert.equal(retried.delivered, 1);
+    assert.deepEqual(await readdir(remoteEventsDir), []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -591,6 +777,7 @@ test('persists health failure counts across checks and sends recovery after rest
         feishuWebhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/test',
         failureThreshold: 3,
         repeatIntervalMinutes: 30,
+        notifications: { noUsableSite: false },
         rules: []
       },
       sites: [site()]

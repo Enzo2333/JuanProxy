@@ -53,7 +53,7 @@ export async function findRecentJuanProxyFailures({ sessionsDir, sinceMs = 0 }) 
     } catch {
       continue;
     }
-    if (fileStat.mtimeMs < sinceMs) {
+    if (fileChangedAtMs(fileStat) < sinceMs) {
       continue;
     }
 
@@ -117,7 +117,7 @@ export async function findRecentCodexCompletions({ sessionsDir, sinceMs = 0 }) {
     } catch {
       continue;
     }
-    if (fileStat.mtimeMs < sinceMs) {
+    if (fileChangedAtMs(fileStat) < sinceMs) {
       continue;
     }
     try {
@@ -147,7 +147,7 @@ export async function findRecentCodexEvents({
     } catch {
       continue;
     }
-    if (fileStat.mtimeMs < modifiedSinceMs) {
+    if (fileChangedAtMs(fileStat) < modifiedSinceMs) {
       continue;
     }
     try {
@@ -403,6 +403,10 @@ function dateMs(value) {
 
 function eventTimeMs(event) {
   return dateMs(event.type === 'goal' ? event.updatedAt : event.completedAt);
+}
+
+function fileChangedAtMs(fileStat) {
+  return Math.max(fileStat.mtimeMs, fileStat.ctimeMs);
 }
 
 function escapeRegExp(value) {

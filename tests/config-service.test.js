@@ -26,7 +26,8 @@ test('persists one monitoring rule per account across linked sites and removes s
         noUsableSite: true,
         programIssues: true,
         answerCompleted: false,
-        goalStatusChanged: false
+        goalStatusChanged: false,
+        remoteCompletion: false
       },
       rules: []
     });
@@ -51,7 +52,8 @@ test('persists one monitoring rule per account across linked sites and removes s
         noUsableSite: false,
         programIssues: true,
         answerCompleted: true,
-        goalStatusChanged: true
+        goalStatusChanged: true,
+        remoteCompletion: true
       },
       noUsableSiteDelayMinutes: 15
     });
@@ -74,7 +76,8 @@ test('persists one monitoring rule per account across linked sites and removes s
       noUsableSite: false,
       programIssues: true,
       answerCompleted: true,
-      goalStatusChanged: true
+      goalStatusChanged: true,
+      remoteCompletion: true
     });
     assert.doesNotMatch(JSON.stringify(service.exportConfig()), /hook\/test/);
     assert.deepEqual(state.monitoring.rules, [{

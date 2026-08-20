@@ -192,3 +192,24 @@ test('reads user-facing names for completed Codex threads', async () => {
     ]
   );
 });
+
+test('bounds thread name lookup time so notifications can use their fallback title', async () => {
+  const fakeProcess = createFakeProcess((message, reply) => {
+    if (message.method === 'initialize') {
+      reply({ id: message.id, result: {} });
+    }
+  });
+  const appServer = await import('../src/codex/codex-app-server-client.js');
+  const forcedExit = setTimeout(() => fakeProcess.emit('exit', 1, null), 50);
+
+  try {
+    await assert.rejects(appServer.readCodexThreadNames({
+      threadIds: ['thread-1'],
+      executablePath: 'codex.exe',
+      spawnProcess: () => fakeProcess,
+      requestTimeoutMs: 5
+    }), /request timed out: thread\/read/);
+  } finally {
+    clearTimeout(forcedExit);
+  }
+});

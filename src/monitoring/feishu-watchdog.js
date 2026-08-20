@@ -1,11 +1,16 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { basename, dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { readCodexThreadNames } from '../codex/codex-app-server-client.js';
 import { findRecentCodexEvents } from '../codex/codex-session-failure-detector.js';
+import {
+  readRemoteCodexEvents,
+  removeRemoteCodexEventFiles
+} from './remote-codex-event-inbox.js';
 
 import {
   calculateEffectiveMultiplier,
+  chooseBestSite,
   isRateLimitPaused,
   isUsableSite
 } from '../proxy/switching-policy.js';
@@ -17,14 +22,17 @@ export async function runWatchdogCheck({
   now = new Date(),
   logger = console,
   sessionsDir = null,
+  remoteEventsDir = null,
   findCodexEvents = findRecentCodexEvents,
   findCodexCompletions = null,
   resolveCodexThreadNames = readCodexThreadNames
 } = {}) {
   const config = JSON.parse(await readFile(configPath, 'utf8'));
+  remoteEventsDir ??= join(dirname(configPath), 'remote-codex-events');
   let state = await readWatchdogState(statePath);
   const monitoring = config.monitoring ?? {};
   if (!monitoring.enabled) {
+    await clearRemoteEventInbox(remoteEventsDir, logger);
     if (
       state.healthFailureCount ||
       state.activeMultiplier ||
@@ -44,6 +52,9 @@ export async function runWatchdogCheck({
   }
 
   state = clearDisabledNotificationState(state, monitoring);
+  if (!notificationSettings(monitoring).remoteCompletion) {
+    await clearRemoteEventInbox(remoteEventsDir, logger);
+  }
   const healthOk = await checkProxyHealth(config.proxy?.port, fetchImpl);
   state.healthFailureCount = notificationSettings(monitoring).programIssues
     ? healthOk ? 0 : state.healthFailureCount + 1
@@ -72,6 +83,7 @@ export async function runWatchdogCheck({
     findCodexEvents,
     findCodexCompletions,
     resolveCodexThreadNames,
+    remoteEventsDir,
     now,
     logger
   });
@@ -90,6 +102,9 @@ export async function runWatchdogCheck({
         fetchImpl
       });
       state = recordAlertDelivery(state, event, now);
+      if (event.remoteInboxPath) {
+        await removeRemoteCodexEventFiles([event.remoteInboxPath]);
+      }
       delivered += 1;
     } catch (error) {
       logger?.error?.(`[feishu-watchdog] ${error?.message ?? error}`);
@@ -136,7 +151,7 @@ export function collectAlertConditions({
   const sites = Array.isArray(config.sites) ? config.sites : [];
   if (
     notifications.noUsableSite &&
-    !sites.some((site) => isUsableSite(site) && !isRateLimitPaused(site, now))
+    !hasSelectableSite(config, now)
   ) {
     addCondition(conditions, {
       key: 'no-usable-site',
@@ -196,6 +211,21 @@ export function collectAlertConditions({
   }
 
   return conditions;
+}
+
+function hasSelectableSite(config, now) {
+  const sites = Array.isArray(config.sites) ? config.sites : [];
+  if (!config.proxy?.smartSwitching) {
+    const active = sites.find((site) => site.id === config.activeSiteId);
+    return Boolean(active && isUsableSite(active) && !isRateLimitPaused(active, now));
+  }
+  return Boolean(chooseBestSite(sites, {
+    samePriorityStrategy: config.proxy?.samePriorityStrategy,
+    priorityMode: config.proxy?.priorityMode,
+    lastSelectedSiteId: config.proxy?.lastSelectedSiteId,
+    autoSwitchMultiplierLimit: config.proxy?.autoSwitchMultiplierLimit,
+    now
+  }));
 }
 
 export function reconcileAlerts({
@@ -367,13 +397,14 @@ async function reconcileCodexNotifications({
   findCodexEvents,
   findCodexCompletions,
   resolveCodexThreadNames,
+  remoteEventsDir,
   now,
   logger
 }) {
   const next = normalizeWatchdogState(state);
   const completionState = next.codexCompletions;
   const notifications = notificationSettings(monitoring);
-  if (!notifications.answerCompleted && !notifications.goalStatusChanged) {
+  if (!notifications.answerCompleted && !notifications.goalStatusChanged && !notifications.remoteCompletion) {
     return { events: [], state: next };
   }
 
@@ -384,6 +415,11 @@ async function reconcileCodexNotifications({
   if (notifications.goalStatusChanged && !completionState.goalEnabledAt) {
     completionState.goalEnabledAt = nowIso;
   }
+  const known = new Set([
+    ...completionState.delivered,
+    ...Object.keys(completionState.pending)
+  ]);
+  const unseen = [];
 
   if (sessionsDir) {
     let found;
@@ -407,11 +443,6 @@ async function reconcileCodexNotifications({
       found = [];
     }
 
-    const known = new Set([
-      ...completionState.delivered,
-      ...Object.keys(completionState.pending)
-    ]);
-    const unseen = [];
     for (const value of [...found].sort((left, right) =>
       codexNotificationTimeMs(left) - codexNotificationTimeMs(right)
     )) {
@@ -450,20 +481,48 @@ async function reconcileCodexNotifications({
       known.add(item.key);
     }
 
-    let names = new Map();
-    if (unseen.length > 0) {
-      try {
-        names = await resolveCodexThreadNames({
-          threadIds: [...new Set(unseen.map((item) => item.threadId))]
-        });
-      } catch (error) {
-        logger?.error?.(`[feishu-watchdog] ${error?.message ?? error}`);
+  }
+
+  if (notifications.remoteCompletion && remoteEventsDir) {
+    try {
+      const stalePaths = [];
+      for (const value of await readRemoteCodexEvents(remoteEventsDir)) {
+        const item = normalizeCodexNotification(value);
+        if (!item || item.source !== 'remote') {
+          continue;
+        }
+        if (
+          known.has(item.key)
+        ) {
+          stalePaths.push(item.remoteInboxPath);
+          continue;
+        }
+        unseen.push(item);
+        known.add(item.key);
       }
+      await removeRemoteCodexEventFiles(stalePaths);
+    } catch (error) {
+      logger?.error?.(`[feishu-watchdog] ${error?.message ?? error}`);
     }
-    for (const item of unseen) {
+  }
+
+  let names = new Map();
+  const localUnseen = unseen.filter((item) => item.source !== 'remote');
+  if (localUnseen.length > 0) {
+    try {
+      names = await resolveCodexThreadNames({
+        threadIds: [...new Set(localUnseen.map((item) => item.threadId))],
+        requestTimeoutMs: 3_000
+      });
+    } catch (error) {
+      logger?.error?.(`[feishu-watchdog] ${error?.message ?? error}`);
+    }
+  }
+  for (const item of unseen) {
+    if (item.source !== 'remote') {
       item.threadName = String(names.get(item.threadId) ?? '').trim();
-      completionState.pending[item.key] = item;
     }
+    completionState.pending[item.key] = item;
   }
 
   return {
@@ -472,6 +531,15 @@ async function reconcileCodexNotifications({
       .map(createCodexNotificationEvent),
     state: next
   };
+}
+
+async function clearRemoteEventInbox(remoteEventsDir, logger) {
+  try {
+    const events = await readRemoteCodexEvents(remoteEventsDir);
+    await removeRemoteCodexEventFiles(events.map((event) => event.inboxPath));
+  } catch (error) {
+    logger?.error?.(`[feishu-watchdog] ${error?.message ?? error}`);
+  }
 }
 
 function normalizeCodexCompletionState(value = {}) {
@@ -531,10 +599,15 @@ function normalizeCodexNotification(value = {}) {
     }
     return {
       type: 'goal',
-      key: `${threadId}:${createdAt}:${updatedAt}:${status}`,
+      key: String(value.key ?? `${threadId}:${createdAt}:${updatedAt}:${status}`),
+      source: value.source === 'remote' ? 'remote' : 'local',
+      sourceId: String(value.sourceId ?? '').trim(),
+      machineName: String(value.machineName ?? '').trim(),
+      remoteInboxPath: String(value.inboxPath ?? value.remoteInboxPath ?? '').trim() || null,
       threadId,
       cwd: String(value.cwd ?? '').trim(),
       threadName: String(value.threadName ?? '').trim(),
+      receivedAt: normalizeIso(value.receivedAt),
       status,
       createdAt,
       updatedAt
@@ -547,11 +620,16 @@ function normalizeCodexNotification(value = {}) {
   }
   return {
     type: 'completion',
-    key: `${threadId}:${turnId}`,
+    key: String(value.key ?? `${threadId}:${turnId}`),
+    source: value.source === 'remote' ? 'remote' : 'local',
+    sourceId: String(value.sourceId ?? '').trim(),
+    machineName: String(value.machineName ?? '').trim(),
+    remoteInboxPath: String(value.inboxPath ?? value.remoteInboxPath ?? '').trim() || null,
     threadId,
     turnId,
     cwd: String(value.cwd ?? '').trim(),
     threadName: String(value.threadName ?? '').trim(),
+    receivedAt: normalizeIso(value.receivedAt),
     startedAt: normalizeIso(value.startedAt),
     completedAt,
     durationMs: Number.isFinite(Number(value.durationMs)) && Number(value.durationMs) >= 0
@@ -561,7 +639,9 @@ function normalizeCodexNotification(value = {}) {
 }
 
 function createCodexNotificationEvent(item) {
-  const target = item.threadName || basename(item.cwd) ||
+  const target = item.source === 'remote'
+    ? `${item.machineName || '远程电脑'} / ${item.threadName || basename(item.cwd) || item.threadId.slice(0, 8)}`
+    : item.threadName || basename(item.cwd) ||
     `会话 ${item.threadId.slice(0, 8)}`;
   const shortTarget = target.length > 60 ? `${target.slice(0, 59)}…` : target;
   const details = [`会话：${target}`];
@@ -574,6 +654,7 @@ function createCodexNotificationEvent(item) {
   return {
     type: 'completion',
     completionKey: item.key,
+    remoteInboxPath: item.remoteInboxPath ?? null,
     condition: {
       key: `codex-completion:${item.key}`,
       kind: item.type === 'goal' ? `codex-goal-${item.status}` : 'codex-answer-completed',
@@ -616,7 +697,7 @@ function clearDisabledNotificationState(state, monitoring) {
   if (!notifications.multiplierChanged) {
     next.activeMultiplier = null;
   }
-  if (!notifications.answerCompleted && !notifications.goalStatusChanged) {
+  if (!notifications.answerCompleted && !notifications.goalStatusChanged && !notifications.remoteCompletion) {
     next.codexCompletions = normalizeCodexCompletionState();
   } else {
     if (!notifications.answerCompleted) {
@@ -626,6 +707,9 @@ function clearDisabledNotificationState(state, monitoring) {
     if (!notifications.goalStatusChanged) {
       next.codexCompletions.goalEnabledAt = null;
       removePendingCodexNotifications(next.codexCompletions, 'goal');
+    }
+    if (!notifications.remoteCompletion) {
+      removePendingCodexNotifications(next.codexCompletions, 'remote');
     }
   }
   const enabledByKind = {
@@ -694,13 +778,14 @@ function notificationSettings(monitoring = {}) {
     noUsableSite: monitoring.notifications?.noUsableSite ?? true,
     programIssues: monitoring.notifications?.programIssues ?? true,
     answerCompleted: monitoring.notifications?.answerCompleted ?? false,
-    goalStatusChanged: monitoring.notifications?.goalStatusChanged ?? false
+    goalStatusChanged: monitoring.notifications?.goalStatusChanged ?? false,
+    remoteCompletion: monitoring.notifications?.remoteCompletion ?? false
   };
 }
 
 function removePendingCodexNotifications(state, type) {
   for (const [key, item] of Object.entries(state.pending)) {
-    if (item.type === type) {
+    if (type === 'remote' ? item.source === 'remote' : item.type === type && item.source !== 'remote') {
       delete state.pending[key];
     }
   }
@@ -785,7 +870,12 @@ function normalizeIso(value) {
 }
 
 function monitoringIntervalMs(monitoring) {
-  return Math.max(10, Number(monitoring?.checkIntervalSeconds) || 30) * 1000;
+  const configured = Math.max(10, Number(monitoring?.checkIntervalSeconds) || 30) * 1000;
+  const notifications = notificationSettings(monitoring);
+  return notifications.answerCompleted || notifications.goalStatusChanged
+    || notifications.remoteCompletion
+    ? Math.min(configured, 10_000)
+    : configured;
 }
 
 async function checkProxyHealth(port, fetchImpl) {

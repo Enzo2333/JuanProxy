@@ -2,7 +2,9 @@ import http from 'node:http';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 
+import { storeRemoteCodexEvents } from '../monitoring/remote-codex-event-inbox.js';
 import { recoverAvailableSites } from './recover-sites.js';
 import { SiteAvailabilityWaiter } from './site-availability-waiter.js';
 import { testSiteAvailability } from './site-tester.js';
@@ -29,6 +31,7 @@ const INCOMPLETE_RESPONSES_STREAM_ERROR =
   'stream disconnected before completion: stream closed before response.completed';
 const RESPONSES_COMPLETED_EVENT = 'response.completed';
 const ROUTE_TRACE_TEXT_LIMIT = 240;
+const REMOTE_CODEX_EVENT_BODY_BYTES = 64 * 1024;
 
 export class OpenApiProxyServer extends EventEmitter {
   constructor(options = {}) {
@@ -43,7 +46,8 @@ export class OpenApiProxyServer extends EventEmitter {
       availabilityPollIntervalMs,
       maxPendingRecoveryRequests,
       maxBufferedErrorBodyBytes = DEFAULT_MAX_BUFFERED_ERROR_BODY_BYTES,
-      maxBufferedRetryableErrorBodyBytes = DEFAULT_MAX_BUFFERED_RETRYABLE_ERROR_BODY_BYTES
+      maxBufferedRetryableErrorBodyBytes = DEFAULT_MAX_BUFFERED_RETRYABLE_ERROR_BODY_BYTES,
+      remoteCodexInboxDir = null
     } = options;
     super();
     if (!configService) {
@@ -65,6 +69,8 @@ export class OpenApiProxyServer extends EventEmitter {
     );
     this.maxBufferedErrorBodyBytes = maxBufferedErrorBodyBytes;
     this.maxBufferedRetryableErrorBodyBytes = maxBufferedRetryableErrorBodyBytes;
+    this.remoteCodexInboxDir = remoteCodexInboxDir ??
+      join(dirname(configService.filePath), 'remote-codex-events');
     this.availabilityWaiter = new SiteAvailabilityWaiter({
       configService,
       waitTimeoutMs: availabilityWaitTimeoutMs,
@@ -185,6 +191,11 @@ export class OpenApiProxyServer extends EventEmitter {
           message: 'Invalid local API key'
         }
       }, { 'WWW-Authenticate': 'Bearer' });
+      return;
+    }
+
+    if (isRemoteCodexEventPath(req.url)) {
+      await this.handleRemoteCodexEvents(req, res);
       return;
     }
 
@@ -894,6 +905,40 @@ export class OpenApiProxyServer extends EventEmitter {
     });
   }
 
+  async handleRemoteCodexEvents(req, res) {
+    if (req.method !== 'POST') {
+      this.sendJson(res, 405, { error: { message: 'Method not allowed' } }, { Allow: 'POST' });
+      return;
+    }
+    if (!isJsonContentType(req.headers['content-type'])) {
+      this.sendJson(res, 415, { error: { message: 'Content-Type must be application/json' } });
+      return;
+    }
+    const body = await readRequestBody(req, REMOTE_CODEX_EVENT_BODY_BYTES);
+    let payload;
+    try {
+      payload = JSON.parse(body.toString('utf8'));
+    } catch {
+      this.sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
+      return;
+    }
+    if (!Array.isArray(payload?.events) || payload.events.length < 1 || payload.events.length > 100) {
+      this.sendJson(res, 400, { error: { message: 'events must contain 1 to 100 items' } });
+      return;
+    }
+    const monitoring = this.configService.getState().monitoring;
+    if (!monitoring?.enabled || !monitoring.notifications?.remoteCompletion) {
+      this.sendJson(res, 202, { accepted: 0, ignored: payload.events.length });
+      return;
+    }
+    const result = await storeRemoteCodexEvents({
+      inboxDir: this.remoteCodexInboxDir,
+      source: payload.source,
+      events: payload.events
+    });
+    this.sendJson(res, 202, result);
+  }
+
   sendJson(res, statusCode, body, headers = {}) {
     if (res.headersSent) {
       res.end();
@@ -927,6 +972,10 @@ export class OpenApiProxyServer extends EventEmitter {
 function readBearerToken(authorization) {
   const match = /^Bearer[ \t]+([^\s,]+)[ \t]*$/i.exec(String(authorization ?? ''));
   return match?.[1] ?? '';
+}
+
+function isRemoteCodexEventPath(value) {
+  return parseRequestUrl(value).pathname.endsWith('/__proxy/remote-codex-events');
 }
 
 export function composeTargetUrl(baseUrl, requestUrl) {

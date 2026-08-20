@@ -106,11 +106,13 @@ const elements = {
   monitoringProgramIssues: document.querySelector('#monitoring-program-issues'),
   monitoringAnswerCompleted: document.querySelector('#monitoring-answer-completed'),
   monitoringGoalStatusChanged: document.querySelector('#monitoring-goal-status-changed'),
+  monitoringRemoteCompletion: document.querySelector('#monitoring-remote-completion'),
   monitoringSummary: document.querySelector('#monitoring-summary'),
   saveMonitoring: document.querySelector('#save-monitoring'),
   testFeishuWebhook: document.querySelector('#test-feishu-webhook'),
   installMonitoringTask: document.querySelector('#install-monitoring-task'),
   removeMonitoringTask: document.querySelector('#remove-monitoring-task'),
+  openRemoteMonitorDownload: document.querySelector('#open-remote-monitor-download'),
   configExportGlobalSettings: document.querySelector('#config-export-global-settings'),
   configExportMode: document.querySelector('#config-export-mode'),
   configExportSelectedSites: document.querySelector('#config-export-selected-sites'),
@@ -601,6 +603,7 @@ function renderMonitoringSettings() {
   elements.monitoringProgramIssues.checked = notifications.programIssues ?? true;
   elements.monitoringAnswerCompleted.checked = notifications.answerCompleted ?? false;
   elements.monitoringGoalStatusChanged.checked = notifications.goalStatusChanged ?? false;
+  elements.monitoringRemoteCompletion.checked = notifications.remoteCompletion ?? false;
   elements.noUsableSiteDelayMinutes.value = monitoring.noUsableSiteDelayMinutes ?? 5;
   elements.noUsableSiteDelayMinutes.disabled = !elements.monitoringNoUsableSite.checked;
   const enabledCount = [
@@ -609,12 +612,13 @@ function renderMonitoringSettings() {
     elements.monitoringNoUsableSite,
     elements.monitoringProgramIssues,
     elements.monitoringAnswerCompleted,
-    elements.monitoringGoalStatusChanged
+    elements.monitoringGoalStatusChanged,
+    elements.monitoringRemoteCompletion
   ].filter((element) => element.checked).length;
   elements.monitoringSummary.textContent = [
     monitoring.enabled ? '监控已启用' : '监控未启用',
     monitoring.feishuWebhook ? 'Webhook 已配置' : 'Webhook 未配置',
-    `已启用 ${enabledCount}/6 项通知`,
+    `已启用 ${enabledCount}/7 项通知`,
     formatMonitoringTaskStatus(),
     '持续异常每 30 分钟提醒'
   ].join(' · ');
@@ -635,7 +639,8 @@ function readMonitoringSettingsFormPayload() {
       noUsableSite: elements.monitoringNoUsableSite.checked,
       programIssues: elements.monitoringProgramIssues.checked,
       answerCompleted: elements.monitoringAnswerCompleted.checked,
-      goalStatusChanged: elements.monitoringGoalStatusChanged.checked
+      goalStatusChanged: elements.monitoringGoalStatusChanged.checked,
+      remoteCompletion: elements.monitoringRemoteCompletion.checked
     }
   };
 }
@@ -1037,6 +1042,7 @@ function getProxyControlRoots() {
     elements.monitoringProgramIssues,
     elements.monitoringAnswerCompleted,
     elements.monitoringGoalStatusChanged,
+    elements.monitoringRemoteCompletion,
     elements.configExportGlobalSettings,
     elements.configExportMode,
     elements.configExportSelectedSites,
@@ -2933,6 +2939,13 @@ elements.removeMonitoringTask.addEventListener('click', async () => {
     monitoringTaskStatus = await api.removeMonitoringTask();
     render();
     showToast('飞书监控后台任务已移除');
+  });
+});
+
+elements.openRemoteMonitorDownload.addEventListener('click', async () => {
+  await runAction(async () => {
+    await api.openRemoteMonitorDownload();
+    showToast('已打开远程监控程序下载页');
   });
 });
 

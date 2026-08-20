@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -154,6 +154,48 @@ test('requires the local API key and replaces it with the upstream site key', as
   } finally {
     await proxy.stop();
     await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('accepts deduplicated remote Codex completion events with the local API key', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-remote-codex-events-'));
+  const config = new ConfigService({ filePath: join(dir, 'config.json') });
+  const proxy = new OpenApiProxyServer({ configService: config });
+  try {
+    await loadConfig(config);
+    await config.updateMonitoringSettings({
+      enabled: true,
+      notifications: { remoteCompletion: true }
+    });
+    const port = await proxy.start(0);
+    const url = `http://127.0.0.1:${port}/v1/__proxy/remote-codex-events`;
+    const payload = {
+      source: { id: 'remote-pc', name: 'REMOTE-PC' },
+      events: [{
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        cwd: 'E:\\work',
+        completedAt: '2026-08-20T10:00:00.000Z'
+      }]
+    };
+
+    const first = await postJson(url, payload);
+    const duplicate = await postJson(url, payload);
+    assert.equal(first.response.status, 202);
+    assert.deepEqual(JSON.parse(first.text), { accepted: 1, duplicates: 0, rejected: 0 });
+    assert.deepEqual(JSON.parse(duplicate.text), { accepted: 0, duplicates: 1, rejected: 0 });
+    const names = await readdir(join(dir, 'remote-codex-events'));
+    assert.equal(names.length, 1);
+    const stored = JSON.parse(await readFile(join(dir, 'remote-codex-events', names[0]), 'utf8'));
+    assert.equal(stored.key, 'remote:remote-pc:thread-1:turn-1');
+    await config.updateMonitoringSettings({ notifications: { remoteCompletion: false } });
+    payload.events[0].turnId = 'turn-2';
+    const disabled = await postJson(url, payload);
+    assert.deepEqual(JSON.parse(disabled.text), { accepted: 0, ignored: 1 });
+    assert.equal((await readdir(join(dir, 'remote-codex-events'))).length, 1);
+  } finally {
+    await proxy.stop();
     await rm(dir, { recursive: true, force: true });
   }
 });

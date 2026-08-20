@@ -749,6 +749,10 @@
                     <input id="monitoring-goal-status-changed" type="checkbox" />
                     Codex 目标完成或暂停
                   </label>
+                  <label class="toggle">
+                    <input id="monitoring-remote-completion" type="checkbox" />
+                    远程 Codex 回答或目标完成/暂停
+                  </label>
                 </fieldset>
                 <small id="monitoring-summary" class="wide-field section-note">
                   持续异常每 30 分钟提醒一次，恢复后通知
@@ -758,6 +762,7 @@
                   <button id="test-feishu-webhook" type="button" class="secondary">发送测试消息</button>
                   <button id="install-monitoring-task" type="button" class="secondary">安装并启动后台任务</button>
                   <button id="remove-monitoring-task" type="button" class="secondary">停止并移除后台任务</button>
+                  <button id="open-remote-monitor-download" type="button" class="secondary">下载远程一键监控程序</button>
                 </div>
               </div>
             </details>

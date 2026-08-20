@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { app, BrowserWindow, dialog, ipcMain, screen } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, screen, shell } from 'electron';
 
 import { APP_DISPLAY_NAME, APP_ID, selectUserDataPath } from './app-identity.js';
 import { CodexRecoveryCoordinator } from './codex/codex-recovery-coordinator.js';
@@ -41,6 +41,7 @@ import { loadWindowSize, MIN_WINDOW_SIZE, saveWindowSize } from './window-state.
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const MAX_RECENT_ROUTE_TRACES = 50;
+const REMOTE_MONITOR_RELEASE_URL = 'https://github.com/Enzo2333/JuanProxy/releases/latest';
 
 app.setName(APP_DISPLAY_NAME);
 if (process.platform === 'win32') {
@@ -191,7 +192,8 @@ async function bootstrap() {
 
   proxyServer = new OpenApiProxyServer({
     configService,
-    logger: createLoggerBridge('proxy')
+    logger: createLoggerBridge('proxy'),
+    remoteCodexInboxDir: join(userDataPath, 'remote-codex-events')
   });
   autoRecoveryScheduler = new DisabledSiteAutoRecoveryScheduler({
     configService,
@@ -627,6 +629,10 @@ function registerIpc() {
   handleLogged('monitoring-task:remove', async () => {
     await removeWatchdogTask({ projectRoot: join(__dirname, '..') });
     return getWatchdogTaskStatus();
+  });
+  handleLogged('remote-monitoring:open-download', async () => {
+    await shell.openExternal(REMOTE_MONITOR_RELEASE_URL);
+    return { url: REMOTE_MONITOR_RELEASE_URL };
   });
   handleLogged('floating-window:set-expanded', (_event, expanded) => {
     setFloatingWindowExpanded(Boolean(expanded));

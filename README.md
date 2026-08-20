@@ -340,8 +340,9 @@ JuanProxy 使用飞书群自定义机器人 Webhook 发送通知。Watchdog 是�
 
 1. 在飞书群的 **设置 → 群机器人 → 添加机器人 → 自定义机器人** 中复制 Webhook。
 2. 在 JuanProxy 的 **路由策略 → 飞书监控** 中填写 Webhook，发送测试消息后启用监控。
-3. 选择需要的六类通知；在任一关联站点的 **站点策略 → 飞书余额提醒** 中设置当前账号的独立余额阈值，或关闭该账号的余额提醒。同一账号关联的全部站点共用此配置。
+3. 选择需要的七类通知；在任一关联站点的 **站点策略 → 飞书余额提醒** 中设置当前账号的独立余额阈值，或关闭该账号的余额提醒。同一账号关联的全部站点共用此配置。
 4. 点击 **安装并启动后台任务**，JuanProxy 会注册并立即启动当前用户的 Windows 任务计划。
+5. 需要监控远程电脑时，开启 **远程 Codex 回答或目标完成/暂停**，点击 **下载远程一键监控程序**，在 [GitHub Releases](https://github.com/Enzo2333/JuanProxy/releases/latest) 按远程电脑系统下载对应压缩包并双击安装。
 
 命令行也可以执行同一操作：
 
@@ -355,9 +356,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-feishu-wat
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall-feishu-watchdog.ps1
 ```
 
-Watchdog 每 30 秒检查一次。程序异常在连续 3 次无法访问 `/__proxy/health` 后通知；无可用站点默认持续 5 分钟后通知。持续类异常每 30 分钟提醒一次，恢复后通知一次。倍率通知以当前活动路由的实际倍率为准，首次检查只建立基线，实际倍率发生变化时通知。告警卡片标题统一采用“通知类型：具体内容”，例如 `回答完成：会话名`、`余额不足：站点名`、`倍率切换：1x → 0.5x`；持续和恢复状态附在标题末尾。
+Watchdog 默认每 30 秒检查一次；开启 Codex 回答或目标通知后，完成事件最多每 10 秒检查一次，会话名查询超过 3 秒时使用本地目录名或会话短 ID 立即发送。程序异常在连续 3 次无法访问 `/__proxy/health` 后通知；无可用站点默认持续 5 分钟后通知，并使用与代理相同的手动选路、限速暂停和自动倍率上限规则判断是否仍有站点可选。持续类异常每 30 分钟提醒一次，恢复后通知一次。倍率通知以当前活动路由的实际倍率为准，首次检查只建立基线，实际倍率发生变化时通知。告警卡片标题统一采用“通知类型：具体内容”，例如 `回答完成：会话名`、`余额不足：站点名`、`倍率切换：1x → 0.5x`；持续和恢复状态附在标题末尾。
 
-六类通知可以分别开启或关闭；关闭时会清理该类活动状态。余额阈值直接使用远端展示的数值单位，不进行币种换算，且只在最近一次账号同步成功并取得有效余额时判断。`Codex 普通对话回答完成` 和 `Codex 目标完成或暂停` 默认关闭：目标处于活动、暂停或阻塞状态时不发送单轮回答通知，仅在目标暂停或完成时发送目标通知；目标完成后的普通对话恢复单轮回答通知。通知按会话事件去重，不发送目标内容或回答正文。
+七类通知可以分别开启或关闭；关闭时会清理该类活动状态。余额阈值直接使用远端展示的数值单位，不进行币种换算，且只在最近一次账号同步成功并取得有效余额时判断。`Codex 普通对话回答完成`、`Codex 目标完成或暂停` 和远程完成通知默认关闭：目标处于活动、暂停或阻塞状态时不发送单轮回答通知，仅在目标暂停或完成时发送目标通知；目标完成后的普通对话恢复单轮回答通知。通知按会话事件去重，不发送目标内容或回答正文。
+
+远程一键监控程序是独立的原生可执行文件，不需要安装 Node.js、Go 或其他第三方运行时。Release 页面提供以下三个压缩包：
+
+- `JuanProxy-Remote-Codex-Monitor-Windows-x64.zip`：解压后双击 `.exe`，程序安装到 `%LOCALAPPDATA%\JuanProxy` 并注册当前用户登录任务。
+- `JuanProxy-Remote-Codex-Monitor-macOS-Apple-Silicon.zip`：适用于 M1 及后续 Apple 芯片，解压后双击 `Install-JuanProxy-Remote-Monitor.command`。
+- `JuanProxy-Remote-Codex-Monitor-macOS-Intel.zip`：适用于 Intel Mac，安装方式相同。
+
+macOS 首次启动若被系统拦截，在 Finder 中按住 Control 点击 `.command` 后选择 **打开**。安装后程序位于 `~/Library/Application Support/JuanProxy`，并注册当前用户 LaunchAgent。
+
+监控程序每 5 秒读取远程 `~/.codex/config.toml` 中当前生效的 `model_provider`、`base_url` 和 `env_key`，API key 从该环境变量、`OPENAI_API_KEY` 或 `~/.codex/auth.json` 获取。它扫描本机 Codex rollout，只把根任务的普通回答完成以及目标完成/暂停事件上报到当前 JuanProxy 地址；目标运行中的单轮完成不通知。JuanProxy 使用同一份本地 API key 校验上报、持久化去重并由本机 Watchdog 发送飞书通知；上报失败时远端保留事件并重试。
+
+远端状态和错误日志分别保存在 `%LOCALAPPDATA%\JuanProxy`（Windows）或 `~/Library/Application Support/JuanProxy`（macOS）。卸载后台监控可运行：
+
+```powershell
+& "$env:LOCALAPPDATA\JuanProxy\remote-codex-monitor.exe" --uninstall
+```
+
+```bash
+"$HOME/Library/Application Support/JuanProxy/remote-codex-monitor" --uninstall
+```
 
 飞书 Webhook 和站点提醒规则保存在本机 `config.json`，不会进入界面导出的配置文件。
 

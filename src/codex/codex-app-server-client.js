@@ -279,7 +279,8 @@ export async function readCodexThreadNames({
   threadIds = [],
   env = process.env,
   executablePath = null,
-  spawnProcess = spawn
+  spawnProcess = spawn,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
 } = {}) {
   const ids = [...new Set(threadIds.map((id) => String(id ?? '').trim()).filter(Boolean))];
   if (ids.length === 0) {
@@ -288,14 +289,17 @@ export async function readCodexThreadNames({
   const client = new CodexAppServerClient({
     executablePath: executablePath ?? await findCodexExecutable({ env }),
     spawnProcess,
-    env
+    env,
+    requestTimeoutMs
   });
   try {
     await client.start();
     const names = new Map();
-    for (const threadId of ids) {
+    const threads = await Promise.all(ids.map(async (threadId) => {
       const response = await client.request('thread/read', { threadId, includeTurns: false });
-      const name = String(response?.thread?.name ?? '').trim();
+      return [threadId, String(response?.thread?.name ?? '').trim()];
+    }));
+    for (const [threadId, name] of threads) {
       if (name) {
         names.set(threadId, name);
       }

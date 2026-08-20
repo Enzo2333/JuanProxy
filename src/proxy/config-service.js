@@ -68,7 +68,8 @@ export const DEFAULT_MONITORING_SETTINGS = {
     noUsableSite: true,
     programIssues: true,
     answerCompleted: false,
-    goalStatusChanged: false
+    goalStatusChanged: false,
+    remoteCompletion: false
   },
   rules: []
 };
@@ -1831,7 +1832,10 @@ export function normalizeMonitoringSettings(settings = {}, sites = []) {
         : Boolean(source.notifications.answerCompleted),
       goalStatusChanged: source.notifications?.goalStatusChanged === undefined
         ? DEFAULT_MONITORING_SETTINGS.notifications.goalStatusChanged
-        : Boolean(source.notifications.goalStatusChanged)
+        : Boolean(source.notifications.goalStatusChanged),
+      remoteCompletion: source.notifications?.remoteCompletion === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.remoteCompletion
+        : Boolean(source.notifications.remoteCompletion)
     },
     rules: [...rules.values()]
   };

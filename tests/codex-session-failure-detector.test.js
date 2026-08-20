@@ -277,7 +277,7 @@ test('finds every recent successful root turn completion', async () => {
   }
 });
 
-test('returns a root thread timeline with delayed completions and goal state changes', async () => {
+test('returns recent events when an open rollout has a stale modification time', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'juanproxy-codex-events-'));
   try {
     const detector = await import('../src/codex/codex-session-failure-detector.js');
@@ -312,7 +312,7 @@ test('returns a root thread timeline with delayed completions and goal state cha
         }
       }, '2026-07-31T01:50:31.000Z')
     ]);
-    await utimes(path, new Date('2026-07-31T01:55:00.000Z'), new Date('2026-07-31T01:55:00.000Z'));
+    await utimes(path, new Date('2026-07-31T01:48:00.000Z'), new Date('2026-07-31T01:48:00.000Z'));
 
     assert.equal(typeof detector.findRecentCodexEvents, 'function');
     assert.deepEqual(await detector.findRecentCodexEvents({

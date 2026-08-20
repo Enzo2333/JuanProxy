@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('openApiProxy', {
   getMonitoringTaskStatus: () => ipcRenderer.invoke('monitoring-task:status'),
   installMonitoringTask: () => ipcRenderer.invoke('monitoring-task:install'),
   removeMonitoringTask: () => ipcRenderer.invoke('monitoring-task:remove'),
+  openRemoteMonitorDownload: () => ipcRenderer.invoke('remote-monitoring:open-download'),
   setFloatingWindowExpanded: (expanded) =>
     ipcRenderer.invoke('floating-window:set-expanded', expanded),
   getFloatingWindowBounds: () => ipcRenderer.invoke('floating-window:get-bounds'),
