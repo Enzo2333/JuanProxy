@@ -6,30 +6,47 @@ import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, dialog, ipcMain, screen } from 'electron';
 
 import { APP_DISPLAY_NAME, APP_ID, selectUserDataPath } from './app-identity.js';
+import { CodexRecoveryCoordinator } from './codex/codex-recovery-coordinator.js';
 import { ConfigService } from './proxy/config-service.js';
 import { DisabledSiteAutoRecoveryScheduler } from './proxy/disabled-site-auto-recovery.js';
 import { OpenApiProxyServer } from './proxy/proxy-server.js';
+import { buildProxyAccessUrls } from './proxy/network-access.js';
 import { PortOccupancyGuard } from './proxy/port-occupancy-guard.js';
 import { detectSiteCapabilities } from './proxy/site-capabilities.js';
 import { startProxyWithFallback } from './proxy/start-proxy-with-fallback.js';
 import { testConfiguredSite } from './proxy/site-actions.js';
 import {
   createConfiguredSiteKey,
+  logoutConfiguredSiteAccount,
   switchConfiguredSiteGroup,
   syncAllConfiguredSites,
-  syncConfiguredSite
+  syncConfiguredSite,
+  syncGroupWebsite
 } from './proxy/site-sync-actions.js';
 import { SiteSyncScheduler } from './proxy/site-sync-scheduler.js';
-import { createRuntimeLogger } from './runtime-logger.js';
+import { createActivityLogger, createRuntimeLogger } from './runtime-logger.js';
 import { createCoalescedStateBroadcaster } from './state-broadcaster.js';
+import { sendFeishuWebhook } from './monitoring/feishu-watchdog.js';
+import {
+  getWatchdogTaskStatus,
+  installWatchdogTask,
+  removeWatchdogTask
+} from './monitoring/windows-watchdog-task.js';
+import {
+  resolveRemoteBrowserSessionWithWindow,
+  resolveTurnstileTokenWithWindow
+} from './turnstile-token-window.js';
+import { hideMainWindowOnClose, showMainWindow } from './window-lifecycle.js';
 import { loadWindowSize, MIN_WINDOW_SIZE, saveWindowSize } from './window-state.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const MAX_RECENT_ROUTE_TRACES = 50;
 
 app.setName(APP_DISPLAY_NAME);
 if (process.platform === 'win32') {
   app.setAppUserModelId(APP_ID);
 }
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 let mainWindow = null;
 let floatingWindow = null;
@@ -39,6 +56,7 @@ let pendingFloatingWindowPosition = null;
 let configService = null;
 let proxyServer = null;
 let autoRecoveryScheduler = null;
+let codexRecoveryCoordinator = null;
 let siteSyncScheduler = null;
 let portOccupancyGuard = null;
 let windowStateFilePath = null;
@@ -47,8 +65,11 @@ let pendingSitePatchTimer = null;
 let pendingSitePatchIds = new Set();
 let pendingConfigImports = new Map();
 let runtimeLogger = null;
+let activityLogger = null;
+let recentRouteTraces = [];
 let processErrorHandlersInstalled = false;
 let quitting = false;
+let pendingLocalApiKey = null;
 
 async function createWindow() {
   const savedWindowSize = loadWindowSize(windowStateFilePath);
@@ -59,7 +80,7 @@ async function createWindow() {
     minWidth: MIN_WINDOW_SIZE.width,
     minHeight: MIN_WINDOW_SIZE.height,
     title: APP_DISPLAY_NAME,
-    backgroundColor: '#f6f7f9',
+    backgroundColor: '#eaf3fa',
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -70,11 +91,22 @@ async function createWindow() {
 
   trackWindowSize(mainWindow);
   trackWindowRuntimeErrors(mainWindow);
+  mainWindow.on('close', (event) => {
+    const hidden = hideMainWindowOnClose({
+      event,
+      window: mainWindow,
+      quitting
+    });
+    if (hidden) {
+      logLifecycleEvent(
+        'main-window.hidden',
+        'Main window close request was converted to hide',
+        { reason: 'window-close' }
+      );
+    }
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
-    if (!quitting && process.platform !== 'darwin') {
-      app.quit();
-    }
   });
 
   await mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
@@ -145,12 +177,17 @@ async function bootstrap() {
     userDataPath,
     appVersion: app.getVersion?.()
   });
+  activityLogger = createActivityLogger({
+    userDataPath,
+    appVersion: app.getVersion?.()
+  });
   windowStateFilePath = join(userDataPath, 'window-state.json');
 
   configService = new ConfigService({
     filePath: join(userDataPath, 'config.json')
   });
   await configService.load();
+  pendingLocalApiKey = await configService.ensureLocalApiKey();
 
   proxyServer = new OpenApiProxyServer({
     configService,
@@ -160,8 +197,22 @@ async function bootstrap() {
     configService,
     logger: createLoggerBridge('auto-recovery')
   });
+  const codexHomePath = process.env.CODEX_HOME || join(app.getPath('home'), '.codex');
+  codexRecoveryCoordinator = new CodexRecoveryCoordinator({
+    configService,
+    sessionsDir: join(codexHomePath, 'sessions'),
+    queueFilePath: join(userDataPath, 'codex-recovery-queue.json'),
+    logger: createLoggerBridge('codex-recovery')
+  });
   siteSyncScheduler = new SiteSyncScheduler({
     configService,
+    syncWebsite: (options) => syncGroupWebsite({
+      ...options,
+      trigger: 'scheduled',
+      onActivity: recordActivityEvent,
+      resolveTurnstileToken: resolveSiteSyncTurnstileToken,
+      resolveBrowserSession: resolveSiteSyncBrowserSession
+    }),
     logger: createLoggerBridge('site-sync')
   });
   portOccupancyGuard = new PortOccupancyGuard({
@@ -191,6 +242,9 @@ async function bootstrap() {
     logRuntimeError('proxy.site-sync-preheat-error', error);
     broadcastState();
   });
+  proxyServer.on('route-trace', (trace) => {
+    recordRouteTrace(trace);
+  });
   proxyServer.on('request-complete', (event) => {
     if (event?.statusCode >= 400) {
       logRuntimeError(
@@ -211,8 +265,26 @@ async function bootstrap() {
     });
     broadcastSitePatch(event?.siteId);
   });
+  proxyServer.on('availability-exhausted', (event) => {
+    codexRecoveryCoordinator.handleAvailabilityExhausted(event);
+  });
+  proxyServer.on('codex-retry-needed', (event) => {
+    codexRecoveryCoordinator.handleAvailabilityExhausted(event);
+  });
+  proxyServer.on('sites-recovered', () => {
+    codexRecoveryCoordinator.notifySitesRecovered();
+  });
   autoRecoveryScheduler.on('checked', () => broadcastState());
+  autoRecoveryScheduler.on('sites-recovered', () => {
+    codexRecoveryCoordinator.notifySitesRecovered();
+  });
+  codexRecoveryCoordinator.on('queue-changed', () => broadcastState());
+  codexRecoveryCoordinator.on('recovery-error', (error) => {
+    logRuntimeError('codex-recovery.error', error);
+    broadcastState();
+  });
   siteSyncScheduler.on('synced', () => broadcastState());
+  siteSyncScheduler.on('status-changed', () => broadcastState());
   portOccupancyGuard.on('released', () => broadcastState());
   portOccupancyGuard.on('guard-error', (error) => {
     logRuntimeError('port-guard.guard-error', error, {
@@ -220,6 +292,7 @@ async function bootstrap() {
     });
     broadcastState();
   });
+  await codexRecoveryCoordinator.start();
   autoRecoveryScheduler.start();
   siteSyncScheduler.start();
   portOccupancyGuard.start();
@@ -303,7 +376,22 @@ async function restartProxy() {
 }
 
 function registerIpc() {
-  handleLogged('state:get', () => buildState());
+  handleLogged('state:get', (event) => buildState({
+    revealLocalApiKey: event.sender === mainWindow?.webContents
+  }));
+  handleLogged('app-window:show-main', async () => {
+    const shown = showMainWindowWithLog('renderer-request');
+    return { shown };
+  });
+  handleLogged('app:quit', async () => {
+    await logLifecycleEvent(
+      'app.quit-requested',
+      'Explicit app quit requested',
+      { source: 'renderer' }
+    );
+    app.quit();
+    return { ok: true };
+  });
   handleLogged('runtime-log:error', async (_event, input) => {
     const result = await logRuntimeError(
       input?.source ?? 'renderer.error',
@@ -314,6 +402,14 @@ function registerIpc() {
       ok: result?.ok ?? false,
       filePath: runtimeLogger?.filePath ?? null
     };
+  });
+  handleLogged('activity-log:list', async (_event, options) => {
+    return activityLogger?.readEntries(options) ?? [];
+  });
+  handleLogged('activity-log:clear', async () => {
+    const result = await activityLogger?.clear();
+    sendToRendererWindows('activity-log:changed');
+    return { ok: result?.ok ?? false };
   });
   handleLogged('site:add', async (_event, input) => {
     await configService.addSite(input);
@@ -347,7 +443,12 @@ function registerIpc() {
     };
   });
   handleLogged('site:sync', async (_event, id) => {
-    const syncResult = await syncConfiguredSite({ configService, siteId: id });
+    const syncResult = await syncConfiguredSite({
+      configService,
+      siteId: id,
+      resolveTurnstileToken: resolveSiteSyncTurnstileToken,
+      resolveBrowserSession: resolveSiteSyncBrowserSession
+    });
     return {
       ...buildState(),
       syncResult: {
@@ -360,15 +461,39 @@ function registerIpc() {
     };
   });
   handleLogged('site:create-key', async (_event, id) => {
-    const createKeyResult = await createConfiguredSiteKey({ configService, siteId: id });
+    const createKeyResult = await createConfiguredSiteKey({
+      configService,
+      siteId: id,
+      resolveTurnstileToken: resolveSiteSyncTurnstileToken,
+      resolveBrowserSession: resolveSiteSyncBrowserSession
+    });
     return {
       ...buildState(),
       createKeyResult: {
         ok: createKeyResult.ok,
         multiplier: createKeyResult.multiplier,
         keyName: createKeyResult.keyName,
+        createdSiteId: createKeyResult.createdSiteId ?? null,
         error: createKeyResult.error ? {
           message: createKeyResult.error.message ?? String(createKeyResult.error)
+        } : null
+      }
+    };
+  });
+  handleLogged('site:logout-account', async (_event, id) => {
+    const logoutResult = await logoutConfiguredSiteAccount({
+      configService,
+      siteId: id
+    });
+    return {
+      ...buildState(),
+      logoutResult: {
+        ok: logoutResult.ok,
+        remoteAttempted: logoutResult.remoteAttempted,
+        remoteSucceeded: logoutResult.remoteSucceeded,
+        reason: logoutResult.reason ?? null,
+        error: logoutResult.error ? {
+          message: logoutResult.error.message ?? String(logoutResult.error)
         } : null
       }
     };
@@ -400,12 +525,20 @@ function registerIpc() {
     await switchConfiguredSiteGroup({
       configService,
       siteId: id,
+      resolveTurnstileToken: resolveSiteSyncTurnstileToken,
+      resolveBrowserSession: resolveSiteSyncBrowserSession,
       ...normalizeIpcSwitchGroup(group)
     });
     return buildState();
   });
   handleLogged('site-sync:refresh-all', async () => {
-    const refreshResult = await syncAllConfiguredSites({ configService });
+    const refreshResult = await syncAllConfiguredSites({
+      configService,
+      resolveTurnstileToken: resolveSiteSyncTurnstileToken,
+      resolveBrowserSession: resolveSiteSyncBrowserSession,
+      onActivity: recordActivityEvent,
+      trigger: 'manual'
+    });
     return {
       ...buildState(),
       refreshResult: {
@@ -424,12 +557,26 @@ function registerIpc() {
   });
   handleLogged('proxy:update', async (_event, patch) => {
     const previousPort = configService.getProxyPort();
+    const previousListenHost = configService.getProxyListenHost();
     await configService.updateProxySettings(patch);
     const nextPort = configService.getProxyPort();
-    if (previousPort !== nextPort || !proxyServer.getStatus().running) {
+    const nextListenHost = configService.getProxyListenHost();
+    if (
+      previousPort !== nextPort ||
+      previousListenHost !== nextListenHost ||
+      !proxyServer.getStatus().running
+    ) {
       await restartProxy();
     }
     return buildState();
+  });
+  handleLogged('proxy:generate-local-api-key', async (event) => {
+    if (event.sender !== mainWindow?.webContents) {
+      throw new Error('local API key generation requires the main window');
+    }
+    const localApiKey = await configService.generateLocalApiKey();
+    broadcastState();
+    return { localApiKey };
   });
   handleLogged('site-sync:update-settings', async (_event, patch) => {
     await configService.updateSiteSyncSettings(patch);
@@ -447,6 +594,39 @@ function registerIpc() {
     await configService.updateAppSettings(patch);
     applyFloatingWindowSettings();
     return buildState();
+  });
+  handleLogged('monitoring:update', async (_event, patch) => {
+    await configService.updateMonitoringSettings(patch);
+    return buildState();
+  });
+  handleLogged('monitoring:update-rule', async (_event, siteId, patch) => {
+    await configService.updateMonitoringRule(siteId, patch);
+    return buildState();
+  });
+  handleLogged('monitoring:test', async (_event, webhook) => {
+    await sendFeishuWebhook({
+      webhook,
+      event: {
+        type: 'recovery',
+        condition: {
+          key: 'feishu-test',
+          kind: 'feishu-test',
+          title: '飞书机器人连接成功',
+          message: 'JuanProxy Watchdog 测试消息发送成功'
+        },
+        firstSeenAt: new Date().toISOString()
+      }
+    });
+    return { ok: true };
+  });
+  handleLogged('monitoring-task:status', () => getWatchdogTaskStatus());
+  handleLogged('monitoring-task:install', async () => {
+    await installWatchdogTask({ projectRoot: join(__dirname, '..') });
+    return getWatchdogTaskStatus();
+  });
+  handleLogged('monitoring-task:remove', async () => {
+    await removeWatchdogTask({ projectRoot: join(__dirname, '..') });
+    return getWatchdogTaskStatus();
   });
   handleLogged('floating-window:set-expanded', (_event, expanded) => {
     setFloatingWindowExpanded(Boolean(expanded));
@@ -521,6 +701,7 @@ function registerIpc() {
     }
 
     const previousPort = configService.getProxyPort();
+    const previousListenHost = configService.getProxyListenHost();
     const importResult = await configService.importConfig(pendingImport.raw, {
       siteIds: normalizeOptionalIpcSiteIds(options.siteIds),
       includeGlobalSettings: Boolean(options.includeGlobalSettings)
@@ -528,7 +709,12 @@ function registerIpc() {
     pendingConfigImports.delete(importId);
 
     const nextPort = configService.getProxyPort();
-    if (previousPort !== nextPort || !proxyServer.getStatus().running) {
+    const nextListenHost = configService.getProxyListenHost();
+    if (
+      previousPort !== nextPort ||
+      previousListenHost !== nextListenHost ||
+      !proxyServer.getStatus().running
+    ) {
       await restartProxy();
     }
 
@@ -596,12 +782,27 @@ function handleLogged(channel, handler) {
   });
 }
 
-function buildState() {
+function buildState({ revealLocalApiKey = false } = {}) {
+  const configState = configService.getRendererState();
+  const proxyStatus = proxyServer.getStatus();
+  const localApiKey = revealLocalApiKey ? pendingLocalApiKey : null;
+  if (revealLocalApiKey) {
+    pendingLocalApiKey = null;
+  }
   return {
-    ...configService.getState(),
-    proxyStatus: proxyServer.getStatus(),
+    ...configState,
+    proxyStatus,
+    proxyAccessUrls: buildProxyAccessUrls({
+      port: proxyStatus.port ?? configState.proxy.port,
+      allowLanAccess: configState.proxy.allowLanAccess
+    }),
     configPath: configService.filePath,
-    runtimeLogPath: runtimeLogger?.filePath ?? null
+    runtimeLogPath: runtimeLogger?.filePath ?? null,
+    activityLogPath: activityLogger?.filePath ?? null,
+    siteSyncStatus: siteSyncScheduler?.getStatus() ?? null,
+    codexRecoveryStatus: codexRecoveryCoordinator?.getStatus() ?? null,
+    recentRouteTraces: recentRouteTraces.map((trace) => ({ ...trace })),
+    ...(localApiKey ? { localApiKey } : {})
   };
 }
 
@@ -811,11 +1012,94 @@ function createLoggerBridge(source) {
   return runtimeLogger?.createConsoleBridge(source) ?? console;
 }
 
+function logLifecycleEvent(source, message, context = {}) {
+  console.info(`[${source}] ${message}`);
+  return runtimeLogger?.info(source, message, context) ?? Promise.resolve(null);
+}
+
+function showMainWindowWithLog(source) {
+  const shown = showMainWindow(mainWindow);
+  if (shown) {
+    logLifecycleEvent(
+      'main-window.shown',
+      'Main window was shown and focused',
+      { source }
+    );
+  }
+  return shown;
+}
+
+async function resolveSiteSyncTurnstileToken(context) {
+  return resolveTurnstileTokenWithWindow({
+    parentWindow: mainWindow,
+    origin: context?.origin,
+    siteKey: context?.siteKey,
+    timeoutMs: context?.timeoutMs
+  });
+}
+
+async function resolveSiteSyncBrowserSession(context) {
+  return resolveRemoteBrowserSessionWithWindow({
+    parentWindow: mainWindow,
+    origin: context?.origin,
+    challengeUrl: context?.challengeUrl,
+    timeoutMs: context?.timeoutMs
+  });
+}
+
+function recordRouteTrace(trace) {
+  const normalizedTrace = normalizeRouteTraceForState(trace);
+  if (!normalizedTrace?.id) {
+    return;
+  }
+
+  recentRouteTraces = [
+    normalizedTrace,
+    ...recentRouteTraces.filter((entry) => entry.id !== normalizedTrace.id)
+  ].slice(0, MAX_RECENT_ROUTE_TRACES);
+
+  runtimeLogger
+    ?.info('proxy.route-trace', 'Request route trace', { trace: normalizedTrace })
+    ?.catch?.((error) => {
+      console.error('Failed to write route trace runtime log:', error);
+    });
+  sendToRendererWindows('route-trace:changed', normalizedTrace);
+}
+
+function normalizeRouteTraceForState(trace) {
+  try {
+    return JSON.parse(JSON.stringify(trace ?? null));
+  } catch {
+    return null;
+  }
+}
+
 async function logRuntimeError(source, error, context = {}) {
   if (!runtimeLogger) {
     return null;
   }
   return runtimeLogger.error(source, error, context);
+}
+
+async function recordActivityEvent(event = {}) {
+  if (!activityLogger) {
+    return null;
+  }
+  const level = event.status === 'failure'
+    ? 'error'
+    : event.status === 'skipped'
+      ? 'warn'
+      : 'info';
+  const result = await activityLogger.write({
+    level,
+    source: `activity.${event.category ?? 'runtime'}`,
+    message: event.message ?? '运行活动',
+    context: event
+  });
+  if (result?.ok) {
+    sendToRendererWindows('activity-log:changed');
+  }
+  return result;
 }
 
 async function reportRuntimeError(source, error, context = {}) {
@@ -842,62 +1126,88 @@ function installProcessErrorHandlers() {
   });
 }
 
-installProcessErrorHandlers();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  installProcessErrorHandlers();
 
-app.whenReady()
-  .then(bootstrap)
-  .catch(async (error) => {
-    await reportRuntimeError('app.bootstrap', error);
-    await runtimeLogger?.flush();
-    app.exit(1);
+  app.on('second-instance', () => {
+    showMainWindowWithLog('second-instance');
   });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
-
-app.on('activate', () => {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    createWindow().catch((error) => {
-      reportRuntimeError('app.activate', error);
+  app.whenReady()
+    .then(bootstrap)
+    .catch(async (error) => {
+      await reportRuntimeError('app.bootstrap', error);
+      await runtimeLogger?.flush();
+      await activityLogger?.flush();
+      app.exit(1);
     });
-  }
-  if (!floatingWindow || floatingWindow.isDestroyed()) {
-    createFloatingWindow().catch((error) => {
-      reportRuntimeError('app.activate-floating', error);
-    });
-  }
-});
 
-app.on('before-quit', async (event) => {
-  if (quitting) {
-    return;
-  }
-  event.preventDefault();
-  try {
-    autoRecoveryScheduler?.stop();
-    siteSyncScheduler?.stop();
-    portOccupancyGuard?.stop();
-    if (pendingSitePatchTimer) {
-      clearTimeout(pendingSitePatchTimer);
-      pendingSitePatchTimer = null;
-      pendingSitePatchIds.clear();
+  app.on('window-all-closed', () => {
+    if (!quitting) {
+      logLifecycleEvent(
+        'app.window-all-closed',
+        'All windows closed while the background proxy remains active'
+      );
     }
-    stateBroadcaster?.flush();
-    await flushFloatingWindowPositionSave();
-    await configService?.flush();
-    if (proxyServer?.getStatus().running) {
-      await proxyServer.stop();
+  });
+
+  app.on('activate', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow()
+        .then(() => showMainWindowWithLog('app-activate'))
+        .catch((error) => {
+          reportRuntimeError('app.activate', error);
+        });
+    } else {
+      showMainWindowWithLog('app-activate');
     }
-    await runtimeLogger?.flush();
+    if (!floatingWindow || floatingWindow.isDestroyed()) {
+      createFloatingWindow().catch((error) => {
+        reportRuntimeError('app.activate-floating', error);
+      });
+    }
+  });
+
+  app.on('before-quit', async (event) => {
+    event.preventDefault();
+    if (quitting) {
+      return;
+    }
     quitting = true;
-    app.exit(0);
-  } catch (error) {
-    await reportRuntimeError('app.before-quit', error);
+    await logLifecycleEvent(
+      'app.before-quit.start',
+      'App shutdown cleanup started'
+    );
+    let exitCode = 0;
+    try {
+      await codexRecoveryCoordinator?.stop();
+      autoRecoveryScheduler?.stop();
+      siteSyncScheduler?.stop();
+      portOccupancyGuard?.stop();
+      if (pendingSitePatchTimer) {
+        clearTimeout(pendingSitePatchTimer);
+        pendingSitePatchTimer = null;
+        pendingSitePatchIds.clear();
+      }
+      stateBroadcaster?.flush();
+      await flushFloatingWindowPositionSave();
+      await configService?.flush();
+      if (proxyServer?.getStatus().running) {
+        await proxyServer.stop();
+      }
+    } catch (error) {
+      exitCode = 1;
+      await reportRuntimeError('app.before-quit', error);
+    }
+    await logLifecycleEvent(
+      'app.before-quit.complete',
+      'App shutdown cleanup finished',
+      { exitCode }
+    );
     await runtimeLogger?.flush();
-    quitting = true;
-    app.exit(1);
-  }
-});
+    await activityLogger?.flush();
+    app.exit(exitCode);
+  });
+}

@@ -13,7 +13,11 @@ test('enables every passing non-manual site when every usable site is disabled',
 
   try {
     await config.load();
-    await config.updateProxySettings({ failureThreshold: 0, smartSwitching: true });
+    await config.updateProxySettings({
+      failureThreshold: 0,
+      smartSwitching: true,
+      testModel: 'global-recovery-model'
+    });
     const first = await config.addSite({
       name: 'first',
       baseUrl: 'https://first.example/v1',
@@ -43,8 +47,9 @@ test('enables every passing non-manual site when every usable site is disabled',
     const tested = [];
     const result = await recoverAvailableSites({
       configService: config,
-      testSite: async (site) => {
+      testSite: async (site, options) => {
         tested.push(site.id);
+        assert.deepEqual(options, { testModel: 'global-recovery-model' });
         return {
           ok: site.id !== first.id,
           statusCode: site.id !== first.id ? 200 : 401,

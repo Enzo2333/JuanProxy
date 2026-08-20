@@ -20,6 +20,7 @@
   },
   "scripts": {
     "start": "electron .",
+    "monitor": "node scripts/feishu-watchdog.js",
     "test": "node --test"
   },
   "engines": {

@@ -1,9 +1,14 @@
 export async function loginAndFetchSiteSync({
   sync,
   apiKey = '',
+  targets = [],
+  targetSiteId = '',
+  authSession = null,
   fetch: fetchImpl = globalThis.fetch,
   now = new Date(),
-  timeoutMs = 30000
+  timeoutMs = 30000,
+  resolveTurnstileToken,
+  resolveBrowserSession
 } = {}) {
   if (!fetchImpl) {
     throw new Error('fetch is required');
@@ -12,33 +17,67 @@ export async function loginAndFetchSiteSync({
   const startedAt = nowIso(now);
   try {
     const normalized = normalizeSyncInput(sync);
-    const providerType = await resolveProviderType({
-      sync: normalized,
-      fetchImpl,
-      timeoutMs
-    });
-    const result = await syncByProviderType({
-      providerType,
-      sync: normalized,
+    const normalizedTargets = normalizeSyncTargets(targets, {
       apiKey,
+      targetSiteId
+    });
+    const result = await retryBrowserChallenge({
+      sync: normalized,
       fetchImpl,
-      timeoutMs
+      timeoutMs,
+      resolveBrowserSession,
+      operation: async (currentFetch, sessionOverride) => {
+        const providerType = await resolveProviderType({
+          sync: normalized,
+          fetchImpl: currentFetch,
+          timeoutMs
+        });
+        return retryExpiredAuthSession({
+          authSession: sessionOverride ?? authSession,
+          operation: (currentAuthSession) => syncByProviderType({
+            providerType,
+            sync: normalized,
+            apiKey,
+            targets: normalizedTargets,
+            targetSiteId,
+            authSession: currentAuthSession,
+            fetchImpl: currentFetch,
+            timeoutMs,
+            resolveTurnstileToken
+          })
+        });
+      }
     });
 
+    const primaryTarget = result.targetResults?.find((target) => target.siteId === targetSiteId) ?? null;
+    const primaryError = primaryTarget && !primaryTarget.ok
+      ? new Error(primaryTarget.error || 'Configured API key was not found in the remote account')
+      : null;
     return {
-      ok: true,
-      multiplier: result.remote.groupMultiplier,
+      ok: !primaryError,
+      multiplier: primaryError ? null : result.remote.groupMultiplier,
+      authSession: result.authSession,
+      authReused: result.authReused,
+      ...(result.targetResults ? {
+        accountSync: {
+          siteResults: result.targetResults
+        }
+      } : {}),
+      ...(primaryError ? { error: primaryError } : {}),
       syncPatch: {
         lastSyncAt: startedAt,
-        lastSyncStatus: 'success',
-        lastSyncError: null,
-        remote: result.remote
+        lastSyncStatus: primaryError ? 'failure' : 'success',
+        lastSyncError: primaryError?.message ?? null,
+        remote: primaryTarget?.remote ?? result.remote
       }
     };
   } catch (error) {
+    const establishedAuthSession = normalizeAuthSession(error?.authSession);
     return {
       ok: false,
       multiplier: null,
+      ...(establishedAuthSession ? { authSession: establishedAuthSession } : {}),
+      authSessionInvalidated: Boolean(error?.authSessionInvalidated),
       syncPatch: {
         lastSyncAt: startedAt,
         lastSyncStatus: 'failure',
@@ -53,9 +92,12 @@ export async function loginAndSwitchSiteGroup({
   sync,
   apiKey = '',
   group,
+  authSession = null,
   fetch: fetchImpl = globalThis.fetch,
   now = new Date(),
-  timeoutMs = 30000
+  timeoutMs = 30000,
+  resolveTurnstileToken,
+  resolveBrowserSession
 } = {}) {
   if (!fetchImpl) {
     throw new Error('fetch is required');
@@ -65,32 +107,49 @@ export async function loginAndSwitchSiteGroup({
   try {
     const normalized = normalizeSyncInput(sync);
     const selectedGroup = normalizeSwitchGroup(group);
-    const providerType = await resolveProviderType({
+    const result = await retryBrowserChallenge({
       sync: normalized,
       fetchImpl,
-      timeoutMs
-    });
-    const result = providerType === 'new-api'
-      ? await switchNewApiGroup({
+      timeoutMs,
+      resolveBrowserSession,
+      operation: async (currentFetch, sessionOverride) => {
+        const providerType = await resolveProviderType({
           sync: normalized,
-          originalSync: sync,
-          apiKey,
-          group: selectedGroup,
-          fetchImpl,
-          timeoutMs
-        })
-      : await switchModernV1Group({
-          sync: normalized,
-          originalSync: sync,
-          apiKey,
-          group: selectedGroup,
-          fetchImpl,
+          fetchImpl: currentFetch,
           timeoutMs
         });
+        return retryExpiredAuthSession({
+          authSession: sessionOverride ?? authSession,
+          operation: (currentAuthSession) => providerType === 'new-api'
+            ? switchNewApiGroup({
+              sync: normalized,
+              originalSync: sync,
+              apiKey,
+              group: selectedGroup,
+              authSession: currentAuthSession,
+              fetchImpl: currentFetch,
+              timeoutMs,
+              resolveTurnstileToken
+            })
+            : switchModernV1Group({
+              sync: normalized,
+              originalSync: sync,
+              apiKey,
+              group: selectedGroup,
+              authSession: currentAuthSession,
+              fetchImpl: currentFetch,
+              timeoutMs,
+              resolveTurnstileToken
+            })
+        });
+      }
+    });
 
     return {
       ok: true,
       multiplier: result.remote.groupMultiplier,
+      authSession: result.authSession,
+      authReused: result.authReused,
       syncPatch: {
         lastSyncAt: startedAt,
         lastSyncStatus: 'success',
@@ -99,9 +158,12 @@ export async function loginAndSwitchSiteGroup({
       }
     };
   } catch (error) {
+    const establishedAuthSession = normalizeAuthSession(error?.authSession);
     return {
       ok: false,
       multiplier: null,
+      ...(establishedAuthSession ? { authSession: establishedAuthSession } : {}),
+      authSessionInvalidated: Boolean(error?.authSessionInvalidated),
       syncPatch: {
         lastSyncAt: startedAt,
         lastSyncStatus: 'failure',
@@ -115,9 +177,12 @@ export async function loginAndSwitchSiteGroup({
 export async function loginAndCreateSiteKey({
   sync,
   name,
+  authSession = null,
   fetch: fetchImpl = globalThis.fetch,
   now = new Date(),
-  timeoutMs = 30000
+  timeoutMs = 30000,
+  resolveTurnstileToken,
+  resolveBrowserSession
 } = {}) {
   if (!fetchImpl) {
     throw new Error('fetch is required');
@@ -127,32 +192,49 @@ export async function loginAndCreateSiteKey({
   try {
     const normalized = normalizeSyncInput(sync);
     const keyName = normalizeCreatedKeyName(name);
-    const providerType = await resolveProviderType({
+    const result = await retryBrowserChallenge({
       sync: normalized,
       fetchImpl,
-      timeoutMs
-    });
-    const result = providerType === 'new-api'
-      ? await createNewApiKey({
+      timeoutMs,
+      resolveBrowserSession,
+      operation: async (currentFetch, sessionOverride) => {
+        const providerType = await resolveProviderType({
           sync: normalized,
-          originalSync: sync,
-          name: keyName,
-          fetchImpl,
-          timeoutMs
-        })
-      : await createModernV1Key({
-          sync: normalized,
-          originalSync: sync,
-          name: keyName,
-          fetchImpl,
+          fetchImpl: currentFetch,
           timeoutMs
         });
+        return retryExpiredAuthSession({
+          authSession: sessionOverride ?? authSession,
+          operation: (currentAuthSession) => providerType === 'new-api'
+            ? createNewApiKey({
+              sync: normalized,
+              originalSync: sync,
+              name: keyName,
+              authSession: currentAuthSession,
+              fetchImpl: currentFetch,
+              timeoutMs,
+              resolveTurnstileToken
+            })
+            : createModernV1Key({
+              sync: normalized,
+              originalSync: sync,
+              name: keyName,
+              authSession: currentAuthSession,
+              fetchImpl: currentFetch,
+              timeoutMs,
+              resolveTurnstileToken
+            })
+        });
+      }
+    });
 
     return {
       ok: true,
       apiKey: result.apiKey,
       multiplier: result.remote.groupMultiplier,
       keyName: pickFirstString(result.remote.keyName, keyName),
+      authSession: result.authSession,
+      authReused: result.authReused,
       syncPatch: {
         lastSyncAt: startedAt,
         lastSyncStatus: 'success',
@@ -161,15 +243,150 @@ export async function loginAndCreateSiteKey({
       }
     };
   } catch (error) {
+    const establishedAuthSession = normalizeAuthSession(error?.authSession);
     return {
       ok: false,
       apiKey: '',
       multiplier: null,
+      ...(establishedAuthSession ? { authSession: establishedAuthSession } : {}),
+      authSessionInvalidated: Boolean(error?.authSessionInvalidated),
       syncPatch: {
         lastSyncAt: startedAt,
         lastSyncStatus: 'failure',
         lastSyncError: error.message || String(error)
       },
+      error
+    };
+  }
+}
+
+export async function loginAndDeleteSiteKey({
+  sync,
+  apiKey = '',
+  remoteKeyId = '',
+  authSession = null,
+  fetch: fetchImpl = globalThis.fetch,
+  timeoutMs = 30000,
+  resolveTurnstileToken,
+  resolveBrowserSession
+} = {}) {
+  if (!fetchImpl) {
+    throw new Error('fetch is required');
+  }
+
+  try {
+    const normalized = normalizeSyncInput(sync);
+    const result = await retryBrowserChallenge({
+      sync: normalized,
+      fetchImpl,
+      timeoutMs,
+      resolveBrowserSession,
+      operation: async (currentFetch, sessionOverride) => {
+        const providerType = await resolveProviderType({
+          sync: normalized,
+          fetchImpl: currentFetch,
+          timeoutMs
+        });
+        return retryExpiredAuthSession({
+          authSession: sessionOverride ?? authSession,
+          operation: (currentAuthSession) => deleteSiteKeyByProviderType({
+            providerType,
+            sync: normalized,
+            apiKey,
+            remoteKeyId,
+            authSession: currentAuthSession,
+            fetchImpl: currentFetch,
+            timeoutMs,
+            resolveTurnstileToken
+          })
+        });
+      }
+    });
+    return {
+      ok: true,
+      remoteKeyId: result.remoteKeyId,
+      authSession: result.authSession,
+      authReused: result.authReused
+    };
+  } catch (error) {
+    const establishedAuthSession = normalizeAuthSession(error?.authSession);
+    return {
+      ok: false,
+      remoteKeyId: String(remoteKeyId ?? '').trim(),
+      ...(establishedAuthSession ? { authSession: establishedAuthSession } : {}),
+      authSessionInvalidated: Boolean(error?.authSessionInvalidated),
+      error
+    };
+  }
+}
+
+export async function logoutRemoteAccountSession({
+  sync,
+  authSession,
+  fetch: fetchImpl = globalThis.fetch,
+  timeoutMs = 30000
+} = {}) {
+  if (!fetchImpl) {
+    throw new Error('fetch is required');
+  }
+  const session = normalizeAuthSession(authSession);
+  if (!session) {
+    return {
+      ok: true,
+      remoteAttempted: false,
+      remoteSucceeded: false,
+      reason: 'no-session'
+    };
+  }
+
+  const origin = getOrigin(sync?.dashboardUrl);
+  if (session.origin !== origin) {
+    return {
+      ok: true,
+      remoteAttempted: false,
+      remoteSucceeded: false,
+      reason: 'session-mismatch'
+    };
+  }
+
+  const headers = session.token
+    ? authHeaders(session.token, session.userId)
+    : cookieStringAuthHeaders(session.cookie, session.userId);
+  const providerType = session.providerType;
+  const url = providerType === 'new-api'
+    ? `${origin}/api/user/logout`
+    : joinApiPath(session.apiBaseUrl || `${origin}/api/v1`, '/auth/logout');
+  const method = providerType === 'new-api' ? 'GET' : 'POST';
+
+  try {
+    await requestJson(fetchImpl, url, {
+      method,
+      headers,
+      signal: timeoutSignal(timeoutMs)
+    });
+    return {
+      ok: true,
+      remoteAttempted: true,
+      remoteSucceeded: true,
+      reason: null
+    };
+  } catch (error) {
+    if ([401, 403, 404, 405, 501].includes(error?.status)) {
+      return {
+        ok: true,
+        remoteAttempted: true,
+        remoteSucceeded: false,
+        reason: error.status === 401 || error.status === 403
+          ? 'session-expired'
+          : 'unsupported',
+        error
+      };
+    }
+    return {
+      ok: false,
+      remoteAttempted: true,
+      remoteSucceeded: false,
+      reason: 'request-failed',
       error
     };
   }
@@ -202,20 +419,53 @@ export function parseMultiplierFromText(value) {
   return Number.isFinite(multiplier) ? multiplier : null;
 }
 
-async function syncModernV1({ sync, apiKey = '', fetchImpl, timeoutMs }) {
-  const { apiBaseUrl, settingsPayload, headers } = await loginModernV1({
+async function syncModernV1({
+  sync,
+  apiKey = '',
+  targets = [],
+  targetSiteId = '',
+  authSession = null,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginModernV1({
     sync,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
-  const [profile, keysPayload, groupsPayload, ratesPayload] = await Promise.all([
-    requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/user/profile'), { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/keys?page=1&page_size=20'), { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/groups/available'), { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/groups/rates'), { headers, signal: timeoutSignal(timeoutMs) })
-  ]);
+  const { apiBaseUrl, settingsPayload, headers } = loginSession;
+  let profile;
+  let keysPayload;
+  let groupsPayload;
+  let ratesPayload;
+  try {
+    [profile, keysPayload, groupsPayload, ratesPayload] = await Promise.all([
+      requestJson(fetchImpl, joinApiPath(apiBaseUrl, '/user/profile'), { headers, signal: timeoutSignal(timeoutMs) }),
+      requestPaginatedJson({
+        fetchImpl,
+        buildUrl: (page, pageSize) => joinApiPath(apiBaseUrl, `/keys?page=${page}&page_size=${pageSize}`),
+        headers,
+        timeoutMs
+      }),
+      requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/groups/available'), { headers, signal: timeoutSignal(timeoutMs) }),
+      requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/groups/rates'), { headers, signal: timeoutSignal(timeoutMs) })
+    ]);
+  } catch (error) {
+    throw attachAuthSession(error, loginSession.authSession);
+  }
 
-  const key = selectRemoteKeyForConfiguredApiKey(keysPayload, apiKey);
+  let key;
+  try {
+    key = selectRemoteKeyForConfiguredApiKey(keysPayload, apiKey);
+  } catch (error) {
+    if (!targets.length) {
+      throw attachAuthSession(error, loginSession.authSession);
+    }
+    key = null;
+  }
   const keyGroup = pickFirstGroupName(key?.group, key?.group_name, key?.groupName, key?.groups?.[0]);
   const group = keyGroup ? findGroup(groupsPayload, keyGroup) : null;
   const groupName = key ? pickFirstGroupName(group, keyGroup) : '';
@@ -248,26 +498,43 @@ async function syncModernV1({ sync, apiKey = '', fetchImpl, timeoutMs }) {
       )
     : null;
 
+  const remote = {
+    providerType: 'modern-v1',
+    authType: 'Bearer auth_token (/api/v1)',
+    accountName: getAccountName(profile, sync.username),
+    balance: getBalanceText(profile),
+    apiEndpoint: pickFirstString(
+      key?.endpoint,
+      key?.api_endpoint,
+      key?.baseUrl,
+      key?.base_url,
+      getModernSettingsEndpoint(settingsPayload)
+    ),
+    keyName: pickFirstString(key?.name, key?.key_name, key?.label),
+    remoteKeyId: keyId,
+    keyGroup: groupName,
+    groupId,
+    groupMultiplier: multiplier,
+    groups
+  };
+  const targetResults = buildRemoteTargetResults({
+    targets,
+    keysPayload,
+    buildRemote: (targetKey) => buildModernRemoteSnapshotFromParts({
+      sync,
+      profile,
+      settingsPayload,
+      groupsPayload,
+      ratesPayload,
+      key: targetKey
+    })
+  });
+
   return {
-    remote: {
-      providerType: 'modern-v1',
-      authType: 'Bearer auth_token (/api/v1)',
-      accountName: getAccountName(profile, sync.username),
-      balance: getBalanceText(profile),
-      apiEndpoint: pickFirstString(
-        key?.endpoint,
-        key?.api_endpoint,
-        key?.baseUrl,
-        key?.base_url,
-        getModernSettingsEndpoint(settingsPayload)
-      ),
-      keyName: pickFirstString(key?.name, key?.key_name, key?.label),
-      remoteKeyId: keyId,
-      keyGroup: groupName,
-      groupId,
-      groupMultiplier: multiplier,
-      groups
-    }
+    authSession: loginSession.authSession,
+    authReused: loginSession.authReused,
+    remote,
+    ...(targetResults.length ? { targetResults } : {})
   };
 }
 
@@ -282,7 +549,7 @@ async function resolveProviderType({ sync, fetchImpl, timeoutMs }) {
     fetchImpl,
     timeoutMs
   });
-  return publicProviderType ?? 'modern-v1';
+  return publicProviderType ?? sync.providerTypeHint ?? 'modern-v1';
 }
 
 async function detectPublicProviderType({ dashboardUrl, fetchImpl, timeoutMs }) {
@@ -335,27 +602,88 @@ function isModernSettingsPayload(payload) {
   );
 }
 
-async function syncByProviderType({ providerType, sync, apiKey, fetchImpl, timeoutMs }) {
+async function syncByProviderType({
+  providerType,
+  sync,
+  apiKey,
+  targets,
+  targetSiteId,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
   if (providerType === 'new-api') {
-    return syncNewApi({ sync, apiKey, fetchImpl, timeoutMs });
+    return syncNewApi({
+      sync,
+      apiKey,
+      targets,
+      targetSiteId,
+      authSession,
+      fetchImpl,
+      timeoutMs,
+      resolveTurnstileToken
+    });
   }
-  return syncModernV1({ sync, apiKey, fetchImpl, timeoutMs });
+  return syncModernV1({
+    sync,
+    apiKey,
+    targets,
+    targetSiteId,
+    authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
 }
 
-async function syncNewApi({ sync, apiKey = '', fetchImpl, timeoutMs }) {
-  const { origin, token, headers } = await loginNewApi({
+async function syncNewApi({
+  sync,
+  apiKey = '',
+  targets = [],
+  targetSiteId = '',
+  authSession = null,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginNewApi({
     sync,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
-  const [profile, tokensPayload, groupsPayload, statusPayload] = await Promise.all([
-    requestOptionalJson(fetchImpl, `${origin}/api/user/self`, { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, `${origin}/api/token/?p=1&size=10`, { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, `${origin}/api/user/self/groups`, { headers, signal: timeoutSignal(timeoutMs) }),
-    requestOptionalJson(fetchImpl, `${origin}/api/status`, { headers, signal: timeoutSignal(timeoutMs) })
-  ]);
+  const { origin, token, headers } = loginSession;
+  let profile;
+  let tokensPayload;
+  let groupsPayload;
+  let statusPayload;
+  try {
+    [profile, tokensPayload, groupsPayload, statusPayload] = await Promise.all([
+      requestJson(fetchImpl, `${origin}/api/user/self`, { headers, signal: timeoutSignal(timeoutMs) }),
+      requestPaginatedJson({
+        fetchImpl,
+        buildUrl: (page, pageSize) => `${origin}/api/token/?p=${page}&size=${pageSize}`,
+        headers,
+        timeoutMs
+      }),
+      requestOptionalJson(fetchImpl, `${origin}/api/user/self/groups`, { headers, signal: timeoutSignal(timeoutMs) }),
+      requestOptionalJson(fetchImpl, `${origin}/api/status`, { headers, signal: timeoutSignal(timeoutMs) })
+    ]);
+  } catch (error) {
+    throw attachAuthSession(error, loginSession.authSession);
+  }
 
-  const tokenRow = selectRemoteKeyForConfiguredApiKey(tokensPayload, apiKey);
+  let tokenRow;
+  try {
+    tokenRow = selectRemoteKeyForConfiguredApiKey(tokensPayload, apiKey);
+  } catch (error) {
+    if (!targets.length) {
+      throw attachAuthSession(error, loginSession.authSession);
+    }
+    tokenRow = null;
+  }
   const keyGroup = pickFirstGroupName(tokenRow?.group, tokenRow?.group_name, tokenRow?.groupName);
   const group = keyGroup ? findGroup(groupsPayload, keyGroup) : null;
   const groupName = tokenRow ? pickFirstGroupName(group, keyGroup) : '';
@@ -382,29 +710,57 @@ async function syncNewApi({ sync, apiKey = '', fetchImpl, timeoutMs }) {
       )
     : null;
 
+  const remote = {
+    providerType: 'new-api',
+    authType: token ? 'Bearer token (/api)' : 'Cookie session + New-Api-User (/api)',
+    accountName: getAccountName(profile, sync.username),
+    balance: getBalanceText(profile, statusPayload),
+    apiEndpoint: getNewApiEndpoint(statusPayload),
+    keyName: pickFirstString(tokenRow?.name, tokenRow?.key_name, tokenRow?.label),
+    remoteKeyId: keyId,
+    keyGroup: groupName,
+    groupId,
+    groupMultiplier: multiplier,
+    groups
+  };
+  const targetResults = buildRemoteTargetResults({
+    targets,
+    keysPayload: tokensPayload,
+    buildRemote: (targetKey) => buildNewApiRemoteSnapshotFromParts({
+      sync,
+      profile,
+      groupsPayload,
+      statusPayload,
+      tokenRow: targetKey,
+      token
+    })
+  });
+
   return {
-    remote: {
-      providerType: 'new-api',
-      authType: token ? 'Bearer token (/api)' : 'Cookie session + New-Api-User (/api)',
-      accountName: getAccountName(profile, sync.username),
-      balance: getBalanceText(profile, statusPayload),
-      apiEndpoint: getNewApiEndpoint(statusPayload),
-      keyName: pickFirstString(tokenRow?.name, tokenRow?.key_name, tokenRow?.label),
-      remoteKeyId: keyId,
-      keyGroup: groupName,
-      groupId,
-      groupMultiplier: multiplier,
-      groups
-    }
+    authSession: loginSession.authSession,
+    authReused: loginSession.authReused,
+    remote,
+    ...(targetResults.length ? { targetResults } : {})
   };
 }
 
-async function createModernV1Key({ sync, originalSync, name, fetchImpl, timeoutMs }) {
-  const { apiBaseUrl, headers } = await loginModernV1({
+async function createModernV1Key({
+  sync,
+  originalSync,
+  name,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginModernV1({
     sync,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
+  const { apiBaseUrl, headers } = loginSession;
   const createPayload = buildModernV1KeyCreatePayload({
     name,
     groupId: pickCreationGroupId(originalSync)
@@ -415,24 +771,67 @@ async function createModernV1Key({ sync, originalSync, name, fetchImpl, timeoutM
     body: JSON.stringify(createPayload),
     signal: timeoutSignal(timeoutMs)
   });
+  const remoteKeyId = pickRemoteKeyId(unwrapData(createdPayload));
   const apiKey = pickCreatedApiKey(createdPayload);
   if (!apiKey) {
+    await deleteCreatedRemoteKey({
+      providerType: 'modern-v1',
+      apiBaseUrl,
+      remoteKeyId,
+      headers,
+      fetchImpl,
+      timeoutMs
+    });
     throw new Error('Remote key creation did not return an API key');
   }
 
-  const result = await syncModernV1({ sync, apiKey, fetchImpl, timeoutMs });
+  let result;
+  try {
+    result = await syncModernV1({
+      sync,
+      apiKey,
+      authSession: loginSession.authSession,
+      fetchImpl,
+      timeoutMs,
+      resolveTurnstileToken
+    });
+  } catch (error) {
+    await deleteCreatedRemoteKey({
+      providerType: 'modern-v1',
+      apiBaseUrl,
+      remoteKeyId,
+      headers,
+      fetchImpl,
+      timeoutMs
+    });
+    throw attachAuthSession(error, loginSession.authSession);
+  }
   return {
     apiKey,
+    remoteKeyId,
+    authSession: result.authSession,
+    authReused: loginSession.authReused,
     remote: result.remote
   };
 }
 
-async function createNewApiKey({ sync, originalSync, name, fetchImpl, timeoutMs }) {
-  const { origin, headers } = await loginNewApi({
+async function createNewApiKey({
+  sync,
+  originalSync,
+  name,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginNewApi({
     sync,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
+  const { origin, headers } = loginSession;
   const createPayload = await requestJson(fetchImpl, `${origin}/api/token/`, {
     method: 'POST',
     headers,
@@ -447,32 +846,233 @@ async function createNewApiKey({ sync, originalSync, name, fetchImpl, timeoutMs 
     throw new Error('Remote token creation did not return a token id');
   }
 
-  const keyPayload = await requestJson(fetchImpl, `${origin}/api/token/${encodeURIComponent(remoteKeyId)}/key`, {
-    method: 'POST',
-    headers,
-    signal: timeoutSignal(timeoutMs)
-  });
+  let keyPayload;
+  try {
+    keyPayload = await requestJson(fetchImpl, `${origin}/api/token/${encodeURIComponent(remoteKeyId)}/key`, {
+      method: 'POST',
+      headers,
+      signal: timeoutSignal(timeoutMs)
+    });
+  } catch (error) {
+    await deleteCreatedRemoteKey({
+      providerType: 'new-api',
+      origin,
+      remoteKeyId,
+      headers,
+      fetchImpl,
+      timeoutMs
+    });
+    throw attachAuthSession(error, loginSession.authSession);
+  }
   const apiKey = normalizeApiKeyScheme(pickCreatedApiKey(keyPayload));
   if (!apiKey) {
+    await deleteCreatedRemoteKey({
+      providerType: 'new-api',
+      origin,
+      remoteKeyId,
+      headers,
+      fetchImpl,
+      timeoutMs
+    });
     throw new Error('Remote token key lookup did not return an API key');
   }
 
-  const result = await syncNewApi({ sync, apiKey, fetchImpl, timeoutMs });
+  let result;
+  try {
+    result = await syncNewApi({
+      sync,
+      apiKey,
+      authSession: loginSession.authSession,
+      fetchImpl,
+      timeoutMs,
+      resolveTurnstileToken
+    });
+  } catch (error) {
+    await deleteCreatedRemoteKey({
+      providerType: 'new-api',
+      origin,
+      remoteKeyId,
+      headers,
+      fetchImpl,
+      timeoutMs
+    });
+    throw attachAuthSession(error, loginSession.authSession);
+  }
   return {
     apiKey,
+    remoteKeyId,
+    authSession: result.authSession,
+    authReused: loginSession.authReused,
     remote: result.remote
   };
 }
 
-async function switchModernV1Group({ sync, originalSync, apiKey = '', group, fetchImpl, timeoutMs }) {
-  const { apiBaseUrl, headers } = await loginModernV1({
+async function deleteSiteKeyByProviderType({
+  providerType,
+  sync,
+  apiKey,
+  remoteKeyId,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  if (providerType === 'new-api') {
+    return deleteNewApiKey({
+      sync,
+      apiKey,
+      remoteKeyId,
+      authSession,
+      fetchImpl,
+      timeoutMs,
+      resolveTurnstileToken
+    });
+  }
+  return deleteModernV1Key({
     sync,
+    apiKey,
+    remoteKeyId,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
-  const keysPayload = await requestOptionalJson(fetchImpl, joinApiPath(apiBaseUrl, '/keys?page=1&page_size=20'), {
+}
+
+async function deleteModernV1Key({
+  sync,
+  apiKey = '',
+  remoteKeyId = '',
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginModernV1({
+    sync,
+    authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
+  const { apiBaseUrl, headers } = loginSession;
+  let id = String(remoteKeyId ?? '').trim();
+  if (!id) {
+    const keysPayload = await requestPaginatedJson({
+      fetchImpl,
+      buildUrl: (page, pageSize) => joinApiPath(apiBaseUrl, `/keys?page=${page}&page_size=${pageSize}`),
+      headers,
+      timeoutMs
+    });
+    id = pickRemoteKeyId(selectRemoteKeyForConfiguredApiKey(keysPayload, apiKey));
+  }
+  if (!id) {
+    throw new Error('Remote key id is missing');
+  }
+  await requestJson(fetchImpl, joinApiPath(apiBaseUrl, `/keys/${encodeURIComponent(id)}`), {
+    method: 'DELETE',
     headers,
     signal: timeoutSignal(timeoutMs)
+  });
+  return {
+    remoteKeyId: id,
+    authSession: loginSession.authSession,
+    authReused: loginSession.authReused
+  };
+}
+
+async function deleteNewApiKey({
+  sync,
+  apiKey = '',
+  remoteKeyId = '',
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginNewApi({
+    sync,
+    authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
+  const { origin, headers } = loginSession;
+  let id = String(remoteKeyId ?? '').trim();
+  if (!id) {
+    const tokensPayload = await requestPaginatedJson({
+      fetchImpl,
+      buildUrl: (page, pageSize) => `${origin}/api/token/?p=${page}&size=${pageSize}`,
+      headers,
+      timeoutMs
+    });
+    id = pickRemoteKeyId(selectRemoteKeyForConfiguredApiKey(tokensPayload, apiKey));
+  }
+  if (!id) {
+    throw new Error('Remote token id is missing');
+  }
+  await requestJson(fetchImpl, `${origin}/api/token/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers,
+    signal: timeoutSignal(timeoutMs)
+  });
+  return {
+    remoteKeyId: id,
+    authSession: loginSession.authSession,
+    authReused: loginSession.authReused
+  };
+}
+
+async function deleteCreatedRemoteKey({
+  providerType,
+  apiBaseUrl,
+  origin,
+  remoteKeyId,
+  headers,
+  fetchImpl,
+  timeoutMs
+}) {
+  if (!remoteKeyId) {
+    return;
+  }
+  const url = providerType === 'new-api'
+    ? `${origin}/api/token/${encodeURIComponent(remoteKeyId)}`
+    : joinApiPath(apiBaseUrl, `/keys/${encodeURIComponent(remoteKeyId)}`);
+  try {
+    await requestJson(fetchImpl, url, {
+      method: 'DELETE',
+      headers,
+      signal: timeoutSignal(timeoutMs)
+    });
+  } catch {
+    // The original creation/sync error is more useful to callers than a
+    // cleanup failure. A later account sync can reconcile any leftover key.
+  }
+}
+
+async function switchModernV1Group({
+  sync,
+  originalSync,
+  apiKey = '',
+  group,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginModernV1({
+    sync,
+    authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
+  const { apiBaseUrl, headers } = loginSession;
+  const keysPayload = await requestPaginatedJson({
+    fetchImpl,
+    buildUrl: (page, pageSize) => joinApiPath(apiBaseUrl, `/keys?page=${page}&page_size=${pageSize}`),
+    headers,
+    timeoutMs
   });
   const matchedKey = selectRemoteKeyForConfiguredApiKey(keysPayload, apiKey);
   const remoteKeyId = pickFirstString(pickRemoteKeyId(matchedKey), originalSync?.remote?.remoteKeyId);
@@ -493,21 +1093,44 @@ async function switchModernV1Group({ sync, originalSync, apiKey = '', group, fet
     signal: timeoutSignal(timeoutMs)
   });
 
-  const result = await syncModernV1({ sync, apiKey, fetchImpl, timeoutMs });
+  const result = await syncModernV1({
+    sync,
+    apiKey,
+    authSession: loginSession.authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
   return {
+    authSession: result.authSession,
+    authReused: loginSession.authReused,
     remote: markSelectedRemoteGroup(result.remote, group)
   };
 }
 
-async function switchNewApiGroup({ sync, originalSync, apiKey = '', group, fetchImpl, timeoutMs }) {
-  const { origin, headers } = await loginNewApi({
+async function switchNewApiGroup({
+  sync,
+  originalSync,
+  apiKey = '',
+  group,
+  authSession,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const loginSession = await loginNewApi({
     sync,
+    authSession,
     fetchImpl,
-    timeoutMs
+    timeoutMs,
+    resolveTurnstileToken
   });
-  const tokensPayload = await requestOptionalJson(fetchImpl, `${origin}/api/token/?p=1&size=10`, {
+  const { origin, headers } = loginSession;
+  const tokensPayload = await requestPaginatedJson({
+    fetchImpl,
+    buildUrl: (page, pageSize) => `${origin}/api/token/?p=${page}&size=${pageSize}`,
     headers,
-    signal: timeoutSignal(timeoutMs)
+    timeoutMs
   });
   const matchedToken = selectRemoteKeyForConfiguredApiKey(tokensPayload, apiKey);
   const remoteKeyId = pickFirstString(pickRemoteKeyId(matchedToken), originalSync?.remote?.remoteKeyId);
@@ -535,24 +1158,58 @@ async function switchNewApiGroup({ sync, originalSync, apiKey = '', group, fetch
     signal: timeoutSignal(timeoutMs)
   });
 
-  const result = await syncNewApi({ sync, apiKey, fetchImpl, timeoutMs });
+  const result = await syncNewApi({
+    sync,
+    apiKey,
+    authSession: loginSession.authSession,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
   return {
+    authSession: result.authSession,
+    authReused: loginSession.authReused,
     remote: markSelectedRemoteGroup(result.remote, group)
   };
 }
 
-async function loginModernV1({ sync, fetchImpl, timeoutMs }) {
+async function loginModernV1({
+  sync,
+  authSession = null,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
   const { apiBaseUrl, settingsPayload } = await resolveModernApiContext({
     dashboardUrl: sync.dashboardUrl,
     fetchImpl,
     timeoutMs
+  });
+  const origin = getOrigin(sync.dashboardUrl);
+  if (isReusableAuthSession(authSession, { providerType: 'modern-v1', origin })) {
+    return {
+      apiBaseUrl: authSession.apiBaseUrl || apiBaseUrl,
+      settingsPayload,
+      token: authSession.token,
+      headers: authHeaders(authSession.token),
+      authSession: normalizeAuthSession(authSession),
+      authReused: true
+    };
+  }
+  const turnstileToken = await resolveModernV1TurnstileToken({
+    sync,
+    origin,
+    settingsPayload,
+    timeoutMs,
+    resolveTurnstileToken
   });
   const login = await requestJson(fetchImpl, joinApiPath(apiBaseUrl, '/auth/login'), {
     method: 'POST',
     headers: jsonHeaders(),
     body: JSON.stringify({
       email: sync.username,
-      password: sync.password
+      password: sync.password,
+      ...(turnstileToken ? { turnstile_token: turnstileToken } : {})
     }),
     signal: timeoutSignal(timeoutMs)
   });
@@ -575,14 +1232,119 @@ async function loginModernV1({ sync, fetchImpl, timeoutMs }) {
     apiBaseUrl,
     settingsPayload,
     token,
-    headers: authHeaders(token)
+    headers: authHeaders(token),
+    authSession: normalizeAuthSession({
+      providerType: 'modern-v1',
+      origin,
+      apiBaseUrl,
+      token,
+      createdAt: nowIso()
+    }),
+    authReused: false
   };
 }
 
-async function loginNewApi({ sync, fetchImpl, timeoutMs }) {
+async function resolveModernV1TurnstileToken({
+  sync,
+  origin,
+  settingsPayload,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  const settings = unwrapData(settingsPayload);
+  const enabled = Boolean(
+    settings?.turnstile_enabled ??
+      settings?.turnstileEnabled ??
+      settings?.TurnstileEnabled
+  );
+  if (!enabled) {
+    return '';
+  }
+  if (typeof resolveTurnstileToken !== 'function') {
+    throw new Error('Remote login requires Turnstile verification, but no Turnstile token resolver is available');
+  }
+  const siteKey = pickFirstString(
+    settings?.turnstile_site_key,
+    settings?.turnstileSiteKey,
+    settings?.TurnstileSiteKey
+  );
+  if (!siteKey) {
+    throw new Error('Remote login requires Turnstile verification, but the site key is unavailable');
+  }
+  const token = pickFirstString(await resolveTurnstileToken({
+    providerType: 'modern-v1',
+    dashboardUrl: sync.dashboardUrl,
+    origin,
+    siteKey,
+    timeoutMs
+  }));
+  if (!token) {
+    throw new Error('Remote login requires Turnstile verification, but no Turnstile token was returned');
+  }
+  return token;
+}
+
+async function loginNewApi({ sync, authSession = null, fetchImpl, timeoutMs, resolveTurnstileToken }) {
   const origin = getOrigin(sync.dashboardUrl);
+  if (isReusableAuthSession(authSession, { providerType: 'new-api', origin })) {
+    const normalizedSession = normalizeAuthSession(authSession);
+    return {
+      origin,
+      token: normalizedSession.token,
+      newApiUserId: normalizedSession.userId,
+      headers: normalizedSession.token
+        ? authHeaders(normalizedSession.token, normalizedSession.userId)
+        : cookieStringAuthHeaders(normalizedSession.cookie, normalizedSession.userId),
+      authSession: normalizedSession,
+      authReused: true
+    };
+  }
   const cookieJar = createCookieJar();
-  const login = await requestJson(fetchImpl, `${origin}/api/user/login`, {
+  try {
+    const login = await requestNewApiLogin({
+      sync,
+      origin,
+      fetchImpl,
+      timeoutMs,
+      cookieJar
+    });
+    return buildNewApiLoginSession({ origin, login, cookieJar });
+  } catch (error) {
+    if (!isTurnstileTokenRequiredError(error)) {
+      throw error;
+    }
+  }
+
+  const turnstileToken = await resolveNewApiTurnstileToken({
+    sync,
+    origin,
+    fetchImpl,
+    timeoutMs,
+    resolveTurnstileToken
+  });
+  const retryLogin = await requestNewApiLogin({
+    sync,
+    origin,
+    fetchImpl,
+    timeoutMs,
+    cookieJar,
+    turnstileToken
+  });
+  return buildNewApiLoginSession({ origin, login: retryLogin, cookieJar });
+}
+
+async function requestNewApiLogin({
+  sync,
+  origin,
+  fetchImpl,
+  timeoutMs,
+  cookieJar,
+  turnstileToken = ''
+}) {
+  const loginUrl = turnstileToken
+    ? appendUrlQueryParam(`${origin}/api/user/login`, 'turnstile', turnstileToken)
+    : `${origin}/api/user/login`;
+  return requestJson(fetchImpl, loginUrl, {
     method: 'POST',
     headers: jsonHeaders(),
     body: JSON.stringify({
@@ -592,6 +1354,9 @@ async function loginNewApi({ sync, fetchImpl, timeoutMs }) {
     signal: timeoutSignal(timeoutMs),
     cookieJar
   });
+}
+
+function buildNewApiLoginSession({ origin, login, cookieJar }) {
   const token = getNewApiLoginToken(login);
   const newApiUserId = getNewApiUserId(login);
   if (!token && (cookieJar.isEmpty() || !newApiUserId)) {
@@ -602,8 +1367,59 @@ async function loginNewApi({ sync, fetchImpl, timeoutMs }) {
     origin,
     token,
     newApiUserId,
-    headers: token ? authHeaders(token, newApiUserId) : cookieAuthHeaders(cookieJar, newApiUserId)
+    headers: token ? authHeaders(token, newApiUserId) : cookieAuthHeaders(cookieJar, newApiUserId),
+    authSession: normalizeAuthSession({
+      providerType: 'new-api',
+      origin,
+      token,
+      cookie: cookieJar.getCookieHeader(),
+      userId: newApiUserId,
+      createdAt: nowIso()
+    }),
+    authReused: false
   };
+}
+
+async function resolveNewApiTurnstileToken({
+  sync,
+  origin,
+  fetchImpl,
+  timeoutMs,
+  resolveTurnstileToken
+}) {
+  if (typeof resolveTurnstileToken !== 'function') {
+    throw new Error('Remote login requires Turnstile verification, but no Turnstile token resolver is available');
+  }
+
+  const siteKey = await discoverNewApiTurnstileSiteKey({ origin, fetchImpl, timeoutMs });
+  const token = pickFirstString(await resolveTurnstileToken({
+    providerType: 'new-api',
+    dashboardUrl: sync.dashboardUrl,
+    origin,
+    siteKey,
+    timeoutMs
+  }));
+  if (!token) {
+    throw new Error('Remote login requires Turnstile verification, but no Turnstile token was returned');
+  }
+  return token;
+}
+
+async function discoverNewApiTurnstileSiteKey({ origin, fetchImpl, timeoutMs }) {
+  const statusPayload = await requestOptionalJson(fetchImpl, `${origin}/api/status`, {
+    signal: timeoutSignal(timeoutMs)
+  });
+  const data = unwrapData(statusPayload);
+  return pickFirstString(
+    data?.turnstile_site_key,
+    data?.turnstileSiteKey,
+    data?.TurnstileSiteKey
+  );
+}
+
+function isTurnstileTokenRequiredError(error) {
+  const message = stringValue(error?.message ?? error);
+  return /turnstile/i.test(message) && /(token|验证|verification|captcha|challenge)/i.test(message);
 }
 
 function getNewApiLoginToken(payload) {
@@ -721,16 +1537,84 @@ function normalizeSyncInput(sync = {}) {
     password,
     providerType: sync.providerType === 'modern-v1' || sync.providerType === 'new-api'
       ? sync.providerType
-      : 'auto'
+      : 'auto',
+    providerTypeHint: sync?.remote?.providerType === 'modern-v1' || sync?.remote?.providerType === 'new-api'
+      ? sync.remote.providerType
+      : ''
   };
 }
 
 async function requestOptionalJson(fetchImpl, url, options) {
   try {
     return await requestJson(fetchImpl, url, options);
-  } catch {
+  } catch (error) {
+    if (isAuthenticationError(error) || error?.browserChallengeRequired) {
+      throw error;
+    }
     return null;
   }
+}
+
+async function requestPaginatedJson({
+  fetchImpl,
+  buildUrl,
+  headers,
+  timeoutMs,
+  pageSize = 100,
+  maxPages = 50
+}) {
+  const items = [];
+  let page = 1;
+  let total = null;
+
+  while (page <= maxPages) {
+    const payload = await requestOptionalJson(fetchImpl, buildUrl(page, pageSize), {
+      headers,
+      signal: timeoutSignal(timeoutMs)
+    });
+    if (!payload) {
+      return page === 1 ? null : { data: { items, total: items.length } };
+    }
+
+    const data = unwrapData(payload);
+    const pageItems = toArray(data);
+    items.push(...pageItems);
+    total = pickPaginationTotal(payload, data, total);
+
+    if (pageItems.length === 0 || (Number.isFinite(total) && items.length >= total)) {
+      break;
+    }
+    if (!Number.isFinite(total) && pageItems.length < pageSize) {
+      break;
+    }
+    page += 1;
+  }
+
+  return {
+    data: {
+      items,
+      total: Number.isFinite(total) ? total : items.length
+    }
+  };
+}
+
+function pickPaginationTotal(payload, data, fallback) {
+  for (const value of [
+    data?.total,
+    data?.total_count,
+    data?.totalCount,
+    data?.count,
+    payload?.total,
+    payload?.total_count,
+    payload?.totalCount,
+    payload?.count
+  ]) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return number;
+    }
+  }
+  return fallback;
 }
 
 async function requestOptionalText(fetchImpl, url, options) {
@@ -747,11 +1631,36 @@ async function requestJson(fetchImpl, url, options = {}) {
   const response = await fetchImpl(url, options);
   options.cookieJar?.storeFromResponse(response);
   const text = await response.text();
-  const payload = text ? parseJson(text, url) : null;
+  let payload = null;
+  if (text) {
+    try {
+      payload = parseJson(text, url);
+    } catch (error) {
+      error.status = response.status;
+      error.url = url;
+      error.browserChallengeRequired = isBrowserChallengeResponse(response, text);
+      throw error;
+    }
+  }
   if (!response.ok) {
-    throw new Error(`Remote request failed HTTP ${response.status}: ${truncate(text, 300)}`);
+    const error = new Error(`Remote request failed HTTP ${response.status}: ${truncate(text, 300)}`);
+    error.status = response.status;
+    error.url = url;
+    error.code = pickFirstString(payload?.code, payload?.error?.code, payload?.data?.code);
+    error.browserChallengeRequired = isBrowserChallengeResponse(response, text);
+    throw error;
   }
   return payload;
+}
+
+function isBrowserChallengeResponse(response, text) {
+  const body = stringValue(text);
+  const server = stringValue(response?.headers?.get?.('server'));
+  return Boolean(
+    /(?:_cf_chl_opt|cf-chl-|challenge-platform|just a moment|cloudflare ray id)/i.test(body) ||
+      /(?:\barg1\s*=|acw_sc__v2|aliyun.*challenge|esa.*challenge)/i.test(body) ||
+      (/(?:cloudflare|\besa\b)/i.test(server) && /<html|<script/i.test(body) && !response?.ok)
+  );
 }
 
 async function resolveModernApiContext({ dashboardUrl, fetchImpl, timeoutMs }) {
@@ -896,6 +1805,163 @@ function selectRemoteKeyForConfiguredApiKey(payload, apiKey) {
   return matched;
 }
 
+function findRemoteKeyForConfiguredApiKey(payload, apiKey) {
+  try {
+    return selectRemoteKeyForConfiguredApiKey(payload, apiKey);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSyncTargets(targets, { apiKey = '', targetSiteId = '' } = {}) {
+  const normalized = (Array.isArray(targets) ? targets : [])
+    .map((target) => ({
+      siteId: pickFirstString(target?.siteId, target?.id),
+      apiKey: pickFirstString(target?.apiKey)
+    }))
+    .filter((target) => target.siteId && target.apiKey);
+  if (!normalized.length) {
+    return [];
+  }
+  if (
+    targetSiteId &&
+    apiKey &&
+    !normalized.some((target) => target.siteId === targetSiteId)
+  ) {
+    normalized.unshift({ siteId: targetSiteId, apiKey });
+  }
+  return normalized;
+}
+
+function buildRemoteTargetResults({ targets = [], keysPayload, buildRemote }) {
+  return targets.map((target) => {
+    const key = findRemoteKeyForConfiguredApiKey(keysPayload, target.apiKey);
+    if (!key) {
+      return {
+        siteId: target.siteId,
+        ok: false,
+        error: 'Configured API key was not found in the remote account'
+      };
+    }
+    return {
+      siteId: target.siteId,
+      ok: true,
+      multiplier: buildRemote(key).groupMultiplier,
+      remote: buildRemote(key)
+    };
+  });
+}
+
+function buildModernRemoteSnapshotFromParts({
+  sync,
+  profile,
+  settingsPayload,
+  groupsPayload,
+  ratesPayload,
+  key
+}) {
+  const keyGroup = pickFirstGroupName(key?.group, key?.group_name, key?.groupName, key?.groups?.[0]);
+  const group = keyGroup ? findGroup(groupsPayload, keyGroup) : null;
+  const groupName = key ? pickFirstGroupName(group, keyGroup) : '';
+  const groupId = pickFirstString(key?.group_id, key?.groupId, group?.id, group?.key, group?.value);
+  const multiplier = key
+    ? pickMultiplier(
+        getRateMultiplier(ratesPayload, groupName),
+        key?.multiplier,
+        key?.rate_multiplier,
+        key?.rateMultiplier,
+        key?.rate,
+        key?.ratio,
+        key?.group?.multiplier,
+        key?.group?.rate_multiplier,
+        key?.group?.rateMultiplier,
+        key?.group?.rate,
+        key?.group?.ratio,
+        group?.multiplier,
+        group?.rate_multiplier,
+        group?.rateMultiplier,
+        group?.rate,
+        group?.ratio,
+        parseMultiplierFromText(groupName)
+      )
+    : null;
+  return {
+    providerType: 'modern-v1',
+    authType: 'Bearer auth_token (/api/v1)',
+    accountName: getAccountName(profile, sync.username),
+    balance: getBalanceText(profile),
+    apiEndpoint: pickFirstString(
+      key?.endpoint,
+      key?.api_endpoint,
+      key?.baseUrl,
+      key?.base_url,
+      getModernSettingsEndpoint(settingsPayload)
+    ),
+    keyName: pickFirstString(key?.name, key?.key_name, key?.label),
+    remoteKeyId: pickRemoteKeyId(key),
+    keyGroup: groupName,
+    groupId,
+    groupMultiplier: multiplier,
+    groups: buildModernRemoteGroups({
+      groupsPayload,
+      ratesPayload,
+      selectedGroupName: groupName
+    })
+  };
+}
+
+function buildNewApiRemoteSnapshotFromParts({
+  sync,
+  profile,
+  groupsPayload,
+  statusPayload,
+  tokenRow,
+  token
+}) {
+  const keyGroup = pickFirstGroupName(tokenRow?.group, tokenRow?.group_name, tokenRow?.groupName);
+  const group = keyGroup ? findGroup(groupsPayload, keyGroup) : null;
+  const groupName = tokenRow ? pickFirstGroupName(group, keyGroup) : '';
+  const multiplier = tokenRow
+    ? pickMultiplier(
+        tokenRow?.multiplier,
+        tokenRow?.rate_multiplier,
+        tokenRow?.rateMultiplier,
+        tokenRow?.rate,
+        tokenRow?.ratio,
+        group?.multiplier,
+        group?.rate_multiplier,
+        group?.rateMultiplier,
+        group?.rate,
+        group?.ratio,
+        parseMultiplierFromText(groupName)
+      )
+    : null;
+  return {
+    providerType: 'new-api',
+    authType: token ? 'Bearer token (/api)' : 'Cookie session + New-Api-User (/api)',
+    accountName: getAccountName(profile, sync.username),
+    balance: getBalanceText(profile, statusPayload),
+    apiEndpoint: getNewApiEndpoint(statusPayload),
+    keyName: pickFirstString(tokenRow?.name, tokenRow?.key_name, tokenRow?.label),
+    remoteKeyId: pickRemoteKeyId(tokenRow),
+    keyGroup: groupName,
+    groupId: pickFirstString(
+      keyGroup,
+      tokenRow?.group_id,
+      tokenRow?.groupId,
+      group?.id,
+      group?.key,
+      group?.value
+    ),
+    groupMultiplier: multiplier,
+    groups: buildRemoteGroups({
+      groupsPayload,
+      selectedGroupName: groupName,
+      selectedGroupKey: keyGroup
+    })
+  };
+}
+
 function remoteKeyMatchesConfiguredApiKey(row, configuredApiKey) {
   return getRemoteKeyCandidateValues(row)
     .some((candidate) => apiKeyMatchesCandidate(configuredApiKey, candidate));
@@ -931,6 +1997,9 @@ function apiKeyMatchesCandidate(configuredApiKey, candidate) {
     return false;
   }
   if (remote === expected) {
+    return true;
+  }
+  if (stripApiKeySchemePrefix(remote) === stripApiKeySchemePrefix(expected)) {
     return true;
   }
 
@@ -1431,6 +2500,14 @@ function cookieAuthHeaders(cookieJar, newApiUserId = '') {
   };
 }
 
+function cookieStringAuthHeaders(cookie, newApiUserId = '') {
+  return {
+    ...jsonHeaders(),
+    ...(cookie ? { Cookie: cookie } : {}),
+    ...(newApiUserId ? { 'New-Api-User': newApiUserId } : {})
+  };
+}
+
 function createCookieJar() {
   const cookies = new Map();
   return {
@@ -1452,6 +2529,137 @@ function createCookieJar() {
       return cookies.size === 0;
     }
   };
+}
+
+async function retryBrowserChallenge({
+  sync,
+  fetchImpl,
+  timeoutMs,
+  resolveBrowserSession,
+  operation
+}) {
+  try {
+    return await operation(fetchImpl);
+  } catch (error) {
+    if (!error?.browserChallengeRequired || typeof resolveBrowserSession !== 'function') {
+      throw error;
+    }
+    try {
+      const browserSession = await resolveBrowserSession({
+        dashboardUrl: sync.dashboardUrl,
+        origin: getOrigin(sync.dashboardUrl),
+        timeoutMs,
+        challengeUrl: pickFirstString(error.url)
+      });
+      const browserFetch = resolveBrowserSessionFetch(browserSession, fetchImpl);
+      return await operation(browserFetch, normalizeAuthSession(error.authSession));
+    } catch (retryError) {
+      throw attachAuthSession(retryError, error.authSession);
+    }
+  }
+}
+
+function resolveBrowserSessionFetch(browserSession, fallbackFetch) {
+  if (typeof browserSession?.fetch === 'function') {
+    return browserSession.fetch;
+  }
+  const cookie = pickFirstString(browserSession?.cookie);
+  const userAgent = pickFirstString(browserSession?.userAgent);
+  if (!cookie && !userAgent) {
+    throw new Error('Remote browser verification did not return a usable session');
+  }
+  return (url, options = {}) => fallbackFetch(url, {
+    ...options,
+    headers: mergeRequestHeaders(options.headers, {
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...(userAgent ? { 'User-Agent': userAgent } : {})
+    })
+  });
+}
+
+function mergeRequestHeaders(current, additional) {
+  if (typeof Headers === 'function') {
+    const headers = new Headers(current ?? {});
+    for (const [name, value] of Object.entries(additional)) {
+      headers.set(name, value);
+    }
+    return headers;
+  }
+  return {
+    ...(current ?? {}),
+    ...additional
+  };
+}
+
+function attachAuthSession(error, authSession) {
+  if (error && !error.authSession) {
+    error.authSession = normalizeAuthSession(authSession);
+  }
+  return error;
+}
+
+async function retryExpiredAuthSession({ authSession, operation }) {
+  try {
+    return await operation(authSession);
+  } catch (error) {
+    if (!authSession || !isAuthenticationError(error)) {
+      throw error;
+    }
+    try {
+      return await operation(null);
+    } catch (retryError) {
+      // The cached session is known to be stale. A newly established session
+      // should still be retained when the follow-up metadata request fails
+      // for a non-authentication reason; only a second auth failure means the
+      // replacement session is invalid as well.
+      retryError.authSessionInvalidated = Boolean(
+        isAuthenticationError(retryError) || !normalizeAuthSession(retryError?.authSession)
+      );
+      throw retryError;
+    }
+  }
+}
+
+function isAuthenticationError(error) {
+  return !error?.browserChallengeRequired && (error?.status === 401 || error?.status === 403);
+}
+
+function isReusableAuthSession(session, { providerType, origin }) {
+  const normalized = normalizeAuthSession(session);
+  return Boolean(
+    normalized &&
+    normalized.providerType === providerType &&
+    normalized.origin === origin &&
+    (normalized.token || normalized.cookie)
+  );
+}
+
+function normalizeAuthSession(session) {
+  if (!session || typeof session !== 'object') {
+    return null;
+  }
+  const providerType = session.providerType === 'modern-v1' || session.providerType === 'new-api'
+    ? session.providerType
+    : '';
+  const token = pickFirstString(session.token);
+  const cookie = pickFirstString(session.cookie);
+  if (!providerType || (!token && !cookie)) {
+    return null;
+  }
+  return {
+    providerType,
+    origin: pickFirstString(session.origin),
+    apiBaseUrl: pickFirstString(session.apiBaseUrl),
+    token,
+    cookie,
+    userId: pickFirstString(session.userId),
+    createdAt: normalizeSessionIso(session.createdAt)
+  };
+}
+
+function normalizeSessionIso(value) {
+  const date = value ? new Date(value) : new Date();
+  return Number.isFinite(date.getTime()) ? date.toISOString() : nowIso();
 }
 
 function getSetCookieHeaders(response) {
@@ -1501,6 +2709,12 @@ function joinApiPath(apiBaseUrl, path) {
   const base = stripTrailingSlash(apiBaseUrl);
   const suffix = stringValue(path).startsWith('/') ? stringValue(path) : `/${path}`;
   return `${base}${suffix}`;
+}
+
+function appendUrlQueryParam(url, key, value) {
+  const parsed = new URL(url);
+  parsed.searchParams.set(key, value);
+  return parsed.href;
 }
 
 function parseUrl(url) {

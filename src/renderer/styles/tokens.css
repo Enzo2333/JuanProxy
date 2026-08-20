@@ -1,0 +1,35 @@
+:root {
+  color-scheme: light;
+  --bg: #eaf3fa;
+  --surface: rgb(248 252 255 / 64%);
+  --surface-strong: rgb(252 254 255 / 82%);
+  --surface-soft: rgb(255 255 255 / 42%);
+  --surface-subtle: rgb(225 239 248 / 34%);
+  --line: rgb(74 118 154 / 15%);
+  --line-strong: rgb(72 119 158 / 25%);
+  --glass-line: rgb(255 255 255 / 84%);
+  --text: #17314d;
+  --muted: #6b7f92;
+  --muted-strong: #536a80;
+  --primary: #2f78bb;
+  --primary-strong: #225f9b;
+  --primary-soft: rgb(62 143 211 / 13%);
+  --primary-glow: rgb(64 134 218 / 24%);
+  --danger: #b42318;
+  --danger-soft: rgb(255 235 232 / 72%);
+  --success: #08745b;
+  --success-soft: rgb(220 248 238 / 68%);
+  --warning: #9a6510;
+  --warning-soft: rgb(255 244 214 / 72%);
+  --brand-gradient: linear-gradient(145deg, #45aee6, #7367e8);
+  --shadow: 0 18px 45px rgb(35 74 114 / 16%);
+  --shadow-soft: 0 8px 24px rgb(37 76 112 / 10%);
+  --shadow-float: 0 24px 58px rgb(30 66 104 / 22%);
+  --radius-control: 10px;
+  --radius-card: 14px;
+  --radius-shell: 20px;
+  --focus-ring: 0 0 0 3px rgb(61 137 207 / 18%);
+  --motion-fast: 140ms;
+  --motion-base: 200ms;
+  --motion-slow: 260ms;
+}

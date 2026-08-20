@@ -36,16 +36,6 @@ test('classifies request payload and capability errors without site health penal
       requestLocalRetry: true
     },
     {
-      statusCode: 503,
-      bodyText: JSON.stringify({
-        error: {
-          code: 'model_not_found',
-          message: 'No available channel for model gpt-5.5 under group default'
-        }
-      }),
-      retryable: true
-    },
-    {
       statusCode: 404,
       bodyText: JSON.stringify({
         error: {
@@ -73,6 +63,50 @@ test('classifies request payload and capability errors without site health penal
     assert.equal(classification.affectsSiteHealth, false);
     assert.equal(classification.retryable, entry.retryable);
     assert.equal(Boolean(classification.requestLocalRetry), Boolean(entry.requestLocalRetry));
+  }
+});
+
+test('treats unavailable-model errors as site health failures', () => {
+  for (const bodyText of [
+    JSON.stringify({
+      error: {
+        code: 'model_not_found'
+      }
+    }),
+    JSON.stringify({
+      error: {
+        message: 'No available channel for model gpt-5.6-sol under group AA.k12 (distributor)'
+      }
+    })
+  ]) {
+    const classification = classifyUpstreamHttpError({
+      statusCode: 503,
+      bodyText
+    });
+
+    assert.equal(classification.retryable, true);
+    assert.equal(classification.affectsSiteHealth, true);
+  }
+});
+
+test('marks selected-model capacity failures for Codex task retry', () => {
+  for (const bodyText of [
+    JSON.stringify({
+      error: {
+        code: 'model_capacity_exceeded',
+        message: 'Selected model is at capacity. Please try a different model.'
+      }
+    }),
+    'Selected model is at capacity. Please try a different model.'
+  ]) {
+    const classification = classifyUpstreamHttpError({
+      statusCode: 429,
+      bodyText
+    });
+
+    assert.equal(classification.retryable, true);
+    assert.equal(classification.affectsSiteHealth, true);
+    assert.equal(classification.codexTaskRetry, true);
   }
 });
 
@@ -125,18 +159,15 @@ test('availability tests treat request-scoped HTTP failures as non-health failur
     {
       statusCode: 400,
       detail: JSON.stringify({
-        error: {
-          code: 'invalid_responses_request',
-          message: 'invalid codex request'
-        }
+        detail: 'Input must be a list'
       })
     },
     {
-      statusCode: 503,
+      statusCode: 400,
       detail: JSON.stringify({
         error: {
-          code: 'model_not_found',
-          message: 'No available channel for model gpt-5.5 under group default'
+          code: 'invalid_responses_request',
+          message: 'invalid codex request'
         }
       })
     }
@@ -149,4 +180,19 @@ test('availability tests treat request-scoped HTTP failures as non-health failur
 
     assert.equal(requestScoped, true);
   }
+});
+
+test('availability tests treat unavailable-model errors as health failures', () => {
+  const requestScoped = isRequestScopedAvailabilityFailure({
+    ok: false,
+    statusCode: 503,
+    detail: JSON.stringify({
+      error: {
+        code: 'model_not_found',
+        message: 'No available channel for model gpt-5.6-sol under group AA.k12 (distributor)'
+      }
+    })
+  });
+
+  assert.equal(requestScoped, false);
 });

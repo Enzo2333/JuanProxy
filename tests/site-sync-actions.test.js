@@ -7,6 +7,8 @@ import test from 'node:test';
 import { ConfigService } from '../src/proxy/config-service.js';
 import {
   createConfiguredSiteKey,
+  logoutConfiguredSiteAccount,
+  provisionMissingLowMultiplierGroup,
   switchConfiguredSiteGroup,
   syncAllConfiguredSites,
   syncConfiguredSite
@@ -1026,7 +1028,227 @@ test('syncConfiguredSite persists failure status without changing multiplier', a
   }
 });
 
-test('createConfiguredSiteKey writes the generated key and remote metadata', async () => {
+test('syncConfiguredSite serializes shared-account operations and persists the reusable session', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-shared-session-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  let activeCalls = 0;
+  let maximumActiveCalls = 0;
+  const receivedSessions = [];
+
+  try {
+    await service.load();
+    const first = await service.addSite({
+      name: 'first',
+      baseUrl: 'https://first.example/v1',
+      apiKey: 'sk-first',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/keys',
+        username: 'shared@example.com',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const second = await service.addSite({
+      name: 'second',
+      baseUrl: 'https://second.example/v1',
+      apiKey: 'sk-second',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/profile',
+        username: 'shared@example.com',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const fetchRemoteSync = async ({ authSession }) => {
+      receivedSessions.push(authSession);
+      activeCalls += 1;
+      maximumActiveCalls = Math.max(maximumActiveCalls, activeCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeCalls -= 1;
+      return {
+        ok: true,
+        multiplier: null,
+        authSession: authSession ?? {
+          providerType: 'modern-v1',
+          origin: 'https://panel.example.com',
+          apiBaseUrl: 'https://panel.example.com/api/v1',
+          token: 'shared-session-token',
+          createdAt: '2026-07-29T08:00:00.000Z'
+        },
+        syncPatch: {
+          lastSyncAt: '2026-07-29T08:00:00.000Z',
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+          remote: {}
+        }
+      };
+    };
+
+    await Promise.all([
+      syncConfiguredSite({ configService: service, siteId: first.id, fetchRemoteSync }),
+      syncConfiguredSite({ configService: service, siteId: second.id, fetchRemoteSync })
+    ]);
+
+    assert.equal(maximumActiveCalls, 1);
+    assert.equal(receivedSessions[0], null);
+    assert.equal(receivedSessions[1].token, 'shared-session-token');
+    assert.equal(service.getRemoteAccountSession(first.id).token, 'shared-session-token');
+    assert.equal(service.getRemoteAccountSession(second.id).token, 'shared-session-token');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('syncConfiguredSite clears a failed shared-session refresh before the next site reacquires it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-refresh-session-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  const receivedTokens = [];
+
+  try {
+    await service.load();
+    const first = await service.addSite({
+      name: 'first',
+      baseUrl: 'https://first.example/v1',
+      apiKey: 'sk-first',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/keys',
+        username: 'shared@example.com',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const second = await service.addSite({
+      name: 'second',
+      baseUrl: 'https://second.example/v1',
+      apiKey: 'sk-second',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/profile',
+        username: 'shared@example.com',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const expiredSession = {
+      providerType: 'modern-v1',
+      origin: 'https://panel.example.com',
+      apiBaseUrl: 'https://panel.example.com/api/v1',
+      token: 'expired-token',
+      createdAt: '2026-07-29T07:00:00.000Z'
+    };
+    await service.updateRemoteAccountSession(first.id, expiredSession);
+
+    const fetchRemoteSync = async ({ authSession }) => {
+      receivedTokens.push(authSession?.token ?? null);
+      if (authSession) {
+        return {
+          ok: false,
+          multiplier: null,
+          authSession,
+          authSessionInvalidated: true,
+          syncPatch: {
+            lastSyncAt: '2026-07-29T08:00:00.000Z',
+            lastSyncStatus: 'failure',
+            lastSyncError: 'session expired'
+          }
+        };
+      }
+      return {
+        ok: true,
+        multiplier: null,
+        authSession: {
+          ...expiredSession,
+          token: 'fresh-token',
+          createdAt: '2026-07-29T08:01:00.000Z'
+        },
+        syncPatch: {
+          lastSyncAt: '2026-07-29T08:01:00.000Z',
+          lastSyncStatus: 'success',
+          lastSyncError: null
+        }
+      };
+    };
+
+    const firstResult = await syncConfiguredSite({
+      configService: service,
+      siteId: first.id,
+      fetchRemoteSync
+    });
+    assert.equal(firstResult.ok, false);
+    assert.equal(service.getRemoteAccountSession(first.id), null);
+
+    const secondResult = await syncConfiguredSite({
+      configService: service,
+      siteId: second.id,
+      fetchRemoteSync
+    });
+    assert.equal(secondResult.ok, true);
+    assert.deepEqual(receivedTokens, ['expired-token', null]);
+    assert.equal(service.getRemoteAccountSession(first.id).token, 'fresh-token');
+    assert.equal(service.getRemoteAccountSession(second.id).token, 'fresh-token');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('logoutConfiguredSiteAccount clears a successful shared session and keeps it on network failure', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-logout-account-action-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'site',
+      baseUrl: 'https://api.example/v1',
+      apiKey: 'sk-site',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/keys',
+        username: 'user@example.com',
+        password: 'secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const session = {
+      providerType: 'modern-v1',
+      origin: 'https://panel.example.com',
+      apiBaseUrl: 'https://panel.example.com/api/v1',
+      token: 'saved-token',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    };
+    await service.updateRemoteAccountSession(site.id, session);
+
+    const failed = await logoutConfiguredSiteAccount({
+      configService: service,
+      siteId: site.id,
+      logoutRemoteAccount: async ({ authSession }) => {
+        assert.equal(authSession.token, 'saved-token');
+        return { ok: false, remoteAttempted: true, remoteSucceeded: false };
+      }
+    });
+    assert.equal(failed.ok, false);
+    assert.equal(service.getRemoteAccountSession(site.id).token, 'saved-token');
+
+    const succeeded = await logoutConfiguredSiteAccount({
+      configService: service,
+      siteId: site.id,
+      logoutRemoteAccount: async ({ authSession }) => {
+        assert.equal(authSession.token, 'saved-token');
+        return { ok: true, remoteAttempted: true, remoteSucceeded: true };
+      }
+    });
+    assert.equal(succeeded.ok, true);
+    assert.equal(service.getRemoteAccountSession(site.id), null);
+    assert.ok(service.getRemoteAccountForSite(site.id).lastLogoutAt);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createConfiguredSiteKey imports the generated key as a new site and copies site characteristics', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-create-key-action-'));
   const service = new ConfigService({ filePath: join(dir, 'config.json') });
 
@@ -1036,7 +1258,25 @@ test('createConfiguredSiteKey writes the generated key and remote metadata', asy
       name: 'sync',
       baseUrl: 'https://sync.example/v1',
       apiKey: 'sk-old',
-      multiplier: 1,
+      priority: 7,
+      multiplier: 2,
+      customMultiplier: 0.5,
+      multiplierLocked: false,
+      modelMapping: {
+        enabled: true,
+        mappings: [{ from: 'client-model', to: 'remote-model' }]
+      },
+      rateLimit: {
+        enabled: true,
+        limit: 20,
+        windowValue: 1,
+        windowUnit: 'hour'
+      },
+      autoRecovery: {
+        enabled: true,
+        intervalValue: 10,
+        intervalUnit: 'minute'
+      },
       sync: {
         enabled: true,
         dashboardUrl: 'https://relay.example.com/keys',
@@ -1074,13 +1314,24 @@ test('createConfiguredSiteKey writes the generated key and remote metadata', asy
       })
     });
 
-    const updated = service.getState().sites.find((candidate) => candidate.id === site.id);
+    const state = service.getState();
+    const source = state.sites.find((candidate) => candidate.id === site.id);
+    const imported = state.sites.find((candidate) => candidate.id === result.createdSiteId);
     assert.equal(result.ok, true);
-    assert.equal(updated.apiKey, 'sk-created');
-    assert.equal(updated.multiplier, 0.001);
-    assert.equal(updated.sync.lastSyncStatus, 'success');
-    assert.equal(updated.sync.remote.keyName, 'sync');
-    assert.equal(updated.sync.remote.remoteKeyId, '37');
+    assert.equal(state.sites.length, 2);
+    assert.equal(source.apiKey, 'sk-old');
+    assert.equal(source.multiplier, 2);
+    assert.equal(imported.apiKey, 'sk-created');
+    assert.equal(imported.priority, 7);
+    assert.equal(imported.multiplier, 0.001);
+    assert.equal(imported.customMultiplier, 0.5);
+    assert.equal(imported.sync.accountId, source.sync.accountId);
+    assert.equal(imported.sync.lastSyncStatus, 'success');
+    assert.equal(imported.sync.remote.keyName, 'sync');
+    assert.equal(imported.sync.remote.remoteKeyId, '37');
+    assert.deepEqual(imported.modelMapping, source.modelMapping);
+    assert.deepEqual(imported.rateLimit, source.rateLimit);
+    assert.deepEqual(imported.autoRecovery, source.autoRecovery);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1132,3 +1383,425 @@ test('createConfiguredSiteKey keeps the existing api key when remote creation fa
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('syncConfiguredSite persists a newly established session even when metadata sync fails', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-sync-action-failed-session-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    const site = await service.addSite({
+      name: 'failed-metadata-sync',
+      baseUrl: 'https://relay.example.com/v1',
+      apiKey: 'sk-current',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com',
+        username: 'sync-user',
+        password: 'secret',
+        providerType: 'new-api'
+      }
+    });
+
+    const result = await syncConfiguredSite({
+      configService: service,
+      siteId: site.id,
+      fetchRemoteSync: async () => ({
+        ok: false,
+        multiplier: null,
+        authSession: {
+          providerType: 'new-api',
+          origin: 'https://relay.example.com',
+          token: 'new-session-token',
+          cookie: '',
+          userId: '23',
+          createdAt: '2026-07-31T08:00:00.000Z'
+        },
+        syncPatch: {
+          lastSyncAt: '2026-07-31T08:00:00.000Z',
+          lastSyncStatus: 'failure',
+          lastSyncError: 'Configured API key was not found in the remote account'
+        }
+      })
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(service.getRemoteAccountSession(site.id).token, 'new-session-token');
+    assert.equal(service.findSite(site.id).sync.lastSyncStatus, 'failure');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('provisionMissingLowMultiplierGroup creates, tests and imports one missing group', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-auto-provision-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  try {
+    await service.load();
+    await service.updateProxySettings({
+      testModel: 'global-test-model',
+      autoSwitchMultiplierLimit: { enabled: true, maxMultiplier: 0.01 }
+    });
+    const source = await service.addSite({
+      name: 'source',
+      baseUrl: 'https://source.example/v1',
+      apiKey: 'sk-source',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/console',
+        username: 'shared-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'default',
+          groupId: 'default',
+          groups: [{ id: 'default', name: 'default', multiplier: 1, selected: true }]
+        }
+      }
+    });
+    const createdCalls = [];
+    const testedCalls = [];
+    const activityEvents = [];
+    const result = await provisionMissingLowMultiplierGroup({
+      configService: service,
+      siteId: source.id,
+      syncResult: {
+        ok: true,
+        syncPatch: {
+          remote: {
+            groups: [
+              { id: 'default', name: 'default', multiplier: 1 },
+              { id: 'low', name: 'Low', multiplier: 0.003 }
+            ]
+          }
+        }
+      },
+      createRemoteKey: async ({ sync, name }) => {
+        createdCalls.push({ groupId: sync.remote.groupId, name });
+        return {
+          ok: true,
+          apiKey: 'sk-low',
+          keyName: name,
+          multiplier: 0.003,
+          authSession: { providerType: 'new-api', origin: 'https://panel.example.com', token: 'session' },
+          syncPatch: {
+            remote: {
+              remoteKeyId: '42',
+              keyGroup: 'Low',
+              groupId: 'low',
+              groupMultiplier: 0.003
+            }
+          }
+        };
+      },
+      testSite: async (site, options) => {
+        testedCalls.push({ apiKey: site.apiKey, testModel: options.testModel });
+        return { ok: true, statusCode: 200 };
+      },
+      onActivity: async (event) => {
+        activityEvents.push(event);
+        throw new Error('activity log unavailable');
+      },
+      now: new Date('2026-08-04T00:00:00.000Z')
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.createdSite.apiKey, 'sk-low');
+    assert.deepEqual(createdCalls.map((call) => call.groupId), ['low']);
+    assert.deepEqual(testedCalls, [{ apiKey: 'sk-low', testModel: 'global-test-model' }]);
+    assert.deepEqual(activityEvents.map((event) => event.type), [
+      'candidate-found',
+      'key-created',
+      'test-passed',
+      'imported'
+    ]);
+    assert.equal(activityEvents[0].candidateMultiplier, 0.003);
+    assert.equal(activityEvents[0].currentLowestMultiplier, 1);
+    assert.equal(activityEvents.at(-1).createdSiteId, result.createdSite.id);
+    assert.equal(service.getState().sites.length, 2);
+    assert.equal(service.getState().autoProvisionAttempts[0].status, 'success');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('provisionMissingLowMultiplierGroup skips groups that do not beat the lowest usable multiplier', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-auto-provision-threshold-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  try {
+    await service.load();
+    await service.updateProxySettings({
+      autoSwitchMultiplierLimit: { enabled: true, maxMultiplier: 0.01 }
+    });
+    const source = await service.addSite({
+      name: 'source',
+      baseUrl: 'https://source.example/v1',
+      apiKey: 'sk-source',
+      multiplier: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/console',
+        username: 'shared-user',
+        password: 'secret',
+        providerType: 'new-api',
+        remote: {
+          keyGroup: 'default',
+          groupId: 'default',
+          groupMultiplier: 1,
+          groups: [{ id: 'default', name: 'default', multiplier: 1, selected: true }]
+        }
+      }
+    });
+    await service.addSite({
+      name: 'current-lowest',
+      baseUrl: 'https://lowest.example/v1',
+      apiKey: 'sk-lowest',
+      multiplier: 0.002
+    });
+    await service.addSite({
+      name: 'disabled-lower',
+      baseUrl: 'https://disabled.example/v1',
+      apiKey: 'sk-disabled',
+      multiplier: 0.001,
+      manualEnabled: false
+    });
+    let createCalls = 0;
+    let testCalls = 0;
+    const activityEvents = [];
+
+    const result = await provisionMissingLowMultiplierGroup({
+      configService: service,
+      siteId: source.id,
+      syncResult: {
+        ok: true,
+        syncPatch: {
+          remote: {
+            groups: [
+              { id: 'default', name: 'default', multiplier: 1 },
+              { id: 'same-lowest', name: 'Same lowest', multiplier: 0.002 }
+            ]
+          }
+        }
+      },
+      createRemoteKey: async () => {
+        createCalls += 1;
+        return { ok: true, apiKey: 'sk-created' };
+      },
+      testSite: async () => {
+        testCalls += 1;
+        return { ok: true, statusCode: 200 };
+      },
+      onActivity: async (event) => activityEvents.push(event)
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, true);
+    assert.equal(createCalls, 0);
+    assert.equal(testCalls, 0);
+    assert.deepEqual(activityEvents.map((event) => event.type), ['not-beneficial']);
+    assert.equal(activityEvents[0].currentLowestMultiplier, 0.002);
+    assert.equal(service.getState().sites.length, 3);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('provisionMissingLowMultiplierGroup reports only cooldown before attempting key creation', async () => {
+  const fixture = await createAutoProvisionFixture();
+  const activityEvents = [];
+  let createCalls = 0;
+
+  try {
+    await fixture.service.recordAutoProvisionAttempt({
+      accountId: fixture.source.sync.accountId,
+      groupId: 'low',
+      groupName: 'Low',
+      status: 'failure',
+      error: 'previous availability test failed',
+      now: new Date('2026-08-04T00:00:00.000Z')
+    });
+
+    const result = await provisionMissingLowMultiplierGroup({
+      configService: fixture.service,
+      siteId: fixture.source.id,
+      syncResult: fixture.syncResult,
+      createRemoteKey: async () => {
+        createCalls += 1;
+        return createProvisionKeyResult();
+      },
+      testSite: async () => ({ ok: true }),
+      onActivity: async (event) => activityEvents.push(event),
+      now: new Date('2026-08-04T01:00:00.000Z')
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, 'cooldown');
+    assert.equal(createCalls, 0);
+    assert.deepEqual(activityEvents.map((event) => event.type), ['cooldown']);
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('provisionMissingLowMultiplierGroup reports a failed remote-key rollback', async () => {
+  const fixture = await createAutoProvisionFixture();
+  const activityEvents = [];
+
+  try {
+    const result = await provisionMissingLowMultiplierGroup({
+      configService: fixture.service,
+      siteId: fixture.source.id,
+      syncResult: fixture.syncResult,
+      createRemoteKey: async () => createProvisionKeyResult(),
+      deleteRemoteKey: async () => ({
+        ok: false,
+        error: new Error('delete failed')
+      }),
+      testSite: async () => ({
+        ok: false,
+        statusCode: 503,
+        message: 'Availability test failed HTTP 503'
+      }),
+      onActivity: async (event) => activityEvents.push(event),
+      now: new Date('2026-08-04T01:00:00.000Z')
+    });
+
+    assert.equal(result.ok, false);
+    assert.deepEqual(activityEvents.map((event) => event.type), [
+      'candidate-found',
+      'key-created',
+      'test-failed'
+    ]);
+    assert.equal(activityEvents.at(-1).rolledBack, false);
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('provisionMissingLowMultiplierGroup reports creation, test and import exceptions', async (t) => {
+  const scenarios = [
+    {
+      name: 'creation exception',
+      expectedTypes: ['candidate-found', 'create-failed'],
+      createRemoteKey: async () => {
+        throw new Error('create failed');
+      },
+      testSite: async () => ({ ok: true })
+    },
+    {
+      name: 'test exception',
+      expectedTypes: ['candidate-found', 'key-created', 'test-failed'],
+      createRemoteKey: async () => createProvisionKeyResult(),
+      testSite: async () => {
+        throw new Error('test failed');
+      }
+    },
+    {
+      name: 'import exception',
+      expectedTypes: ['candidate-found', 'key-created', 'test-passed', 'import-failed'],
+      createRemoteKey: async () => createProvisionKeyResult(),
+      testSite: async () => ({ ok: true }),
+      failImport: true
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const fixture = await createAutoProvisionFixture();
+      const activityEvents = [];
+      let deleteCalls = 0;
+      try {
+        if (scenario.failImport) {
+          fixture.service.addSite = async () => {
+            throw new Error('import failed');
+          };
+        }
+        const operation = provisionMissingLowMultiplierGroup({
+          configService: fixture.service,
+          siteId: fixture.source.id,
+          syncResult: fixture.syncResult,
+          createRemoteKey: scenario.createRemoteKey,
+          deleteRemoteKey: async () => {
+            deleteCalls += 1;
+            return { ok: true };
+          },
+          testSite: scenario.testSite,
+          onActivity: async (event) => activityEvents.push(event)
+        });
+
+        if (scenario.failImport) {
+          await assert.rejects(operation, /import failed/);
+        } else {
+          const result = await operation;
+          assert.equal(result.ok, false);
+        }
+        assert.deepEqual(activityEvents.map((event) => event.type), scenario.expectedTypes);
+        assert.equal(activityEvents.at(-1).status, 'failure');
+        assert.equal(deleteCalls, scenario.name === 'creation exception' ? 0 : 1);
+      } finally {
+        await rm(fixture.dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+async function createAutoProvisionFixture() {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-auto-provision-error-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+  await service.load();
+  await service.updateProxySettings({
+    testModel: 'global-test-model',
+    autoSwitchMultiplierLimit: { enabled: true, maxMultiplier: 0.01 }
+  });
+  const source = await service.addSite({
+    name: 'source',
+    baseUrl: 'https://source.example/v1',
+    apiKey: 'sk-source',
+    sync: {
+      enabled: true,
+      dashboardUrl: 'https://panel.example.com/console',
+      username: 'shared-user',
+      password: 'secret',
+      providerType: 'new-api',
+      remote: {
+        keyGroup: 'default',
+        groupId: 'default',
+        groups: [{ id: 'default', name: 'default', multiplier: 1, selected: true }]
+      }
+    }
+  });
+  return {
+    dir,
+    service,
+    source,
+    syncResult: {
+      ok: true,
+      syncPatch: {
+        remote: {
+          groups: [
+            { id: 'default', name: 'default', multiplier: 1 },
+            { id: 'low', name: 'Low', multiplier: 0.003 }
+          ]
+        }
+      }
+    }
+  };
+}
+
+function createProvisionKeyResult() {
+  return {
+    ok: true,
+    apiKey: 'sk-low',
+    keyName: 'Low',
+    multiplier: 0.003,
+    syncPatch: {
+      remote: {
+        remoteKeyId: '42',
+        keyGroup: 'Low',
+        groupId: 'low',
+        groupMultiplier: 0.003
+      }
+    }
+  };
+}

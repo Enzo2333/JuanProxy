@@ -240,6 +240,65 @@ test('syncDueSites uses the group refresh interval instead of per-site intervals
   }
 });
 
+test('short group refresh intervals are not immediately eligible for request preheating', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-group-sync-short-preheat-'));
+  const service = new ConfigService({ filePath: join(dir, 'config.json') });
+
+  try {
+    await service.load();
+    await service.updateSiteSyncSettings({
+      intervalValue: 30,
+      intervalUnit: 'minute',
+      intelligentScheduling: true
+    });
+    await service.updateGroupSyncSettings({
+      intervalValue: 5,
+      intervalUnit: 'minute'
+    });
+    await service.addSite({
+      name: 'active-candidate',
+      baseUrl: 'https://active.example/v1',
+      apiKey: 'sk-active',
+      priority: 1,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'sync-user',
+        password: 'secret',
+        intervalMode: 'global',
+        lastSyncAt: '2026-06-09T08:00:00.000Z'
+      }
+    });
+
+    const calls = [];
+    const syncWebsite = async ({ websiteKey }) => {
+      calls.push(websiteKey);
+      return { ok: true };
+    };
+    const earlyResult = await syncDueSites({
+      configService: service,
+      now: new Date('2026-06-09T08:00:30.000Z'),
+      syncWebsite
+    });
+
+    assert.deepEqual(calls, []);
+    assert.deepEqual(earlyResult.checkedWebsites, []);
+
+    const preheatResult = await syncDueSites({
+      configService: service,
+      now: new Date('2026-06-09T08:04:00.000Z'),
+      syncWebsite
+    });
+
+    assert.deepEqual(calls, ['https://relay.example.com']);
+    assert.deepEqual(preheatResult.checkedWebsites.map((website) => website.key), [
+      'https://relay.example.com'
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('site sync scheduler emits synced events and skips overlapping ticks', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-site-sync-scheduler-'));
   const service = new ConfigService({ filePath: join(dir, 'config.json') });
@@ -273,11 +332,15 @@ test('site sync scheduler emits synced events and skips overlapping ticks', asyn
       }
     });
     const events = [];
+    const statusEvents = [];
     scheduler.on('synced', (event) => events.push(event));
+    scheduler.on('status-changed', (event) => statusEvents.push(event));
 
     const firstTick = scheduler.tick(new Date('2026-06-09T08:00:00.000Z'));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    assert.equal(scheduler.getStatus().checking, true);
+    assert.equal(scheduler.getStatus().lastCheckStartedAt, '2026-06-09T08:00:00.000Z');
     assert.equal(await scheduler.tick(new Date('2026-06-09T08:00:00.000Z')), null);
     releaseSync();
     const firstResult = await firstTick;
@@ -286,6 +349,21 @@ test('site sync scheduler emits synced events and skips overlapping ticks', asyn
     assert.deepEqual(firstResult.syncedSites.map((candidate) => candidate.id), [site.id]);
     assert.equal(events.length, 1);
     assert.deepEqual(events[0].syncedSites.map((candidate) => candidate.id), [site.id]);
+    assert.equal(statusEvents.length, 2);
+    assert.equal(statusEvents[0].checking, true);
+    assert.equal(statusEvents[1].checking, false);
+    assert.deepEqual(scheduler.getStatus(), {
+      monitoring: false,
+      checking: false,
+      intervalMs: 60_000,
+      startedAt: null,
+      lastCheckStartedAt: '2026-06-09T08:00:00.000Z',
+      lastCheckCompletedAt: '2026-06-09T08:00:00.000Z',
+      nextCheckAt: null,
+      checkedWebsiteCount: 1,
+      syncedWebsiteCount: 1,
+      failedWebsiteCount: 0
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,3 +1,4 @@
+import { calculateEffectiveMultiplier } from '../proxy/switching-policy.js';
 import { shouldPreserveEditorOnStateChange } from './editor-preservation.js';
 
 const api = window.openApiProxy;
@@ -10,20 +11,76 @@ let selectedDashboardPeriod = 'hour';
 let selectedSiteStatusFilter = 'all';
 let selectedSiteSort = 'default';
 let selectedGroupFilterKey = null;
+let selectedWorkspaceView = 'sites';
+let selectedSiteTab = 'overview';
 let showAllTopbarSyncGroups = false;
+let selectedGroupAction = null;
+let groupPopoverAnchor = null;
+let compactInspectorMode = window.innerWidth < 1160;
+let siteInspectorOpen = !compactInspectorMode;
 let formDirty = false;
+let pendingEditorNavigation = null;
 let pendingImportPreview = null;
 let configTransferDefaultsApplied = false;
+let activityLogs = [];
+let selectedActivityCategory = 'all';
+let selectedActivityStatus = 'all';
+let monitoringTaskStatus = null;
+let visibleLocalApiKey = '';
 
 const elements = {
+  navSites: document.querySelector('#nav-sites'),
+  navStrategy: document.querySelector('#nav-strategy'),
+  navDiagnostics: document.querySelector('#nav-diagnostics'),
+  navActivity: document.querySelector('#nav-activity'),
+  navSettings: document.querySelector('#nav-settings'),
+  viewSites: document.querySelector('#view-sites'),
+  viewStrategy: document.querySelector('#view-strategy'),
+  viewDiagnostics: document.querySelector('#view-diagnostics'),
+  viewActivity: document.querySelector('#view-activity'),
+  viewSettings: document.querySelector('#view-settings'),
+  workspace: document.querySelector('.workspace'),
+  legacyOverviewSource: document.querySelector('#view-overview'),
+  siteOverview: document.querySelector('#site-overview'),
+  requestDashboard: document.querySelector('#request-dashboard'),
+  overviewSyncGroups: document.querySelector('.overview-sync-groups'),
+  sidebarGroupHost: document.querySelector('#sidebar-group-host'),
+  siteTabOverview: document.querySelector('#site-tab-overview'),
+  siteTabBasic: document.querySelector('#site-tab-basic'),
+  siteTabSync: document.querySelector('#site-tab-sync'),
+  siteTabModels: document.querySelector('#site-tab-models'),
+  siteTabPolicy: document.querySelector('#site-tab-policy'),
+  siteTabOverviewPanel: document.querySelector('#site-tab-overview-panel'),
+  siteBasicPanel: document.querySelector('#site-basic-panel'),
+  siteSyncPanel: document.querySelector('#site-sync-panel'),
+  siteModelsPanel: document.querySelector('#site-models-panel'),
+  sitePolicyPanel: document.querySelector('#site-policy-panel'),
+  formActions: document.querySelector('.form-actions'),
+  siteInspector: document.querySelector('#site-inspector'),
+  toggleSiteInspector: document.querySelector('#toggle-site-inspector'),
+  closeSiteInspector: document.querySelector('#close-site-inspector'),
+  inspectorStatusHost: document.querySelector('#inspector-status-host'),
+  statusPanel: document.querySelector('.status-panel'),
+  inspectorRouteLog: document.querySelector('#inspector-route-log'),
+  openRequestTraces: document.querySelector('#open-request-traces'),
+  inspectorErrorHost: document.querySelector('#inspector-error-host'),
+  errorLogPanel: document.querySelector('#error-log-panel'),
   proxyUrl: document.querySelector('#proxy-url'),
+  proxyEndpointLabel: document.querySelector('#proxy-endpoint-label'),
   copyProxyUrl: document.querySelector('#copy-proxy-url'),
   proxyStatus: document.querySelector('#proxy-status'),
   proxyError: document.querySelector('#proxy-error'),
   proxyPort: document.querySelector('#proxy-port'),
+  localApiKey: document.querySelector('#local-api-key'),
+  copyLocalApiKey: document.querySelector('#copy-local-api-key'),
+  generateLocalApiKey: document.querySelector('#generate-local-api-key'),
+  localApiKeyNote: document.querySelector('#local-api-key-note'),
+  allowLanAccess: document.querySelector('#allow-lan-access'),
   proxyTimeoutSeconds: document.querySelector('#proxy-timeout-seconds'),
   proxyReplayBufferMb: document.querySelector('#proxy-replay-buffer-mb'),
+  codexRecoveryEnabled: document.querySelector('#codex-recovery-enabled'),
   failureThreshold: document.querySelector('#failure-threshold'),
+  globalTestModel: document.querySelector('#global-test-model'),
   smartSwitching: document.querySelector('#smart-switching'),
   priorityMode: document.querySelector('#priority-mode'),
   samePriorityStrategy: document.querySelector('#same-priority-strategy'),
@@ -40,6 +97,20 @@ const elements = {
   groupSyncIntervalValue: document.querySelector('#group-sync-interval-value'),
   groupSyncIntervalUnit: document.querySelector('#group-sync-interval-unit'),
   saveSiteSyncSettings: document.querySelector('#save-site-sync-settings'),
+  monitoringEnabled: document.querySelector('#monitoring-enabled'),
+  feishuWebhook: document.querySelector('#feishu-webhook'),
+  monitoringMultiplierChanged: document.querySelector('#monitoring-multiplier-changed'),
+  monitoringLowBalance: document.querySelector('#monitoring-low-balance'),
+  monitoringNoUsableSite: document.querySelector('#monitoring-no-usable-site'),
+  noUsableSiteDelayMinutes: document.querySelector('#no-usable-site-delay-minutes'),
+  monitoringProgramIssues: document.querySelector('#monitoring-program-issues'),
+  monitoringAnswerCompleted: document.querySelector('#monitoring-answer-completed'),
+  monitoringGoalStatusChanged: document.querySelector('#monitoring-goal-status-changed'),
+  monitoringSummary: document.querySelector('#monitoring-summary'),
+  saveMonitoring: document.querySelector('#save-monitoring'),
+  testFeishuWebhook: document.querySelector('#test-feishu-webhook'),
+  installMonitoringTask: document.querySelector('#install-monitoring-task'),
+  removeMonitoringTask: document.querySelector('#remove-monitoring-task'),
   configExportGlobalSettings: document.querySelector('#config-export-global-settings'),
   configExportMode: document.querySelector('#config-export-mode'),
   configExportSelectedSites: document.querySelector('#config-export-selected-sites'),
@@ -50,6 +121,7 @@ const elements = {
   configImportGlobalSettings: document.querySelector('#config-import-global-settings'),
   configImportSites: document.querySelector('#config-import-sites'),
   applyImportConfig: document.querySelector('#apply-import-config'),
+  quitApp: document.querySelector('#quit-app'),
   restartProxy: document.querySelector('#restart-proxy'),
   siteList: document.querySelector('#site-list'),
   siteListSummary: document.querySelector('#site-list-summary'),
@@ -86,16 +158,21 @@ const elements = {
   name: document.querySelector('#site-name'),
   baseUrl: document.querySelector('#site-base-url'),
   apiKey: document.querySelector('#site-api-key'),
-  testModel: document.querySelector('#site-test-model'),
   siteModelMappingEnabled: document.querySelector('#site-model-mapping-enabled'),
   siteModelMappingRows: document.querySelector('#site-model-mapping-rows'),
   addSiteModelMapping: document.querySelector('#add-site-model-mapping'),
   siteModelMapping: document.querySelector('#site-model-mapping'),
   priority: document.querySelector('#site-priority'),
   multiplier: document.querySelector('#site-multiplier'),
+  customMultiplierEnabled: document.querySelector('#site-custom-multiplier-enabled'),
+  customMultiplier: document.querySelector('#site-custom-multiplier'),
+  accountMultiplier: document.querySelector('#site-account-multiplier'),
+  effectiveMultiplier: document.querySelector('#site-effective-multiplier'),
   multiplierLocked: document.querySelector('#site-multiplier-locked'),
   remark: document.querySelector('#site-remark'),
   syncEnabled: document.querySelector('#site-sync-enabled'),
+  syncAccount: document.querySelector('#site-sync-account'),
+  syncAccountSummary: document.querySelector('#site-sync-account-summary'),
   syncDashboardUrl: document.querySelector('#site-sync-dashboard-url'),
   syncUsername: document.querySelector('#site-sync-username'),
   syncPassword: document.querySelector('#site-sync-password'),
@@ -105,6 +182,7 @@ const elements = {
   syncIntervalUnit: document.querySelector('#site-sync-interval-unit'),
   createSiteKey: document.querySelector('#create-site-key'),
   syncSite: document.querySelector('#sync-site'),
+  logoutSiteAccount: document.querySelector('#logout-site-account'),
   syncSummary: document.querySelector('#site-sync-summary'),
   syncBalance: document.querySelector('#site-sync-balance'),
   syncKeyName: document.querySelector('#site-sync-key-name'),
@@ -124,6 +202,9 @@ const elements = {
   autoRecoveryEnabled: document.querySelector('#auto-recovery-enabled'),
   autoRecoveryIntervalValue: document.querySelector('#auto-recovery-interval-value'),
   autoRecoveryIntervalUnit: document.querySelector('#auto-recovery-interval-unit'),
+  siteMonitoringEnabled: document.querySelector('#site-monitoring-enabled'),
+  siteBalanceThreshold: document.querySelector('#site-balance-threshold'),
+  siteMonitoringAccount: document.querySelector('#site-monitoring-account'),
   enabled: document.querySelector('#site-enabled'),
   resetForm: document.querySelector('#reset-form'),
   activeSiteName: document.querySelector('#active-site-name'),
@@ -134,11 +215,36 @@ const elements = {
   toggleTopbarSyncGroups: document.querySelector('#toggle-topbar-sync-groups'),
   refreshSiteSyncAll: document.querySelector('#refresh-site-sync-all'),
   clearSiteGroupFilter: document.querySelector('#clear-site-group-filter'),
+  siteGroupPopover: document.querySelector('#site-group-popover'),
+  siteGroupPopoverTitle: document.querySelector('#site-group-popover-title'),
+  siteGroupPopoverMeta: document.querySelector('#site-group-popover-meta'),
+  siteGroupPopoverClose: document.querySelector('#site-group-popover-close'),
+  siteGroupPopoverViewSite: document.querySelector('#site-group-popover-view-site'),
+  siteGroupPopoverFilter: document.querySelector('#site-group-popover-filter'),
+  siteGroupPopoverSwitch: document.querySelector('#site-group-popover-switch'),
+  unsavedChangesDialog: document.querySelector('#unsaved-changes-dialog'),
+  unsavedChangesSave: document.querySelector('#unsaved-changes-save'),
+  unsavedChangesDiscard: document.querySelector('#unsaved-changes-discard'),
+  unsavedChangesCancel: document.querySelector('#unsaved-changes-cancel'),
   contextSiteName: document.querySelector('#context-site-name'),
   contextSiteStatus: document.querySelector('#context-site-status'),
   status: document.querySelector('#site-status'),
   errorLog: document.querySelector('#error-log'),
   errorLogSummary: document.querySelector('#error-log-summary'),
+  routeTraceLog: document.querySelector('#route-trace-log'),
+  routeTraceSummary: document.querySelector('#route-trace-summary'),
+  activityMonitorSummary: document.querySelector('#activity-monitor-summary'),
+  activityMonitorStatus: document.querySelector('#activity-monitor-status'),
+  activityMonitorChecking: document.querySelector('#activity-monitor-checking'),
+  activityMonitorLastCheck: document.querySelector('#activity-monitor-last-check'),
+  activityMonitorNextCheck: document.querySelector('#activity-monitor-next-check'),
+  activityMonitorCounts: document.querySelector('#activity-monitor-counts'),
+  activityLogSummary: document.querySelector('#activity-log-summary'),
+  activityCategoryFilter: document.querySelector('#activity-category-filter'),
+  activityStatusFilter: document.querySelector('#activity-status-filter'),
+  refreshActivityLogs: document.querySelector('#refresh-activity-logs'),
+  clearActivityLogs: document.querySelector('#clear-activity-logs'),
+  activityLogList: document.querySelector('#activity-log-list'),
   toast: document.querySelector('#toast')
 };
 
@@ -147,6 +253,22 @@ const dashboardPeriodButtons = [
   ['day', elements.dashboardPeriodDay],
   ['week', elements.dashboardPeriodWeek],
   ['month', elements.dashboardPeriodMonth]
+];
+
+const workspaceViewButtons = [
+  ['sites', elements.navSites, elements.viewSites],
+  ['strategy', elements.navStrategy, elements.viewStrategy],
+  ['diagnostics', elements.navDiagnostics, elements.viewDiagnostics],
+  ['activity', elements.navActivity, elements.viewActivity],
+  ['settings', elements.navSettings, elements.viewSettings]
+];
+
+const siteTabButtons = [
+  ['overview', elements.siteTabOverview, elements.siteTabOverviewPanel],
+  ['basic', elements.siteTabBasic, elements.siteBasicPanel],
+  ['sync', elements.siteTabSync, elements.siteSyncPanel],
+  ['models', elements.siteTabModels, elements.siteModelsPanel],
+  ['policy', elements.siteTabPolicy, elements.sitePolicyPanel]
 ];
 
 const siteStatusFilterLabels = {
@@ -163,7 +285,7 @@ const siteSortLabels = {
   requests: '请求数多优先',
   'success-rate': '成功率高优先',
   balance: '余额高优先',
-  multiplier: '倍率低优先'
+  multiplier: '实际倍率低优先'
 };
 
 const capabilityLabels = {
@@ -184,8 +306,15 @@ const capabilityOrder = Object.keys(capabilityLabels);
 installGlobalErrorHandlers();
 
 async function init() {
-  state = await api.getState();
+  mountConsoleLayout();
+  [state, monitoringTaskStatus, activityLogs] = await Promise.all([
+    api.getState(),
+    loadMonitoringTaskStatus(),
+    loadActivityLogs()
+  ]);
   selectedSiteId = state.activeSiteId ?? state.sites[0]?.id ?? null;
+  visibleLocalApiKey = state.localApiKey ?? '';
+  selectedSiteTab = 'overview';
   render();
   setInterval(() => {
     if (state) {
@@ -195,10 +324,40 @@ async function init() {
       renderTopbarSyncGroups();
       renderOverview(getSelectedSite());
       renderStatus(getSelectedSite());
+      renderRouteTraces();
+      renderActivityView();
     }
   }, 60_000);
   api.onStateChanged((nextState) => applyState(nextState, { preserveDirtyEditor: true }));
   api.onSiteChanged?.((patch) => applySitePatch(patch));
+  api.onRouteTraceChanged?.((trace) => applyRouteTracePatch(trace));
+  api.onActivityLogChanged?.(() => {
+    refreshActivityLogs().catch(() => {});
+  });
+}
+
+async function loadActivityLogs() {
+  if (typeof api.listActivityLogs !== 'function') {
+    return [];
+  }
+  const entries = await api.listActivityLogs({ limit: 200 });
+  return Array.isArray(entries) ? entries : [];
+}
+
+async function loadMonitoringTaskStatus() {
+  if (typeof api.getMonitoringTaskStatus !== 'function') {
+    return null;
+  }
+  try {
+    return await api.getMonitoringTaskStatus();
+  } catch {
+    return null;
+  }
+}
+
+async function refreshActivityLogs() {
+  activityLogs = await loadActivityLogs();
+  renderActivityView();
 }
 
 function applyState(nextState, { preserveDirtyEditor = false } = {}) {
@@ -248,6 +407,9 @@ function applySitePatch(patch = {}) {
   renderSiteList();
   renderActiveSite();
   renderTopbarSyncGroups();
+  renderSiteGroupPopover();
+  renderRouteTraces();
+  renderInspectorRoutes();
 
   const selectedSite = getSelectedSite();
   if (preserveEditor) {
@@ -259,12 +421,35 @@ function applySitePatch(patch = {}) {
   }
 }
 
+function applyRouteTracePatch(trace) {
+  if (!state || !trace?.id) {
+    return;
+  }
+
+  const current = Array.isArray(state.recentRouteTraces) ? state.recentRouteTraces : [];
+  state = {
+    ...state,
+    recentRouteTraces: [
+      trace,
+      ...current.filter((entry) => entry.id !== trace.id)
+    ].slice(0, 50)
+  };
+  renderRouteTraces();
+  renderInspectorRoutes();
+}
+
 function render({ preserveEditor = false, preserveProxyControls = false } = {}) {
+  renderWorkspaceView();
+  renderSiteTabs();
+  renderSiteInspector();
   renderProxy({ preserveControls: preserveProxyControls });
   renderDashboard();
   renderSiteList();
   renderActiveSite();
   renderTopbarSyncGroups();
+  renderRouteTraces();
+  renderInspectorRoutes();
+  renderActivityView();
   if (preserveEditor) {
     const site = getSelectedSite();
     renderOverview(site);
@@ -275,14 +460,76 @@ function render({ preserveEditor = false, preserveProxyControls = false } = {}) 
   }
 }
 
+function setWorkspaceView(view) {
+  selectedWorkspaceView = normalizeWorkspaceView(view);
+}
+
+function switchWorkspaceView(view) {
+  const nextView = normalizeWorkspaceView(view);
+  if (nextView === selectedWorkspaceView) {
+    return;
+  }
+  requestEditorNavigation(() => {
+    setWorkspaceView(nextView);
+    renderWorkspaceView();
+  });
+}
+
+function renderWorkspaceView() {
+  for (const [view, button, section] of workspaceViewButtons) {
+    const active = view === selectedWorkspaceView;
+    button.className = active ? 'active' : '';
+    button.setAttribute('aria-current', active ? 'page' : 'false');
+    section.hidden = !active;
+  }
+}
+
+function normalizeWorkspaceView(view) {
+  return workspaceViewButtons.some(([candidate]) => candidate === view) ? view : 'sites';
+}
+
+function mountConsoleLayout() {
+  elements.siteTabOverviewPanel.append(elements.siteOverview, elements.requestDashboard);
+  elements.sidebarGroupHost.append(elements.overviewSyncGroups);
+  document.body.append(elements.siteGroupPopover);
+  elements.inspectorStatusHost.append(elements.statusPanel);
+  elements.inspectorErrorHost.append(elements.errorLogPanel);
+  elements.legacyOverviewSource.hidden = true;
+}
+
+function renderSiteTabs() {
+  selectedSiteTab = siteTabButtons.some(([tab]) => tab === selectedSiteTab)
+    ? selectedSiteTab
+    : 'overview';
+  for (const [tab, button, panel] of siteTabButtons) {
+    const active = tab === selectedSiteTab;
+    button.className = active ? 'active' : '';
+    button.setAttribute('aria-selected', String(active));
+    panel.hidden = !active;
+  }
+  elements.formActions.hidden = selectedSiteTab === 'overview';
+}
+
+function renderSiteInspector() {
+  elements.siteInspector.className = [
+    'context-panel',
+    'site-inspector',
+    siteInspectorOpen ? 'is-open' : ''
+  ].filter(Boolean).join(' ');
+  elements.toggleSiteInspector.setAttribute('aria-expanded', String(siteInspectorOpen));
+}
+
 function renderProxy({ preserveControls = false } = {}) {
   if (!preserveControls) {
     elements.proxyPort.value = state.proxy.port;
+    elements.allowLanAccess.checked = Boolean(state.proxy.allowLanAccess);
     elements.proxyTimeoutSeconds.value = Math.round((state.proxy.timeoutMs ?? 120000) / 1000);
     elements.proxyReplayBufferMb.value = toReplayBufferMegabytes(
       state.proxy.maxReplayableRequestBodyBytes
     );
+    elements.codexRecoveryEnabled.checked = Boolean(state.proxy.codexRecoveryEnabled);
     elements.failureThreshold.value = state.proxy.failureThreshold;
+    elements.globalTestModel.value = state.proxy.testModel ?? 'example-chat-model';
     elements.smartSwitch.checked = Boolean(state.proxy.smartSwitching);
     elements.smartSwitching.checked = Boolean(state.proxy.smartSwitching);
     elements.priorityMode.value = state.proxy.priorityMode ?? 'priority';
@@ -298,18 +545,39 @@ function renderProxy({ preserveControls = false } = {}) {
       modelMapping: state.modelMapping
     });
     renderSiteSyncSettings();
+    renderMonitoringSettings();
     renderConfigTransfer();
   }
+  elements.localApiKey.value = visibleLocalApiKey || '已配置；如已遗失请重新生成';
+  elements.localApiKey.type = visibleLocalApiKey ? 'text' : 'password';
+  elements.copyLocalApiKey.disabled = !visibleLocalApiKey;
+  elements.localApiKeyNote.textContent = visibleLocalApiKey
+    ? '这是唯一一次明文显示，请立即复制保存；刷新或关闭窗口后不再展示。'
+    : '密钥明文只显示一次；重新生成后，旧密钥立即失效。';
   elements.configPath.textContent = `配置文件：${state.configPath}`;
 
   const running = state.proxyStatus.running;
   const port = state.proxyStatus.port ?? state.proxy.port;
   const proxyError = state.proxyStatus.error;
-  elements.proxyUrl.textContent = `http://127.0.0.1:${port}/v1`;
+  elements.proxyEndpointLabel.textContent = state.proxy.allowLanAccess ? '局域网代理' : '本机代理';
+  elements.proxyUrl.textContent = formatProxyAccessUrl(state.proxyAccessUrls?.[0], port);
   elements.proxyStatus.textContent = running ? '运行中' : '未运行';
   elements.proxyStatus.className = `status-pill ${running ? 'success' : 'error'}`;
   elements.proxyError.textContent = proxyError ? formatProxyError(proxyError, state.proxy.port) : '';
   elements.proxyError.hidden = !proxyError;
+}
+
+function formatProxyAccessUrl(accessUrl, port) {
+  if (!accessUrl) {
+    return `http://127.0.0.1:${port}/v1`;
+  }
+  try {
+    const url = new URL(accessUrl);
+    url.port = String(port);
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return `http://127.0.0.1:${port}/v1`;
+  }
 }
 
 function renderSiteSyncSettings() {
@@ -320,6 +588,69 @@ function renderSiteSyncSettings() {
   elements.siteSyncIntelligentScheduling.checked = settings.intelligentScheduling ?? true;
   elements.groupSyncIntervalValue.value = groupSettings.intervalValue ?? 30;
   elements.groupSyncIntervalUnit.value = groupSettings.intervalUnit ?? 'minute';
+}
+
+function renderMonitoringSettings() {
+  const monitoring = state.monitoring ?? {};
+  const notifications = monitoring.notifications ?? {};
+  elements.monitoringEnabled.checked = Boolean(monitoring.enabled);
+  elements.feishuWebhook.value = monitoring.feishuWebhook ?? '';
+  elements.monitoringMultiplierChanged.checked = notifications.multiplierChanged ?? true;
+  elements.monitoringLowBalance.checked = notifications.lowBalance ?? true;
+  elements.monitoringNoUsableSite.checked = notifications.noUsableSite ?? true;
+  elements.monitoringProgramIssues.checked = notifications.programIssues ?? true;
+  elements.monitoringAnswerCompleted.checked = notifications.answerCompleted ?? false;
+  elements.monitoringGoalStatusChanged.checked = notifications.goalStatusChanged ?? false;
+  elements.noUsableSiteDelayMinutes.value = monitoring.noUsableSiteDelayMinutes ?? 5;
+  elements.noUsableSiteDelayMinutes.disabled = !elements.monitoringNoUsableSite.checked;
+  const enabledCount = [
+    elements.monitoringMultiplierChanged,
+    elements.monitoringLowBalance,
+    elements.monitoringNoUsableSite,
+    elements.monitoringProgramIssues,
+    elements.monitoringAnswerCompleted,
+    elements.monitoringGoalStatusChanged
+  ].filter((element) => element.checked).length;
+  elements.monitoringSummary.textContent = [
+    monitoring.enabled ? '监控已启用' : '监控未启用',
+    monitoring.feishuWebhook ? 'Webhook 已配置' : 'Webhook 未配置',
+    `已启用 ${enabledCount}/6 项通知`,
+    formatMonitoringTaskStatus(),
+    '持续异常每 30 分钟提醒'
+  ].join(' · ');
+  elements.installMonitoringTask.disabled =
+    typeof api.installMonitoringTask !== 'function' || monitoringTaskStatus?.supported === false;
+  elements.removeMonitoringTask.disabled =
+    typeof api.removeMonitoringTask !== 'function' || !monitoringTaskStatus?.installed;
+}
+
+function readMonitoringSettingsFormPayload() {
+  return {
+    enabled: elements.monitoringEnabled.checked,
+    feishuWebhook: elements.feishuWebhook.value.trim(),
+    noUsableSiteDelayMinutes: Number(elements.noUsableSiteDelayMinutes.value || 5),
+    notifications: {
+      multiplierChanged: elements.monitoringMultiplierChanged.checked,
+      lowBalance: elements.monitoringLowBalance.checked,
+      noUsableSite: elements.monitoringNoUsableSite.checked,
+      programIssues: elements.monitoringProgramIssues.checked,
+      answerCompleted: elements.monitoringAnswerCompleted.checked,
+      goalStatusChanged: elements.monitoringGoalStatusChanged.checked
+    }
+  };
+}
+
+function formatMonitoringTaskStatus() {
+  if (!monitoringTaskStatus) {
+    return '后台任务状态未知';
+  }
+  if (!monitoringTaskStatus.supported) {
+    return '当前系统不支持后台任务';
+  }
+  if (monitoringTaskStatus.running) {
+    return '后台任务运行中';
+  }
+  return monitoringTaskStatus.installed ? '后台任务已安装但未运行' : '后台任务未安装';
 }
 
 function renderConfigTransfer() {
@@ -351,7 +682,7 @@ function renderExportSitePicker() {
       createConfigSiteOption({
         id: site.id,
         name: site.name,
-        meta: `${site.baseUrl || '-'} · 优先级 ${site.priority ?? 100} · 倍率 ${formatMultiplier(site.multiplier)}`,
+        meta: `${site.baseUrl || '-'} · 优先级 ${site.priority ?? 100} · 实际倍率 ${formatEffectiveMultiplier(site)}`,
         checked: shouldDefaultChecked || previousCheckedIds.has(site.id)
       })
     )
@@ -391,7 +722,7 @@ function renderImportPreview() {
       createConfigSiteOption({
         id: site.sourceId,
         name: site.name,
-        meta: `${site.baseUrl || '-'} · 优先级 ${site.priority ?? 100} · 倍率 ${formatMultiplier(site.multiplier)}`,
+        meta: `${site.baseUrl || '-'} · 优先级 ${site.priority ?? 100} · 实际倍率 ${formatEffectiveMultiplier(site)}`,
         checked: shouldDefaultChecked || previousCheckedIds.has(site.sourceId)
       })
     )
@@ -547,9 +878,11 @@ function renderSiteListItem(item = document.createElement('div'), site) {
 
   main.append(text, status);
   main.addEventListener('click', () => {
-    selectedSiteId = site.id;
-    formDirty = false;
-    render();
+    requestEditorNavigation(() => {
+      selectedSiteId = site.id;
+      setWorkspaceView('sites');
+      render();
+    });
   });
 
   const actions = document.createElement('div');
@@ -643,12 +976,13 @@ function getSiteEditorControlRoots() {
     elements.name,
     elements.baseUrl,
     elements.apiKey,
-    elements.testModel,
     elements.siteModelMappingEnabled,
     elements.siteModelMappingRows,
     elements.siteModelMapping,
     elements.priority,
     elements.multiplier,
+    elements.customMultiplierEnabled,
+    elements.customMultiplier,
     elements.multiplierLocked,
     elements.remark,
     elements.syncEnabled,
@@ -667,6 +1001,8 @@ function getSiteEditorControlRoots() {
     elements.autoRecoveryEnabled,
     elements.autoRecoveryIntervalValue,
     elements.autoRecoveryIntervalUnit,
+    elements.siteMonitoringEnabled,
+    elements.siteBalanceThreshold,
     elements.enabled
   ].filter(Boolean);
 }
@@ -674,9 +1010,11 @@ function getSiteEditorControlRoots() {
 function getProxyControlRoots() {
   return [
     elements.proxyPort,
+    elements.allowLanAccess,
     elements.proxyTimeoutSeconds,
     elements.proxyReplayBufferMb,
     elements.failureThreshold,
+    elements.globalTestModel,
     elements.smartSwitching,
     elements.priorityMode,
     elements.samePriorityStrategy,
@@ -690,6 +1028,15 @@ function getProxyControlRoots() {
     elements.siteSyncIntelligentScheduling,
     elements.groupSyncIntervalValue,
     elements.groupSyncIntervalUnit,
+    elements.monitoringEnabled,
+    elements.feishuWebhook,
+    elements.monitoringMultiplierChanged,
+    elements.monitoringLowBalance,
+    elements.monitoringNoUsableSite,
+    elements.noUsableSiteDelayMinutes,
+    elements.monitoringProgramIssues,
+    elements.monitoringAnswerCompleted,
+    elements.monitoringGoalStatusChanged,
     elements.configExportGlobalSettings,
     elements.configExportMode,
     elements.configExportSelectedSites,
@@ -781,6 +1128,9 @@ function renderTopbarSyncGroups() {
     : null;
   elements.clearSiteGroupFilter.hidden = !filteredSite;
   elements.clearSiteGroupFilter.textContent = filteredSite ? `清除 ${filteredSite.name}` : '清除筛选';
+  if (selectedGroupAction) {
+    groupPopoverAnchor = findGroupPopoverAnchor();
+  }
 }
 
 function renderTopbarSyncGroupButton(entry) {
@@ -789,19 +1139,194 @@ function renderTopbarSyncGroupButton(entry) {
   button.className = [
     'sync-group-chip',
     'topbar-sync-group-chip',
-    entry.filterKey === selectedGroupFilterKey ? 'active' : ''
+    isSelectedGroupAction(entry) ? 'active' : '',
+    selectedGroupFilterKey === entry.filterKey ? 'filtered' : ''
   ].filter(Boolean).join(' ');
   button.dataset.siteId = entry.site.id;
   button.dataset.filterKey = entry.filterKey;
+  button.dataset.groupId = entry.group.id ?? '';
+  button.dataset.groupName = entry.group.name;
+  button.setAttribute('aria-haspopup', 'dialog');
+  button.setAttribute('aria-expanded', String(isSelectedGroupAction(entry)));
+  button.setAttribute('aria-pressed', String(selectedGroupFilterKey === entry.filterKey));
   button.title = formatGroupTooltip(entry);
-  button.textContent = formatGroupChipLabel(entry.group);
+  button.textContent = formatGroupChipLabel(entry.group, entry.effectiveMultiplier);
   button.addEventListener('click', () => {
-    selectedGroupFilterKey = entry.filterKey;
-    selectedSiteId = entry.site.id;
-    formDirty = false;
-    render();
+    selectedGroupAction = {
+      siteId: entry.site.id,
+      groupId: entry.group.id,
+      groupName: entry.group.name,
+      filterKey: entry.filterKey
+    };
+    renderTopbarSyncGroups();
+    renderSiteGroupPopover();
+    groupPopoverAnchor = findGroupPopoverAnchor();
+    positionSiteGroupPopover(groupPopoverAnchor);
+    elements.siteGroupPopoverClose.focus();
   });
   return button;
+}
+
+function findGroupPopoverAnchor() {
+  if (!selectedGroupAction) {
+    return null;
+  }
+  return [...elements.topbarSyncGroups.children].find((candidate) =>
+    candidate.dataset.siteId === selectedGroupAction.siteId &&
+      (
+        (selectedGroupAction.groupId && candidate.dataset.groupId === selectedGroupAction.groupId) ||
+        candidate.dataset.groupName === selectedGroupAction.groupName
+      )
+  ) ?? null;
+}
+
+function isSelectedGroupAction(entry) {
+  return Boolean(
+    selectedGroupAction &&
+      selectedGroupAction.siteId === entry.site.id &&
+      selectedGroupAction.groupName === entry.group.name
+  );
+}
+
+function resolveSelectedGroupAction() {
+  if (!selectedGroupAction) {
+    return null;
+  }
+  const site = state.sites.find((candidate) => candidate.id === selectedGroupAction.siteId);
+  if (!site) {
+    return null;
+  }
+  const groups = normalizeRemoteGroups(site.sync?.remote?.groups);
+  const group = groups.find((candidate) =>
+    (selectedGroupAction.groupId && candidate.id === selectedGroupAction.groupId) ||
+    candidate.name === selectedGroupAction.groupName
+  );
+  if (!group) {
+    return null;
+  }
+  return {
+    site,
+    group,
+    filterKey: selectedGroupAction.filterKey || getSiteGroupFilterKey(site),
+    effectiveMultiplier: calculateEffectiveGroupMultiplier(site, group)
+  };
+}
+
+function renderSiteGroupPopover() {
+  const entry = resolveSelectedGroupAction();
+  if (!entry) {
+    selectedGroupAction = null;
+    elements.siteGroupPopover.hidden = true;
+    return;
+  }
+
+  const remote = entry.site.sync?.remote ?? {};
+  elements.siteGroupPopover.hidden = false;
+  elements.siteGroupPopoverTitle.textContent =
+    `${entry.group.name} · ${formatGroupMultiplierText(entry.effectiveMultiplier)}`;
+  elements.siteGroupPopoverMeta.innerHTML = [
+    ['关联站点', entry.site.name],
+    ['账户余额', remote.balance || '-'],
+    ['远端倍率', formatGroupMultiplierText(entry.group.multiplier)],
+    ['实际倍率', formatGroupMultiplierText(entry.effectiveMultiplier)],
+    ['当前远端分组', remote.keyGroup || '-']
+  ].map(([label, value]) => `
+    <div class="group-popover-meta-row">
+      <span>${escapeHtml(String(label))}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+    </div>
+  `).join('');
+  elements.siteGroupPopoverSwitch.disabled = Boolean(entry.group.selected);
+  elements.siteGroupPopoverSwitch.textContent = entry.group.selected ? '当前分组' : '切换分组';
+  positionSiteGroupPopover(groupPopoverAnchor);
+}
+
+function positionSiteGroupPopover(anchor = groupPopoverAnchor) {
+  if (elements.siteGroupPopover.hidden || !anchor?.getBoundingClientRect) {
+    return;
+  }
+
+  const anchorRect = anchor.getBoundingClientRect();
+  const viewportPadding = 14;
+  const gap = 12;
+  const popoverWidth = elements.siteGroupPopover.offsetWidth || 348;
+  const popoverHeight = elements.siteGroupPopover.offsetHeight || 260;
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  let left = anchorRect.right + gap;
+  let top = anchorRect.top;
+
+  if (left + popoverWidth > viewportWidth - viewportPadding) {
+    left = anchorRect.left - popoverWidth - gap;
+  }
+  if (left < viewportPadding) {
+    left = Math.max(viewportPadding, viewportWidth - popoverWidth - viewportPadding);
+  }
+  if (top + popoverHeight > viewportHeight - viewportPadding) {
+    top = viewportHeight - popoverHeight - viewportPadding;
+  }
+
+  elements.siteGroupPopover.style.left = `${Math.round(Math.max(viewportPadding, left))}px`;
+  elements.siteGroupPopover.style.top = `${Math.round(Math.max(viewportPadding, top))}px`;
+}
+
+function closeSiteGroupPopover() {
+  selectedGroupAction = null;
+  groupPopoverAnchor = null;
+  elements.siteGroupPopover.hidden = true;
+  renderTopbarSyncGroups();
+  elements.topbarSyncGroups.focus?.();
+}
+
+function requestEditorNavigation(action) {
+  if (!formDirty) {
+    action();
+    return;
+  }
+  pendingEditorNavigation = action;
+  elements.unsavedChangesDialog.hidden = false;
+  if (typeof elements.unsavedChangesDialog.showModal === 'function' && !elements.unsavedChangesDialog.open) {
+    elements.unsavedChangesDialog.showModal();
+  }
+}
+
+function closeUnsavedChangesDialog() {
+  if (typeof elements.unsavedChangesDialog.close === 'function' && elements.unsavedChangesDialog.open) {
+    elements.unsavedChangesDialog.close();
+  }
+  elements.unsavedChangesDialog.hidden = true;
+}
+
+function cancelEditorNavigation() {
+  pendingEditorNavigation = null;
+  closeUnsavedChangesDialog();
+}
+
+function continueEditorNavigation() {
+  const action = pendingEditorNavigation;
+  pendingEditorNavigation = null;
+  closeUnsavedChangesDialog();
+  action?.();
+}
+
+async function persistSiteEditor() {
+  const payload = readSiteFormPayload(getSelectedSite());
+  const id = elements.siteId.value;
+  state = id ? await api.updateSite(id, payload) : await api.addSite(payload);
+  selectedSiteId = id || state.sites.at(-1)?.id || state.activeSiteId;
+  if (typeof api.updateMonitoringRule === 'function') {
+    state = await api.updateMonitoringRule(selectedSiteId, readMonitoringRuleFormPayload());
+  }
+  formDirty = false;
+  return selectedSiteId;
+}
+
+function readMonitoringRuleFormPayload() {
+  const threshold = elements.siteBalanceThreshold.value.trim();
+  return {
+    enabled: elements.siteMonitoringEnabled.checked,
+    balanceThreshold: threshold === '' ? null : Number(threshold)
+  };
 }
 
 function renderEditor() {
@@ -817,7 +1342,6 @@ function renderEditor() {
   elements.baseUrl.value = site?.baseUrl ?? '';
   elements.apiKey.value = site?.apiKey ?? '';
   elements.apiKey.type = 'password';
-  elements.testModel.value = site?.testModel ?? 'example-chat-model';
   elements.siteModelMappingEnabled.checked = site?.modelMapping?.enabled ?? false;
   renderModelMappingEditor({
     rowsElement: elements.siteModelMappingRows,
@@ -826,9 +1350,12 @@ function renderEditor() {
   });
   elements.priority.value = site?.priority ?? 100;
   elements.multiplier.value = site?.multiplier ?? 1;
+  elements.customMultiplierEnabled.checked = site?.customMultiplier !== null && site?.customMultiplier !== undefined;
+  elements.customMultiplier.value = site?.customMultiplier ?? 1;
   elements.multiplierLocked.checked = site?.multiplierLocked ?? false;
   elements.remark.value = site?.remark ?? '';
   elements.syncEnabled.checked = site?.sync?.enabled ?? false;
+  renderRemoteAccountSelector(site);
   elements.syncDashboardUrl.value = site?.sync?.dashboardUrl ?? '';
   elements.syncUsername.value = site?.sync?.username ?? '';
   elements.syncPassword.value = site?.sync?.password ?? '';
@@ -848,7 +1375,10 @@ function renderEditor() {
   elements.autoRecoveryEnabled.checked = site?.autoRecovery?.enabled ?? false;
   elements.autoRecoveryIntervalValue.value = site?.autoRecovery?.intervalValue ?? 1;
   elements.autoRecoveryIntervalUnit.value = site?.autoRecovery?.intervalUnit ?? 'minute';
+  renderSiteMonitoring(site);
   elements.enabled.checked = site?.manualEnabled ?? site?.enabled ?? true;
+  updateCustomMultiplierState();
+  renderMultiplierPreview(site);
 
   renderSetActiveAction(site);
   elements.testSite.disabled = !hasSite;
@@ -872,6 +1402,76 @@ function renderEditor() {
   renderOverview(site);
   renderStatus(site);
   renderErrorLog(site);
+}
+
+function renderSiteMonitoring(site) {
+  const accountId = String(site?.sync?.accountId ?? '');
+  const rule = getMonitoringRule(accountId);
+  const enabled = rule?.enabled ?? true;
+  elements.siteMonitoringEnabled.checked = enabled;
+  elements.siteMonitoringEnabled.disabled = !site || !accountId;
+  elements.siteBalanceThreshold.value = rule?.balanceThreshold ?? '';
+  elements.siteBalanceThreshold.disabled = !site || !accountId || !site.sync?.enabled || !enabled;
+  elements.siteMonitoringAccount.textContent = !site
+    ? '保存站点后可配置余额提醒'
+    : accountId && site.sync?.enabled
+      ? `当前账号：${site.sync?.username || accountId}（同账号关联站点共用此配置）`
+      : accountId
+        ? '当前站点未启用账号同步，余额提醒暂不可用'
+        : '当前站点未关联远端账号，余额提醒暂不可用';
+}
+
+function getMonitoringRule(accountId) {
+  return state.monitoring?.rules?.find((candidate) =>
+    String(candidate.accountId ?? '') === String(accountId ?? '')
+  );
+}
+
+function renderRemoteAccountSelector(site) {
+  const accounts = Array.isArray(state.remoteAccounts) ? state.remoteAccounts : [];
+  const options = [createSelectOption('', '新账号')];
+  for (const account of accounts) {
+    const label = [account.username || '未命名账号', formatAccountWebsite(account.dashboardUrl)]
+      .filter(Boolean)
+      .join(' · ');
+    options.push(createSelectOption(account.id, label));
+  }
+  replaceChildren(elements.syncAccount, options);
+  elements.syncAccount.value = site?.sync?.accountId ?? '';
+
+  const account = accounts.find((candidate) => candidate.id === site?.sync?.accountId);
+  if (!account) {
+    elements.syncAccountSummary.textContent = site
+      ? '保存后可在多个站点间共享登录配置'
+      : '请先保存站点，再启用远端账号';
+    elements.logoutSiteAccount.disabled = true;
+    return;
+  }
+  elements.syncAccountSummary.textContent = [
+    `关联 ${account.linkedSiteCount ?? 1} 个站点`,
+    account.hasSession ? '凭证已保存' : '当前未登录',
+    account.lastLoginAt ? `登录 ${formatLocalDateTime(account.lastLoginAt)}` : null
+  ].filter(Boolean).join(' · ');
+  elements.logoutSiteAccount.disabled = !account.hasSession;
+}
+
+function createSelectOption(value, label) {
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = label;
+  return option;
+}
+
+function formatAccountWebsite(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return String(value ?? '').trim();
+  }
+}
+
+function getRemoteAccountSync(accountId) {
+  return state.sites.find((site) => site.sync?.accountId === accountId)?.sync ?? null;
 }
 
 function renderSetActiveAction(site) {
@@ -989,7 +1589,6 @@ function readSiteFormPayload(existingSite = null) {
     name: elements.name.value.trim(),
     baseUrl: elements.baseUrl.value.trim(),
     apiKey: elements.apiKey.value.trim(),
-    testModel: elements.testModel.value.trim() || 'example-chat-model',
     modelMapping: readModelMappingFormPayload(
       elements.siteModelMappingEnabled,
       elements.siteModelMappingRows,
@@ -997,6 +1596,7 @@ function readSiteFormPayload(existingSite = null) {
     ),
     priority: Number(elements.priority.value || 100),
     multiplier: readSiteMultiplier(),
+    customMultiplier: readCustomMultiplier(),
     multiplierLocked: elements.multiplierLocked.checked,
     remark: elements.remark.value.trim(),
     sync: readSyncFormPayload(existingSite?.sync),
@@ -1081,13 +1681,15 @@ function renderStatus(site) {
     ['错误停用', site.failureDisabled ? '是' : '否'],
     ['当前站点', site.id === state.activeSiteId ? '是' : '否'],
     ['优先级', site.priority ?? 100],
-    ['倍率', formatMultiplier(site.multiplier)],
+    ['真实倍率', formatMultiplier(site.multiplier)],
+    ['账号倍率', formatOptionalMultiplier(site.sync?.remote?.groupMultiplier)],
+    ['自定义倍数', formatOptionalMultiplier(site.customMultiplier)],
+    ['实际倍率', formatEffectiveMultiplier(site)],
     ['模型映射', formatModelMappingSummary(site.modelMapping, state.modelMapping)],
     ['远端同步', formatSyncSummary(site.sync)],
     ['远端余额', site.sync?.remote?.balance || '-'],
     ['远端密钥', site.sync?.remote?.keyName || '-'],
     ['远端分组', site.sync?.remote?.keyGroup || '-'],
-    ['远端倍率', formatOptionalMultiplier(site.sync?.remote?.groupMultiplier)],
     ['速率限制', formatRateLimitSummary(site)],
     ['错误停用后自检', formatAutoRecoverySummary(site)],
     ['自检结果', formatAutoRecoveryResult(site)],
@@ -1135,6 +1737,315 @@ function renderErrorLog(site) {
       `;
     })
     .join('');
+}
+
+function renderRouteTraces() {
+  if (!elements.routeTraceLog || !elements.routeTraceSummary) {
+    return;
+  }
+
+  const traces = Array.isArray(state?.recentRouteTraces) ? state.recentRouteTraces : [];
+  elements.routeTraceSummary.textContent = `${traces.length} 条`;
+  if (!traces.length) {
+    elements.routeTraceLog.innerHTML = '<div class="empty">暂无请求路由。</div>';
+    return;
+  }
+
+  elements.routeTraceLog.innerHTML = traces
+    .slice(0, 20)
+    .map(renderRouteTraceEntry)
+    .join('');
+}
+
+function renderActivityView() {
+  if (!elements.activityLogList) {
+    return;
+  }
+
+  renderActivityMonitorStatus();
+  const category = normalizeActivityCategoryFilter(selectedActivityCategory);
+  const status = normalizeActivityStatusFilter(selectedActivityStatus);
+  const visibleEntries = activityLogs.filter((entry) => {
+    const entryCategory = getActivityCategory(entry);
+    const entryStatus = getActivityStatus(entry);
+    return (category === 'all' || entryCategory === category) &&
+      (status === 'all' || entryStatus === status);
+  });
+
+  elements.activityCategoryFilter.value = category;
+  elements.activityStatusFilter.value = status;
+  elements.activityLogSummary.textContent = category === 'all' && status === 'all'
+    ? `${activityLogs.length} 条`
+    : `显示 ${visibleEntries.length} / ${activityLogs.length} 条`;
+
+  if (!visibleEntries.length) {
+    elements.activityLogList.innerHTML = '<div class="empty">暂无符合条件的运行记录。</div>';
+    return;
+  }
+
+  elements.activityLogList.innerHTML = visibleEntries
+    .map(renderActivityLogEntry)
+    .join('');
+}
+
+function renderActivityMonitorStatus() {
+  const status = state?.siteSyncStatus ?? {};
+  const monitoring = Boolean(status.monitoring);
+  const checking = Boolean(status.checking);
+  const statusLabel = !monitoring ? '未启动' : checking ? '检查中' : '监控中';
+  const statusClassName = !monitoring ? 'idle' : checking ? 'running' : 'success';
+  elements.activityMonitorStatus.textContent = statusLabel;
+  elements.activityMonitorStatus.className = `status-pill ${statusClassName}`;
+  elements.activityMonitorSummary.textContent = monitoring
+    ? `每 ${formatMonitorInterval(status.intervalMs)} 扫描一次，到期站点按分组刷新间隔执行`
+    : '自动监控未启动';
+  elements.activityMonitorChecking.textContent = checking ? '正在检查' : '空闲';
+  elements.activityMonitorLastCheck.textContent = formatLocalDateTime(
+    status.lastCheckCompletedAt ?? status.lastCheckStartedAt
+  );
+  elements.activityMonitorNextCheck.textContent = monitoring
+    ? formatLocalDateTime(status.nextCheckAt)
+    : '-';
+  elements.activityMonitorCounts.textContent = [
+    `检查 ${status.checkedWebsiteCount ?? 0}`,
+    `成功 ${status.syncedWebsiteCount ?? 0}`,
+    `失败 ${status.failedWebsiteCount ?? 0}`
+  ].join(' · ');
+}
+
+function renderActivityLogEntry(entry = {}) {
+  const context = entry.context && typeof entry.context === 'object' ? entry.context : {};
+  const category = getActivityCategory(entry);
+  const status = getActivityStatus(entry);
+  const detail = [
+    context.siteName ? `站点：${context.siteName}` : null,
+    context.groupName ? `分组：${context.groupName}` : null,
+    Number.isFinite(Number(context.candidateMultiplier))
+      ? `候选倍率：${formatActivityMultiplier(context.candidateMultiplier)}x`
+      : null,
+    Number.isFinite(Number(context.currentLowestMultiplier))
+      ? `当前最低：${formatActivityMultiplier(context.currentLowestMultiplier)}x`
+      : null,
+    context.trigger === 'scheduled' ? '来源：自动监控' : null,
+    context.nextAttemptAt ? `下次重试：${formatLocalDateTime(context.nextAttemptAt)}` : null,
+    context.rolledBack ? '远端密钥：已执行回滚' : null
+  ].filter(Boolean);
+
+  return `
+    <article class="activity-entry ${activityStatusClass(status)}">
+      <header class="activity-entry-header">
+        <div>
+          <strong>${escapeHtml(String(entry.message ?? formatActivityType(context.type)))}</strong>
+          <span>${escapeHtml(formatLocalDateTime(entry.timestamp))}</span>
+        </div>
+        <mark class="activity-entry-status ${activityStatusClass(status)}">${escapeHtml(formatActivityStatus(status))}</mark>
+      </header>
+      <div class="activity-entry-meta">
+        <span>${escapeHtml(formatActivityCategory(category))}</span>
+        ${context.type ? `<span>${escapeHtml(formatActivityType(context.type))}</span>` : ''}
+        ${detail.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}
+      </div>
+    </article>
+  `;
+}
+
+function getActivityCategory(entry = {}) {
+  const contextCategory = entry.context?.category;
+  if (contextCategory === 'sync' || contextCategory === 'auto-provision') {
+    return contextCategory;
+  }
+  const source = String(entry.source ?? '');
+  return source.includes('auto-provision') ? 'auto-provision' : source.includes('sync') ? 'sync' : 'all';
+}
+
+function getActivityStatus(entry = {}) {
+  const contextStatus = entry.context?.status;
+  if (['running', 'success', 'skipped', 'failure'].includes(contextStatus)) {
+    return contextStatus;
+  }
+  if (entry.level === 'error') {
+    return 'failure';
+  }
+  if (entry.level === 'warn') {
+    return 'skipped';
+  }
+  return 'success';
+}
+
+function normalizeActivityCategoryFilter(value) {
+  return ['all', 'sync', 'auto-provision'].includes(value) ? value : 'all';
+}
+
+function normalizeActivityStatusFilter(value) {
+  return ['all', 'running', 'success', 'skipped', 'failure'].includes(value) ? value : 'all';
+}
+
+function formatActivityCategory(category) {
+  return category === 'sync' ? '远端同步' : category === 'auto-provision' ? '自动导入' : '运行活动';
+}
+
+function formatActivityStatus(status) {
+  return {
+    running: '进行中',
+    success: '成功',
+    skipped: '已跳过',
+    failure: '失败'
+  }[status] ?? '未知';
+}
+
+function formatActivityType(type) {
+  return {
+    'sync-started': '开始同步',
+    'sync-completed': '同步完成',
+    'sync-failed': '同步失败',
+    'candidate-found': '发现候选分组',
+    'key-created': '密钥已创建',
+    'test-passed': '模型测试通过',
+    imported: '已导入配置',
+    'not-beneficial': '倍率不具备优势',
+    cooldown: '处于失败冷却期',
+    'no-candidate': '未发现候选分组',
+    'create-failed': '创建密钥失败',
+    'test-failed': '模型测试失败',
+    'import-failed': '导入配置失败'
+  }[type] ?? '运行活动';
+}
+
+function activityStatusClass(status) {
+  return status === 'success' ? 'success' : status === 'failure' ? 'failure' : status === 'running' ? 'running' : 'skipped';
+}
+
+function formatActivityMultiplier(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Number(number.toPrecision(8)).toString() : '-';
+}
+
+function formatMonitorInterval(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    return '定时';
+  }
+  const minutes = Math.round(milliseconds / 60_000);
+  if (minutes >= 60 && minutes % 60 === 0) {
+    return `${minutes / 60} 小时`;
+  }
+  return `${Math.max(minutes, 1)} 分钟`;
+}
+
+function renderInspectorRoutes() {
+  const traces = Array.isArray(state?.recentRouteTraces) ? state.recentRouteTraces : [];
+  if (!traces.length) {
+    elements.inspectorRouteLog.innerHTML = '<div class="empty compact-empty">暂无请求路由</div>';
+    return;
+  }
+
+  elements.inspectorRouteLog.innerHTML = traces.slice(0, 3).map((trace) => {
+    const attempts = Array.isArray(trace.attempts) ? trace.attempts : [];
+    const finalAttempt = attempts.at(-1);
+    const status = trace.finalStatusCode ? `HTTP ${trace.finalStatusCode}` : formatRouteTraceOutcome(trace.outcome);
+    return `
+      <article class="inspector-route-entry ${trace.outcome === 'success' ? 'success' : 'error'}">
+        <div>
+          <strong>${escapeHtml(`${trace.method ?? '-'} ${trace.path ?? '/'}`)}</strong>
+          <small>${escapeHtml(`${finalAttempt?.siteName ?? finalAttempt?.siteId ?? '未路由'} · ${formatRouteTraceDuration(trace.durationMs)}`)}</small>
+        </div>
+        <span>${escapeHtml(status)}</span>
+      </article>
+    `;
+  }).join('');
+}
+
+function renderRouteTraceEntry(trace = {}) {
+  const attempts = Array.isArray(trace.attempts) ? trace.attempts : [];
+  const statusLabel = trace.finalStatusCode ? `HTTP ${trace.finalStatusCode}` : formatRouteTraceOutcome(trace.outcome);
+  const queryKeys = Array.isArray(trace.queryKeys) && trace.queryKeys.length
+    ? ` ?${trace.queryKeys.join('&')}`
+    : '';
+  const badges = [
+    trace.requestLocalFailover ? '本次请求切换' : null,
+    trace.globalSelectionPreserved ? '全局选择未改变' : null,
+    trace.replayable ? '可重放' : '不可重放'
+  ].filter(Boolean);
+
+  return `
+    <article class="route-trace-entry ${trace.requestLocalFailover ? 'request-local' : ''}">
+      <header class="route-trace-entry-header">
+        <div>
+          <strong>${escapeHtml(`${trace.method ?? '-'} ${trace.path ?? '/'}${queryKeys}`)}</strong>
+          <span>${escapeHtml(`${formatLocalDateTime(trace.completedAt ?? trace.startedAt)} · ${formatRouteTraceDuration(trace.durationMs)}`)}</span>
+        </div>
+        <mark class="route-trace-status ${trace.outcome === 'success' ? 'success' : 'error'}">${escapeHtml(statusLabel)}</mark>
+      </header>
+      <div class="route-trace-meta">
+        <span>${escapeHtml(formatRouteTraceModel(trace))}</span>
+        <span>${escapeHtml(`尝试 ${attempts.length}`)}</span>
+        ${badges.map((badge) => `<span>${escapeHtml(badge)}</span>`).join('')}
+      </div>
+      <ol class="route-trace-attempts">
+        ${attempts.map(renderRouteTraceAttempt).join('')}
+      </ol>
+    </article>
+  `;
+}
+
+function renderRouteTraceAttempt(attempt = {}) {
+  const statusLabel = attempt.statusCode ? `HTTP ${attempt.statusCode}` : formatRouteTraceOutcome(attempt.kind);
+  const reason = attempt.classification?.reason ?? attempt.errorMessage ?? '';
+  const retryLabel = attempt.classification
+    ? [
+      attempt.classification.retryable ? '可重试' : '不重试',
+      attempt.classification.requestLocalRetry ? '单请求切换' : null,
+      attempt.classification.affectsSiteHealth ? '影响健康' : '不影响健康'
+    ].filter(Boolean).join(' · ')
+    : '';
+
+  return `
+    <li class="${attempt.ok ? 'success' : 'error'}">
+      <div class="route-trace-attempt-main">
+        <strong>${escapeHtml(attempt.siteName ?? attempt.siteId ?? '未知站点')}</strong>
+        <span>${escapeHtml(statusLabel)}</span>
+      </div>
+      ${retryLabel ? `<small>${escapeHtml(retryLabel)}</small>` : ''}
+      ${reason ? `<code>${escapeHtml(reason)}</code>` : ''}
+    </li>
+  `;
+}
+
+function formatRouteTraceModel(trace = {}) {
+  if (trace.modelMapped) {
+    return `模型 ${trace.originalModel ?? '-'} -> ${trace.forwardedModel ?? '-'}`;
+  }
+  return `模型 ${trace.forwardedModel ?? trace.originalModel ?? '-'}`;
+}
+
+function formatRouteTraceDuration(durationMs) {
+  const value = Number(durationMs);
+  if (!Number.isFinite(value) || value < 0) {
+    return '-';
+  }
+  if (value < 1000) {
+    return `${Math.round(value)} ms`;
+  }
+  return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} s`;
+}
+
+function formatRouteTraceOutcome(outcome) {
+  switch (outcome) {
+    case 'success':
+      return '成功';
+    case 'upstream-error':
+      return '上游错误';
+    case 'network-error':
+      return '网络错误';
+    case 'no-site':
+      return '无可用站点';
+    case 'aborted':
+      return '已中断';
+    case 'proxy-error':
+      return '代理错误';
+    default:
+      return '未知';
+  }
 }
 
 function getSelectedSite() {
@@ -1207,6 +2118,34 @@ for (const [period, button] of dashboardPeriodButtons) {
   });
 }
 
+for (const [view, button] of workspaceViewButtons) {
+  button.addEventListener('click', () => {
+    switchWorkspaceView(view);
+  });
+}
+
+for (const [tab, button] of siteTabButtons) {
+  button.addEventListener('click', () => {
+    selectedSiteTab = tab;
+    renderSiteTabs();
+  });
+}
+
+elements.toggleSiteInspector.addEventListener('click', () => {
+  siteInspectorOpen = !siteInspectorOpen;
+  renderSiteInspector();
+});
+
+elements.closeSiteInspector.addEventListener('click', () => {
+  siteInspectorOpen = false;
+  renderSiteInspector();
+  elements.toggleSiteInspector.focus();
+});
+
+elements.openRequestTraces.addEventListener('click', () => {
+  switchWorkspaceView('diagnostics');
+});
+
 elements.siteStatusFilter.addEventListener('change', () => {
   selectedSiteStatusFilter = normalizeSiteStatusFilter(elements.siteStatusFilter.value);
   renderSiteList();
@@ -1215,6 +2154,41 @@ elements.siteStatusFilter.addEventListener('change', () => {
 elements.siteSort.addEventListener('change', () => {
   selectedSiteSort = normalizeSiteSort(elements.siteSort.value);
   renderSiteList();
+});
+
+elements.activityCategoryFilter?.addEventListener('change', () => {
+  selectedActivityCategory = normalizeActivityCategoryFilter(elements.activityCategoryFilter.value);
+  renderActivityView();
+});
+
+elements.activityStatusFilter?.addEventListener('change', () => {
+  selectedActivityStatus = normalizeActivityStatusFilter(elements.activityStatusFilter.value);
+  renderActivityView();
+});
+
+elements.refreshActivityLogs?.addEventListener('click', async () => {
+  await runAction(async () => {
+    await refreshActivityLogs();
+    showToast('运行日志已刷新');
+  });
+});
+
+elements.clearActivityLogs?.addEventListener('click', async () => {
+  if (typeof api.clearActivityLogs !== 'function') {
+    return;
+  }
+  if (!confirm('确定清空所有运行日志吗？')) {
+    return;
+  }
+  await runAction(async () => {
+    const result = await api.clearActivityLogs();
+    if (result?.ok === false) {
+      throw new Error('运行日志清空失败');
+    }
+    activityLogs = [];
+    renderActivityView();
+    showToast('运行日志已清空');
+  });
 });
 
 elements.configExportMode.addEventListener('change', () => {
@@ -1256,6 +2230,19 @@ elements.applyImportConfig.addEventListener('click', async () => {
   });
 });
 
+elements.quitApp.addEventListener('click', async () => {
+  if (!confirm('退出 JuanProxy？本地代理、后台同步和悬浮窗都会停止。')) {
+    return;
+  }
+  elements.quitApp.disabled = true;
+  try {
+    await api.quitApp();
+  } catch (error) {
+    elements.quitApp.disabled = false;
+    showToast(error?.message || String(error));
+  }
+});
+
 elements.refreshSiteSyncAll.addEventListener('click', async () => {
   await runAction(async () => {
     state = await api.refreshAllSiteSync();
@@ -1278,6 +2265,49 @@ elements.clearSiteGroupFilter.addEventListener('click', () => {
   renderTopbarSyncGroups();
 });
 
+elements.siteGroupPopoverClose.addEventListener('click', () => {
+  closeSiteGroupPopover();
+});
+
+elements.siteGroupPopoverViewSite.addEventListener('click', () => {
+  const entry = resolveSelectedGroupAction();
+  if (!entry) {
+    return;
+  }
+  closeSiteGroupPopover();
+  requestEditorNavigation(() => {
+    selectedSiteId = entry.site.id;
+    selectedSiteTab = 'overview';
+    setWorkspaceView('sites');
+    render();
+  });
+});
+
+elements.siteGroupPopoverFilter.addEventListener('click', () => {
+  const entry = resolveSelectedGroupAction();
+  if (!entry) {
+    return;
+  }
+  selectedGroupFilterKey = entry.filterKey;
+  closeSiteGroupPopover();
+  renderSiteList();
+  renderTopbarSyncGroups();
+});
+
+elements.siteGroupPopoverSwitch.addEventListener('click', async () => {
+  const entry = resolveSelectedGroupAction();
+  if (!entry || entry.group.selected) {
+    return;
+  }
+  const switched = await switchSiteGroup(entry.site.id, {
+    groupName: entry.group.name,
+    ...(entry.group.id ? { groupId: entry.group.id } : {})
+  });
+  if (switched) {
+    closeSiteGroupPopover();
+  }
+});
+
 elements.toggleTopbarSyncGroups.addEventListener('click', () => {
   showAllTopbarSyncGroups = !showAllTopbarSyncGroups;
   renderTopbarSyncGroups();
@@ -1287,7 +2317,48 @@ elements.copyProxyUrl.addEventListener('click', async () => {
   await copyProxyUrl();
 });
 
+elements.copyLocalApiKey.addEventListener('click', async () => {
+  if (!visibleLocalApiKey) {
+    return;
+  }
+  await runAction(async () => {
+    await copyTextToClipboard(visibleLocalApiKey);
+    showToast('本地 API 密钥已复制');
+  });
+});
+
+elements.generateLocalApiKey.addEventListener('click', async () => {
+  if (!confirm('重新生成后，正在使用的旧本地 API 密钥会立即失效。继续？')) {
+    return;
+  }
+  await runAction(async () => {
+    const result = await api.generateLocalApiKey();
+    visibleLocalApiKey = result.localApiKey;
+    renderProxy();
+    showToast('新的本地 API 密钥已生成，请立即复制');
+  });
+});
+
 window.addEventListener?.('keydown', async (event) => {
+  if (event.key === 'Escape') {
+    if (!elements.unsavedChangesDialog.hidden) {
+      event.preventDefault?.();
+      cancelEditorNavigation();
+      return;
+    }
+    if (!elements.siteGroupPopover.hidden) {
+      event.preventDefault?.();
+      closeSiteGroupPopover();
+      return;
+    }
+    if (compactInspectorMode && siteInspectorOpen) {
+      event.preventDefault?.();
+      siteInspectorOpen = false;
+      renderSiteInspector();
+      elements.toggleSiteInspector.focus();
+      return;
+    }
+  }
   if (!isCopyProxyUrlShortcut(event)) {
     return;
   }
@@ -1295,19 +2366,81 @@ window.addEventListener?.('keydown', async (event) => {
   await copyProxyUrl();
 });
 
+window.addEventListener?.('resize', () => {
+  const nextCompactMode = window.innerWidth < 1160;
+  if (nextCompactMode === compactInspectorMode) {
+    positionSiteGroupPopover();
+    return;
+  }
+  compactInspectorMode = nextCompactMode;
+  siteInspectorOpen = !compactInspectorMode;
+  renderSiteInspector();
+  positionSiteGroupPopover();
+});
+
+window.addEventListener?.('scroll', () => {
+  positionSiteGroupPopover();
+}, true);
+
 elements.newSite.addEventListener('click', () => {
-  selectedSiteId = null;
+  requestEditorNavigation(() => {
+    selectedSiteId = null;
+    selectedSiteTab = 'basic';
+    setWorkspaceView('sites');
+    render();
+    elements.name.focus();
+  });
+});
+
+elements.unsavedChangesCancel.addEventListener('click', () => {
+  cancelEditorNavigation();
+});
+
+elements.unsavedChangesDiscard.addEventListener('click', () => {
   formDirty = false;
-  render();
-  elements.name.focus();
+  continueEditorNavigation();
+});
+
+elements.unsavedChangesSave.addEventListener('click', async () => {
+  await runAction(async () => {
+    await persistSiteEditor();
+    continueEditorNavigation();
+    showToast('站点已保存');
+  });
 });
 
 elements.form.addEventListener('input', () => {
   formDirty = true;
+  renderMultiplierPreview(getSelectedSite());
 });
 
 elements.form.addEventListener('change', () => {
   formDirty = true;
+  renderMultiplierPreview(getSelectedSite());
+});
+
+elements.customMultiplierEnabled.addEventListener('change', () => {
+  updateCustomMultiplierState();
+  renderMultiplierPreview(getSelectedSite());
+});
+
+elements.multiplierLocked.addEventListener('change', () => {
+  updateCustomMultiplierState();
+  renderMultiplierPreview(getSelectedSite());
+});
+
+elements.siteMonitoringEnabled.addEventListener('change', () => {
+  elements.siteBalanceThreshold.disabled =
+    !elements.syncAccount.value || !elements.syncEnabled.checked || !elements.siteMonitoringEnabled.checked;
+});
+
+elements.monitoringNoUsableSite.addEventListener('change', () => {
+  elements.noUsableSiteDelayMinutes.disabled = !elements.monitoringNoUsableSite.checked;
+});
+
+elements.syncEnabled.addEventListener('change', () => {
+  elements.siteBalanceThreshold.disabled =
+    !elements.syncAccount.value || !elements.syncEnabled.checked || !elements.siteMonitoringEnabled.checked;
 });
 
 elements.apiKey.addEventListener('focus', () => {
@@ -1345,11 +2478,7 @@ elements.siteModelMapping.addEventListener('change', () => {
 elements.form.addEventListener('submit', async (event) => {
   event.preventDefault();
   await runAction(async () => {
-    const payload = readSiteFormPayload(getSelectedSite());
-    const id = elements.siteId.value;
-    state = id ? await api.updateSite(id, payload) : await api.addSite(payload);
-    selectedSiteId = id || state.sites.at(-1)?.id || state.activeSiteId;
-    formDirty = false;
+    await persistSiteEditor();
     render();
     showToast('站点已保存');
   });
@@ -1402,11 +2531,57 @@ elements.createSiteKey.addEventListener('click', async () => {
     render();
 
     state = await api.createSiteKey(id);
-    selectedSiteId = id;
+    selectedSiteId = state.createKeyResult?.createdSiteId || id;
     formDirty = false;
     render();
-    showToast(state.createKeyResult?.ok ? '远端密钥已创建' : '远端密钥创建失败');
+    showToast(state.createKeyResult?.ok ? '远端密钥已创建并导入' : '远端密钥创建失败');
   });
+});
+
+elements.logoutSiteAccount.addEventListener('click', async () => {
+  const site = getSelectedSite();
+  if (!site || !api.logoutSiteAccount) {
+    return;
+  }
+  if (!confirm(`确认退出 ${site.sync?.username || site.name} 的远端登录设备？`)) {
+    return;
+  }
+  await runAction(async () => {
+    state = await api.logoutSiteAccount(site.id);
+    selectedSiteId = site.id;
+    formDirty = false;
+    render();
+    if (state.logoutResult?.ok) {
+      showToast(state.logoutResult.remoteSucceeded ? '远端账号已退出' : '本地登录凭证已清除');
+    } else {
+      showToast('远端登出失败，请稍后重试');
+    }
+  });
+});
+
+elements.syncAccount.addEventListener('change', () => {
+  const accountId = elements.syncAccount.value;
+  const sync = getRemoteAccountSync(accountId);
+  if (sync) {
+    elements.syncDashboardUrl.value = sync.dashboardUrl ?? '';
+    elements.syncUsername.value = sync.username ?? '';
+    elements.syncPassword.value = sync.password ?? '';
+    elements.syncProviderType.value = sync.providerType ?? 'auto';
+  } else {
+    elements.syncDashboardUrl.value = '';
+    elements.syncUsername.value = '';
+    elements.syncPassword.value = '';
+    elements.syncProviderType.value = 'auto';
+  }
+  const rule = getMonitoringRule(accountId);
+  elements.siteMonitoringEnabled.checked = rule?.enabled ?? true;
+  elements.siteBalanceThreshold.value = rule?.balanceThreshold ?? '';
+  elements.siteBalanceThreshold.disabled =
+    !accountId || !elements.syncEnabled.checked || !elements.siteMonitoringEnabled.checked;
+  elements.siteMonitoringAccount.textContent = accountId
+    ? `当前账号：${sync?.username || accountId}（同账号关联站点共用此配置）`
+    : '请选择或保存远端账号后配置余额提醒';
+  formDirty = true;
 });
 
 elements.switchSyncGroupId.addEventListener('click', async () => {
@@ -1424,23 +2599,29 @@ async function switchSelectedSiteGroup(group) {
   if (!site || !api.switchSiteGroup) {
     return;
   }
+  await switchSiteGroup(site.id, group);
+}
+
+async function switchSiteGroup(siteId, group) {
+  const site = state.sites.find((candidate) => candidate.id === siteId);
+  if (!site || !api.switchSiteGroup) {
+    return false;
+  }
   const normalizedGroup = normalizeSwitchGroupInput(site, group);
   if (!normalizedGroup.groupName && !normalizedGroup.groupId) {
     showToast('请输入分组 ID');
-    return;
+    return false;
   }
   if (!confirm(formatSwitchGroupConfirmMessage(site, normalizedGroup))) {
-    return;
+    return false;
   }
 
-  await runAction(async () => {
+  return runAction(async () => {
     const switchPayload = normalizedGroup.groupId
       ? normalizedGroup
       : normalizedGroup.groupName;
-    state = await api.switchSiteGroup(site.id, switchPayload);
-    selectedSiteId = site.id;
-    formDirty = false;
-    render();
+    const nextState = await api.switchSiteGroup(site.id, switchPayload);
+    applyState(nextState, { preserveDirtyEditor: true });
     if (group?.groupId && elements.syncGroupId) {
       elements.syncGroupId.value = '';
     }
@@ -1530,6 +2711,7 @@ async function testSiteFromList(siteId) {
   }
   if (!formDirty && selectedSiteId !== siteId) {
     selectedSiteId = siteId;
+    setWorkspaceView('sites');
     render();
   }
   await testSiteById(siteId);
@@ -1661,9 +2843,12 @@ elements.saveProxy.addEventListener('click', async () => {
   await runAction(async () => {
     state = await api.updateProxy({
       port: Number(elements.proxyPort.value),
+      allowLanAccess: elements.allowLanAccess.checked,
       timeoutMs: Number(elements.proxyTimeoutSeconds.value) * 1000,
       maxReplayableRequestBodyBytes: toReplayBufferBytes(elements.proxyReplayBufferMb.value),
+      codexRecoveryEnabled: elements.codexRecoveryEnabled.checked,
       failureThreshold: Number(elements.failureThreshold.value),
+      testModel: elements.globalTestModel.value.trim() || 'example-chat-model',
       smartSwitching: elements.smartSwitching.checked,
       priorityMode: elements.priorityMode.value,
       samePriorityStrategy: elements.samePriorityStrategy.value,
@@ -1700,6 +2885,57 @@ elements.saveSiteSyncSettings.addEventListener('click', async () => {
   });
 });
 
+elements.saveMonitoring.addEventListener('click', async () => {
+  const settings = readMonitoringSettingsFormPayload();
+  if (settings.enabled && !settings.feishuWebhook) {
+    showToast('请先填写飞书 Webhook');
+    elements.feishuWebhook.focus();
+    return;
+  }
+  await runAction(async () => {
+    state = await api.updateMonitoringSettings(settings);
+    render();
+    showToast('飞书监控设置已保存');
+  });
+});
+
+elements.testFeishuWebhook.addEventListener('click', async () => {
+  const webhook = elements.feishuWebhook.value.trim();
+  if (!webhook) {
+    showToast('请先填写飞书 Webhook');
+    elements.feishuWebhook.focus();
+    return;
+  }
+  await runAction(async () => {
+    await api.testFeishuWebhook(webhook);
+    showToast('飞书测试消息已发送');
+  });
+});
+
+elements.installMonitoringTask.addEventListener('click', async () => {
+  const settings = readMonitoringSettingsFormPayload();
+  if (!settings.feishuWebhook) {
+    showToast('请先填写飞书 Webhook');
+    elements.feishuWebhook.focus();
+    return;
+  }
+  await runAction(async () => {
+    state = await api.updateMonitoringSettings({ ...settings, enabled: true });
+    monitoringTaskStatus = await api.installMonitoringTask();
+    render();
+    showToast('飞书监控后台任务已安装并启动');
+  });
+});
+
+elements.removeMonitoringTask.addEventListener('click', async () => {
+  await runAction(async () => {
+    state = await api.updateMonitoringSettings({ enabled: false });
+    monitoringTaskStatus = await api.removeMonitoringTask();
+    render();
+    showToast('飞书监控后台任务已移除');
+  });
+});
+
 elements.restartProxy.addEventListener('click', async () => {
   await runAction(async () => {
     state = await api.restartProxy();
@@ -1716,7 +2952,7 @@ async function copyProxyUrl() {
 
   await runAction(async () => {
     await copyTextToClipboard(proxyUrl);
-    showToast('本机代理地址已复制');
+    showToast('代理地址已复制');
   });
 }
 
@@ -1744,9 +2980,11 @@ function isCopyProxyUrlShortcut(event) {
 async function runAction(action) {
   try {
     await action();
+    return true;
   } catch (error) {
     logRuntimeError('renderer.action-error', error);
     showToast(error.message || String(error));
+    return false;
   }
 }
 
@@ -1892,7 +3130,8 @@ export function formatMultiplier(multiplier) {
   if (!Number.isFinite(number)) {
     return '1';
   }
-  return Number.isInteger(number) ? number.toFixed(0) : String(number);
+  const normalized = number === 0 ? 0 : Number(number.toPrecision(15));
+  return Number.isInteger(normalized) ? normalized.toFixed(0) : String(normalized);
 }
 
 function toReplayBufferMegabytes(bytes) {
@@ -1916,7 +3155,11 @@ function renderMultiplierBadge(site) {
     'site-multiplier-badge',
     hasRecentSyncFailure(site) ? 'is-danger' : ''
   ].filter(Boolean).join(' ');
-  return `<span class="${classes}">倍率 ${escapeHtml(formatMultiplier(site?.multiplier))}</span>`;
+  return `<span class="${classes}">实际倍率 ${escapeHtml(formatEffectiveMultiplier(site))}</span>`;
+}
+
+function formatEffectiveMultiplier(site) {
+  return formatMultiplier(calculateEffectiveMultiplier(site));
 }
 
 function getSiteBalanceText(site) {
@@ -1931,22 +3174,34 @@ export function buildTopSyncedGroups(sites = [], limit = 3) {
     const filterKey = getSiteGroupFilterKey(site);
     const lowestGroup = normalizeRemoteGroups(site?.sync?.remote?.groups)
       .filter((group) => Number.isFinite(group.multiplier))
+      .map((group) => ({
+        group,
+        effectiveMultiplier: calculateEffectiveGroupMultiplier(site, group)
+      }))
       .sort((left, right) => {
         const multiplierOrder = compareNumbersAscending(
-          getSortableGroupMultiplier(left),
-          getSortableGroupMultiplier(right)
+          getSortableGroupMultiplier(left.effectiveMultiplier),
+          getSortableGroupMultiplier(right.effectiveMultiplier)
         );
-        return multiplierOrder !== 0 ? multiplierOrder : left.name.localeCompare(right.name);
+        return multiplierOrder !== 0
+          ? multiplierOrder
+          : left.group.name.localeCompare(right.group.name);
       })[0];
     if (!lowestGroup) {
       continue;
     }
 
+    const candidate = {
+      site,
+      group: lowestGroup.group,
+      effectiveMultiplier: lowestGroup.effectiveMultiplier,
+      filterKey
+    };
     const existing = entriesBySite.get(filterKey);
-    if (existing && compareTopGroupEntries(existing, { site, group: lowestGroup }) <= 0) {
+    if (existing && compareTopGroupEntries(existing, candidate) <= 0) {
       continue;
     }
-    entriesBySite.set(filterKey, { site, group: lowestGroup, filterKey });
+    entriesBySite.set(filterKey, candidate);
   }
 
   return [...entriesBySite.values()]
@@ -1956,8 +3211,8 @@ export function buildTopSyncedGroups(sites = [], limit = 3) {
 
 function compareTopGroupEntries(left, right) {
   const multiplierOrder = compareNumbersAscending(
-    getSortableGroupMultiplier(left.group),
-    getSortableGroupMultiplier(right.group)
+    getSortableGroupMultiplier(left.effectiveMultiplier),
+    getSortableGroupMultiplier(right.effectiveMultiplier)
   );
   if (multiplierOrder !== 0) {
     return multiplierOrder;
@@ -1988,8 +3243,34 @@ function normalizeOptionalGroupMultiplier(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function getSortableGroupMultiplier(group) {
-  return Number.isFinite(group?.multiplier) ? group.multiplier : Number.POSITIVE_INFINITY;
+function getSortableGroupMultiplier(multiplier) {
+  return Number.isFinite(multiplier) ? multiplier : Number.POSITIVE_INFINITY;
+}
+
+function calculateEffectiveGroupMultiplier(site, group) {
+  const remoteMultiplier = normalizeOptionalGroupMultiplier(group?.multiplier);
+  if (!Number.isFinite(remoteMultiplier)) {
+    return null;
+  }
+  return calculateEffectiveMultiplier({
+    ...site,
+    multiplier: remoteMultiplier,
+    sync: {
+      ...site?.sync,
+      remote: {
+        ...site?.sync?.remote,
+        groupMultiplier: remoteMultiplier
+      }
+    }
+  });
+}
+
+function getAppliedGroupCustomMultiplier(site) {
+  if (site?.multiplierLocked) {
+    return 1;
+  }
+  const customMultiplier = Number(site?.customMultiplier);
+  return Number.isFinite(customMultiplier) && customMultiplier > 0 ? customMultiplier : 1;
 }
 
 function normalizePositiveInteger(value, fallback) {
@@ -2028,9 +3309,9 @@ function normalizeGroupFilterKey(value) {
   }
 }
 
-function formatGroupChipLabel(group) {
+function formatGroupChipLabel(group, multiplier = group?.multiplier) {
   const name = String(group?.name ?? '').trim();
-  const multiplierText = formatGroupMultiplierText(group?.multiplier);
+  const multiplierText = formatGroupMultiplierText(multiplier);
   if (multiplierText === '-' || name.toLowerCase().includes(multiplierText.toLowerCase())) {
     return name || '-';
   }
@@ -2048,7 +3329,9 @@ function formatGroupTooltip(entry) {
   return [
     `站点：${entry.site?.name ?? '-'}`,
     `分组：${entry.group.name}`,
-    `倍率：${formatGroupMultiplierText(entry.group.multiplier)}`,
+    `远端倍率：${formatGroupMultiplierText(entry.group.multiplier)}`,
+    `自定义倍数：${formatGroupMultiplierText(getAppliedGroupCustomMultiplier(entry.site))}`,
+    `实际倍率：${formatGroupMultiplierText(entry.effectiveMultiplier)}`,
     remote.balance ? `余额：${remote.balance}` : null,
     remote.keyName ? `密钥：${remote.keyName}` : null,
     sync.dashboardUrl ? `后台：${sync.dashboardUrl}` : null,
@@ -2067,6 +3350,39 @@ function formatOptionalMultiplier(multiplier) {
 function readSiteMultiplier() {
   const number = Number(String(elements.multiplier.value ?? '').trim() || 1);
   return Number.isFinite(number) && number >= 0 ? number : 1;
+}
+
+function readCustomMultiplier() {
+  if (!elements.customMultiplierEnabled.checked) {
+    return null;
+  }
+  const number = Number(String(elements.customMultiplier.value ?? '').trim());
+  if (!Number.isFinite(number) || number <= 0) {
+    throw new Error('自定义倍数必须大于 0');
+  }
+  return number;
+}
+
+function updateCustomMultiplierState() {
+  const locked = elements.multiplierLocked.checked;
+  elements.customMultiplierEnabled.disabled = locked;
+  elements.customMultiplier.disabled = locked || !elements.customMultiplierEnabled.checked;
+}
+
+function renderMultiplierPreview(site) {
+  const accountMultiplier = site?.sync?.remote?.groupMultiplier;
+  const customMultiplier = elements.customMultiplierEnabled.checked
+    ? Number(elements.customMultiplier.value)
+    : null;
+  elements.accountMultiplier.textContent = formatOptionalMultiplier(accountMultiplier);
+  elements.effectiveMultiplier.textContent = formatEffectiveMultiplier({
+    multiplier: readSiteMultiplier(),
+    multiplierLocked: elements.multiplierLocked.checked,
+    customMultiplier: Number.isFinite(customMultiplier) && customMultiplier > 0
+      ? customMultiplier
+      : null,
+    sync: site?.sync
+  });
 }
 
 function readModelMappingFormPayload(enabledInput, rowsElement, label = '模型映射') {
@@ -2312,6 +3628,7 @@ function readSyncFormPayload(existingSync = {}) {
   return {
     ...existingSync,
     enabled: elements.syncEnabled.checked,
+    accountId: elements.syncAccount.value,
     dashboardUrl: elements.syncDashboardUrl.value.trim(),
     username: elements.syncUsername.value.trim(),
     password: elements.syncPassword.value.trim(),
@@ -2477,8 +3794,7 @@ function getSortableSuccessRate(site) {
 }
 
 function getSortableMultiplier(site) {
-  const number = Number(site?.multiplier ?? 1);
-  return Number.isFinite(number) ? number : 1;
+  return calculateEffectiveMultiplier(site);
 }
 
 function parseBalanceAmount(value) {

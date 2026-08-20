@@ -203,6 +203,46 @@ export class RuntimeLogger {
     await this.writeQueue.catch(() => {});
   }
 
+  async readEntries({ limit = 200 } = {}) {
+    await this.flush();
+    let raw;
+    try {
+      raw = await this.read(this.filePath, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
+    const entries = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(parseLogLine)
+      .filter(Boolean);
+    const normalizedLimit = Number.isInteger(Number(limit)) && Number(limit) > 0
+      ? Math.min(Number(limit), 1000)
+      : 200;
+    return entries.slice(-normalizedLimit).reverse();
+  }
+
+  async clear() {
+    const run = this.writeQueue.then(async () => {
+      await this.makeDirectory(dirname(this.filePath), { recursive: true });
+      await this.writeFile(this.filePath, '', 'utf8');
+      return { ok: true, filePath: this.filePath };
+    });
+    this.writeQueue = run.catch(() => {});
+    try {
+      return await run;
+    } catch (error) {
+      return {
+        ok: false,
+        filePath: this.filePath,
+        error: serializeErrorForLog(error)
+      };
+    }
+  }
+
   createEntry({ level, source, message, error, context }) {
     const serializedError = error === undefined || error === null
       ? null
@@ -235,6 +275,19 @@ export function createRuntimeLogger({ userDataPath, appVersion, now } = {}) {
   return new RuntimeLogger({
     directory: join(userDataPath, 'logs'),
     fileName: DEFAULT_FILE_NAME,
+    appVersion,
+    now
+  });
+}
+
+export function createActivityLogger({ userDataPath, appVersion, now } = {}) {
+  if (!userDataPath) {
+    throw new Error('userDataPath is required');
+  }
+
+  return new RuntimeLogger({
+    directory: join(userDataPath, 'logs'),
+    fileName: 'activity-log.jsonl',
     appVersion,
     now
   });
@@ -419,6 +472,15 @@ function isExpiredLogLine(line, nowMs, retentionMs) {
     return Number.isFinite(timestampMs) && nowMs - timestampMs > retentionMs;
   } catch {
     return false;
+  }
+}
+
+function parseLogLine(line) {
+  try {
+    const entry = JSON.parse(line);
+    return entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : null;
+  } catch {
+    return null;
   }
 }
 

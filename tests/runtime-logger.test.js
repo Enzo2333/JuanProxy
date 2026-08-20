@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { RuntimeLogger, createRuntimeLogger, sanitizeLogValue } from '../src/runtime-logger.js';
+import {
+  RuntimeLogger,
+  createActivityLogger,
+  createRuntimeLogger,
+  sanitizeLogValue
+} from '../src/runtime-logger.js';
 
 async function readJsonl(filePath) {
   const raw = await readFile(filePath, 'utf8');
@@ -163,4 +168,31 @@ test('createRuntimeLogger stores logs under the app userData logs directory', ()
   const logger = createRuntimeLogger({ userDataPath: 'C:\\Users\\Example\\AppData\\Roaming\\JuanProxy' });
 
   assert.match(logger.filePath, /logs[\\/]runtime-errors\.jsonl$/);
+});
+
+test('runtime logger reads newest entries first and clears its jsonl file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-runtime-log-read-'));
+  const logger = new RuntimeLogger({ directory: dir });
+
+  try {
+    await logger.info('site-sync', 'first');
+    await logger.warn('auto-provision', 'second');
+    await logger.error('auto-provision', new Error('third'));
+
+    const entries = await logger.readEntries({ limit: 2 });
+    assert.deepEqual(entries.map((entry) => entry.message), ['third', 'second']);
+
+    const result = await logger.clear();
+    assert.equal(result.ok, true);
+    assert.deepEqual(await logger.readEntries(), []);
+    assert.equal(await readFile(logger.filePath, 'utf8'), '');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createActivityLogger stores user activity separately from runtime errors', () => {
+  const logger = createActivityLogger({ userDataPath: 'C:\\Users\\Example\\AppData\\Roaming\\JuanProxy' });
+
+  assert.match(logger.filePath, /logs[\\/]activity-log\.jsonl$/);
 });

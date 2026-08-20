@@ -1,7 +1,16 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+
+import {
+  getRemoteAccountIdentity,
+  hydrateSiteWithRemoteAccount,
+  normalizeRemoteAccount,
+  normalizeRemoteAccountSession,
+  reconcileRemoteAccounts,
+  remoteAccountPublicView
+} from './remote-accounts.js';
 
 import {
   DEFAULT_AUTO_RECOVERY_STATE,
@@ -13,6 +22,7 @@ import {
   DEFAULT_RATE_LIMIT_STATE,
   DEFAULT_SITE_CAPABILITIES,
   DEFAULT_SITE_SYNC_SETTINGS,
+  DEFAULT_TEST_MODEL,
   MAX_ERROR_LOG_SIZE,
   chooseBestSite,
   chooseFailoverSite,
@@ -45,8 +55,26 @@ const DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 const MIN_REPLAYABLE_REQUEST_BODY_BYTES = 1024 * 1024;
 const MAX_REPLAYABLE_REQUEST_BODY_BYTES = 512 * 1024 * 1024;
 
+export const DEFAULT_MONITORING_SETTINGS = {
+  enabled: false,
+  feishuWebhook: '',
+  checkIntervalSeconds: 30,
+  failureThreshold: 3,
+  repeatIntervalMinutes: 30,
+  noUsableSiteDelayMinutes: 5,
+  notifications: {
+    multiplierChanged: true,
+    lowBalance: true,
+    noUsableSite: true,
+    programIssues: true,
+    answerCompleted: false,
+    goalStatusChanged: false
+  },
+  rules: []
+};
+
 export const DEFAULT_STATE = {
-  version: 1,
+  version: 2,
   appSettings: {
     floatingWindow: {
       alwaysOnTop: false,
@@ -55,8 +83,12 @@ export const DEFAULT_STATE = {
   },
   proxy: {
     port: 8787,
+    allowLanAccess: false,
+    localApiKeyHash: '',
+    testModel: DEFAULT_TEST_MODEL,
     timeoutMs: 120000,
     maxReplayableRequestBodyBytes: DEFAULT_MAX_REPLAYABLE_REQUEST_BODY_BYTES,
+    codexRecoveryEnabled: false,
     failureThreshold: DEFAULT_FAILURE_THRESHOLD,
     smartSwitching: false,
     priorityMode: DEFAULT_PRIORITY_MODE,
@@ -67,6 +99,9 @@ export const DEFAULT_STATE = {
   modelMapping: DEFAULT_MODEL_MAPPING,
   siteSync: DEFAULT_SITE_SYNC_SETTINGS,
   groupSync: DEFAULT_GROUP_SYNC_SETTINGS,
+  monitoring: DEFAULT_MONITORING_SETTINGS,
+  autoProvisionAttempts: [],
+  remoteAccounts: [],
   activeSiteId: null,
   sites: []
 };
@@ -90,6 +125,7 @@ export class ConfigService extends EventEmitter {
     this.clearTimer = clearTimer;
     this.pendingSaveTimer = null;
     this.pendingSaveEmit = false;
+    this.siteAvailabilityQueues = new Map();
   }
 
   async load() {
@@ -109,6 +145,9 @@ export class ConfigService extends EventEmitter {
       }
     }
 
+    this.state.sites = unifyWebsiteCustomMultipliers(this.state.sites, {
+      preferNonNull: true
+    });
     this.disableLocalProxySites();
     this.ensureActiveSite();
     this.refreshAutoRecoverySchedules();
@@ -121,12 +160,177 @@ export class ConfigService extends EventEmitter {
     return structuredClone(this.state);
   }
 
+  runSiteAvailabilityCheck(id, operation) {
+    const siteId = String(id ?? '').trim();
+    if (!siteId || typeof operation !== 'function') {
+      throw new Error('site availability check requires a site id and operation');
+    }
+
+    const previous = this.siteAvailabilityQueues.get(siteId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(() => operation());
+    this.siteAvailabilityQueues.set(siteId, current);
+
+    return current.finally(() => {
+      if (this.siteAvailabilityQueues.get(siteId) === current) {
+        this.siteAvailabilityQueues.delete(siteId);
+      }
+    });
+  }
+
+  getRendererState() {
+    const state = this.getState();
+    state.proxy.localApiKey = { configured: Boolean(this.state.proxy.localApiKeyHash) };
+    delete state.proxy.localApiKeyHash;
+    state.remoteAccounts = this.state.remoteAccounts.map((account) => remoteAccountPublicView(
+      account,
+      this.state.sites.filter((site) => site.sync?.accountId === account.id).length
+    ));
+    return state;
+  }
+
+  getRemoteAccountForSite(siteId) {
+    const site = this.findSite(siteId);
+    const account = this.findRemoteAccount(site.sync?.accountId);
+    return account ? structuredClone(account) : null;
+  }
+
+  getRemoteAccountSession(siteId) {
+    return structuredClone(this.getRemoteAccountForSite(siteId)?.session ?? null);
+  }
+
+  getRemoteAccountSites(siteId) {
+    const site = this.findSite(siteId);
+    const accountId = String(site.sync?.accountId ?? '').trim();
+    if (!accountId) {
+      return [structuredClone(site)];
+    }
+    return this.state.sites
+      .filter((candidate) => String(candidate.sync?.accountId ?? '').trim() === accountId)
+      .map((candidate) => structuredClone(candidate));
+  }
+
+  async applyRemoteAccountSyncResults(siteId, result, now = new Date()) {
+    const sourceSite = this.findSite(siteId);
+    const accountId = String(sourceSite.sync?.accountId ?? '').trim();
+    const siteResults = Array.isArray(result?.accountSync?.siteResults)
+      ? result.accountSync.siteResults
+      : [];
+    if (!siteResults.length) {
+      return [];
+    }
+
+    const resultBySiteId = new Map(siteResults.map((entry) => [String(entry.siteId), entry]));
+    const refreshedAt = result.syncPatch?.lastSyncAt ?? nowIso(now);
+    const affectedSites = [];
+    this.state.sites = this.state.sites.map((candidate) => {
+      if (
+        accountId && String(candidate.sync?.accountId ?? '').trim() !== accountId
+      ) {
+        return candidate;
+      }
+      const target = resultBySiteId.get(String(candidate.id));
+      if (!target) {
+        return candidate;
+      }
+      const normalizedSite = normalizeSite(candidate);
+      const nextRemote = target.ok && target.remote
+        ? {
+            ...normalizedSite.sync.remote,
+            ...target.remote
+          }
+        : normalizedSite.sync.remote;
+      const nextSite = normalizeSite({
+        ...normalizedSite,
+        ...(target.ok && shouldPersistSyncedMultiplier(normalizedSite, target.multiplier)
+          ? { multiplier: target.multiplier }
+          : {}),
+        sync: {
+          ...normalizedSite.sync,
+          lastSyncAt: refreshedAt,
+          lastSyncStatus: target.ok ? 'success' : 'failure',
+          lastSyncError: target.ok ? null : String(target.error ?? 'Remote account sync failed'),
+          remote: nextRemote
+        },
+        updatedAt: refreshedAt
+      });
+      affectedSites.push(nextSite);
+      return nextSite;
+    });
+    this.rebuildGroupSyncWebsites();
+    await this.save();
+    return affectedSites.map((site) => structuredClone(site));
+  }
+
+  async updateRemoteAccountSession(siteId, session, now = new Date()) {
+    const site = this.findSite(siteId);
+    const index = this.findRemoteAccountIndex(site.sync?.accountId);
+    const normalizedSession = normalizeRemoteAccountSession(session);
+    if (!normalizedSession) {
+      throw new Error('Remote account session is invalid');
+    }
+    const at = nowIso(now);
+    this.state.remoteAccounts[index] = normalizeRemoteAccount({
+      ...this.state.remoteAccounts[index],
+      session: normalizedSession,
+      lastLoginAt: normalizedSession.createdAt ?? at,
+      updatedAt: at
+    }, now);
+    await this.save();
+    return structuredClone(this.state.remoteAccounts[index]);
+  }
+
+  async clearRemoteAccountSession(siteId, { loggedOut = false, now = new Date() } = {}) {
+    const site = this.findSite(siteId);
+    const index = this.findRemoteAccountIndex(site.sync?.accountId);
+    const at = nowIso(now);
+    this.state.remoteAccounts[index] = normalizeRemoteAccount({
+      ...this.state.remoteAccounts[index],
+      session: null,
+      ...(loggedOut ? { lastLogoutAt: at } : {}),
+      updatedAt: at
+    }, now);
+    await this.save();
+    return structuredClone(this.state.remoteAccounts[index]);
+  }
+
   getActiveSiteId() {
     return this.state.activeSiteId;
   }
 
   getProxyPort() {
     return this.state.proxy.port;
+  }
+
+  getProxyListenHost() {
+    return this.state.proxy.allowLanAccess ? '0.0.0.0' : '127.0.0.1';
+  }
+
+  async generateLocalApiKey(value) {
+    const apiKey = value === undefined
+      ? `jp-${randomBytes(32).toString('base64url')}`
+      : String(value).trim();
+    if (Buffer.byteLength(apiKey, 'utf8') < 32) {
+      throw new Error('local API key must contain at least 32 bytes');
+    }
+    this.state.proxy.localApiKeyHash = hashLocalApiKey(apiKey);
+    await this.save();
+    return apiKey;
+  }
+
+  async ensureLocalApiKey() {
+    return this.state.proxy.localApiKeyHash ? null : this.generateLocalApiKey();
+  }
+
+  hasLocalApiKey() {
+    return Boolean(this.state.proxy.localApiKeyHash);
+  }
+
+  verifyLocalApiKey(apiKey) {
+    const expected = Buffer.from(this.state.proxy.localApiKeyHash, 'hex');
+    const actual = Buffer.from(hashLocalApiKey(apiKey), 'hex');
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
   }
 
   getProxyTimeoutMs() {
@@ -145,6 +349,61 @@ export class ConfigService extends EventEmitter {
     return structuredClone(this.state.groupSync);
   }
 
+  getMonitoringSettings() {
+    return structuredClone(this.state.monitoring);
+  }
+
+  getAutoProvisionAttempt(accountId, groupId) {
+    const normalizedAccountId = String(accountId ?? '').trim();
+    const normalizedGroupId = String(groupId ?? '').trim();
+    if (!normalizedAccountId || !normalizedGroupId) {
+      return null;
+    }
+    const attempt = this.state.autoProvisionAttempts.find((candidate) =>
+      candidate.accountId === normalizedAccountId && candidate.groupId === normalizedGroupId
+    );
+    return attempt ? structuredClone(attempt) : null;
+  }
+
+  async recordAutoProvisionAttempt({
+    accountId,
+    groupId,
+    groupName = '',
+    status = 'failure',
+    error = null,
+    now = new Date(),
+    cooldownMs = 24 * 60 * 60 * 1000
+  } = {}) {
+    const normalizedAccountId = String(accountId ?? '').trim();
+    const normalizedGroupId = String(groupId ?? '').trim();
+    if (!normalizedAccountId || !normalizedGroupId) {
+      return null;
+    }
+    const at = nowIso(now);
+    const nextAttemptAt = status === 'failure'
+      ? new Date(new Date(at).getTime() + Math.max(0, Number(cooldownMs) || 0)).toISOString()
+      : null;
+    const entry = {
+      accountId: normalizedAccountId,
+      groupId: normalizedGroupId,
+      groupName: String(groupName ?? '').trim(),
+      lastAttemptAt: at,
+      nextAttemptAt,
+      status: status === 'success' ? 'success' : 'failure',
+      error: error ? String(error).slice(0, 1000) : null
+    };
+    const index = this.state.autoProvisionAttempts.findIndex((candidate) =>
+      candidate.accountId === normalizedAccountId && candidate.groupId === normalizedGroupId
+    );
+    if (index >= 0) {
+      this.state.autoProvisionAttempts[index] = entry;
+    } else {
+      this.state.autoProvisionAttempts.push(entry);
+    }
+    await this.save();
+    return structuredClone(entry);
+  }
+
   getModelMapping() {
     return structuredClone(this.state.modelMapping);
   }
@@ -159,23 +418,28 @@ export class ConfigService extends EventEmitter {
   }
 
   async addSite(input, now = new Date()) {
-    const site = prepareAutoRecoverySchedule(createSite(input, now, this.state.proxy), {
+    const site = prepareAutoRecoverySchedule(this.attachRemoteAccountToSite(
+      createSite(input, now, this.state.proxy),
+      { updateExisting: false, now }
+    ), {
       previousEnabled: true,
       autoRecoveryPatch: true,
       now
     });
     this.state.sites.push(site);
+    this.state.sites = unifyWebsiteCustomMultipliers(this.state.sites);
     if (site.enabled && !this.state.activeSiteId) {
       this.state.activeSiteId = site.id;
     }
     this.rebuildGroupSyncWebsites();
     await this.save();
-    return structuredClone(site);
+    return structuredClone(this.state.sites.find((candidate) => candidate.id === site.id));
   }
 
   async updateSite(id, patch, now = new Date()) {
     const index = this.findSiteIndex(id);
     const current = this.state.sites[index];
+    const currentWebsiteKey = getSiteSyncWebsiteKey(current);
     const sanitizedPatch = sanitizePatch(patch);
     const autoRecoveryPatch = Object.hasOwn(patch ?? {}, 'autoRecovery');
     const manualEnabledPatch =
@@ -186,7 +450,7 @@ export class ConfigService extends EventEmitter {
     const connectionChanged =
       (Object.hasOwn(sanitizedPatch, 'baseUrl') && sanitizedPatch.baseUrl !== current.baseUrl) ||
       (Object.hasOwn(sanitizedPatch, 'apiKey') && sanitizedPatch.apiKey !== current.apiKey);
-    const merged = normalizeSite({
+    let merged = normalizeSite({
       ...current,
       ...sanitizedPatch,
       ...(manualEnabledPatch ? { failureDisabled: false } : {}),
@@ -199,6 +463,15 @@ export class ConfigService extends EventEmitter {
         : {}),
       updatedAt: nowIso(now)
     });
+    if (Object.hasOwn(sanitizedPatch, 'sync')) {
+      merged = this.attachRemoteAccountToSite(merged, {
+        previousAccountId: current.sync?.accountId,
+        updateExisting: true,
+        now
+      });
+    } else {
+      merged = this.hydrateSiteRemoteAccount(merged);
+    }
     validateSite(merged, this.state.proxy);
 
     this.state.sites[index] = prepareAutoRecoverySchedule(merged, {
@@ -206,6 +479,32 @@ export class ConfigService extends EventEmitter {
       autoRecoveryPatch,
       now
     });
+    this.hydrateSitesForRemoteAccount(this.state.sites[index].sync?.accountId);
+    if (current.sync?.accountId !== this.state.sites[index].sync?.accountId) {
+      this.removeRemoteAccountIfOrphaned(current.sync?.accountId);
+    }
+    const websiteKey = getSiteSyncWebsiteKey(this.state.sites[index]);
+    const customMultiplierPatched = Object.hasOwn(sanitizedPatch, 'customMultiplier');
+    const destinationSite = websiteKey && websiteKey !== currentWebsiteKey
+      ? this.state.sites.find((site, siteIndex) =>
+          siteIndex !== index &&
+          site.sync?.accountId !== this.state.sites[index].sync?.accountId &&
+          getSiteSyncWebsiteKey(site) === websiteKey
+        )
+      : null;
+    if (websiteKey && (customMultiplierPatched || destinationSite)) {
+      this.state.sites = unifyWebsiteCustomMultipliers(this.state.sites, {
+        preferredByKey: new Map([
+          [
+            websiteKey,
+            customMultiplierPatched
+              ? this.state.sites[index].customMultiplier
+              : normalizeSite(destinationSite).customMultiplier
+          ]
+        ]),
+        updatedAt: nowIso(now)
+      });
+    }
     this.ensureActiveSite();
     this.rebuildGroupSyncWebsites();
     await this.save();
@@ -230,9 +529,9 @@ export class ConfigService extends EventEmitter {
       remark: source.remark,
       baseUrl: source.baseUrl,
       apiKey: source.apiKey,
-      testModel: source.testModel,
       priority: source.priority,
       multiplier: source.multiplier,
+      customMultiplier: source.customMultiplier,
       multiplierLocked: source.multiplierLocked,
       modelMapping: source.modelMapping,
       capabilities: source.capabilities,
@@ -247,17 +546,19 @@ export class ConfigService extends EventEmitter {
       now
     });
     this.state.sites.push(site);
+    this.state.sites = unifyWebsiteCustomMultipliers(this.state.sites);
     if (site.enabled && !this.state.activeSiteId) {
       this.state.activeSiteId = site.id;
     }
     this.rebuildGroupSyncWebsites();
     await this.save();
-    return structuredClone(site);
+    return structuredClone(this.state.sites.find((candidate) => candidate.id === site.id));
   }
 
   async deleteSite(id) {
-    this.findSite(id);
+    const deleted = this.findSite(id);
     this.state.sites = this.state.sites.filter((site) => site.id !== id);
+    this.removeRemoteAccountIfOrphaned(deleted.sync?.accountId);
     if (this.state.activeSiteId === id) {
       this.state.activeSiteId = null;
       this.ensureActiveSite();
@@ -372,6 +673,7 @@ export class ConfigService extends EventEmitter {
     const timeoutMs = Number(next.timeoutMs);
     const maxReplayableRequestBodyBytes = Number(next.maxReplayableRequestBodyBytes);
     const failureThreshold = Number(next.failureThreshold);
+    const testModel = normalizeTestModel(next.testModel);
     const priorityMode = normalizePriorityMode(next.priorityMode);
     const samePriorityStrategy = normalizeSamePriorityStrategy(next.samePriorityStrategy);
     const autoSwitchMultiplierLimit = normalizeAutoSwitchMultiplierLimit(next.autoSwitchMultiplierLimit);
@@ -394,8 +696,12 @@ export class ConfigService extends EventEmitter {
 
     this.state.proxy = {
       port,
+      allowLanAccess: Boolean(next.allowLanAccess),
+      localApiKeyHash: this.state.proxy.localApiKeyHash,
+      testModel,
       timeoutMs,
       maxReplayableRequestBodyBytes,
+      codexRecoveryEnabled: Boolean(next.codexRecoveryEnabled),
       failureThreshold,
       smartSwitching: Boolean(next.smartSwitching),
       priorityMode,
@@ -440,6 +746,37 @@ export class ConfigService extends EventEmitter {
     return structuredClone(this.state.modelMapping);
   }
 
+  async updateMonitoringSettings(patch = {}) {
+    this.state.monitoring = normalizeMonitoringSettings({
+      ...this.state.monitoring,
+      ...patch,
+      notifications: {
+        ...this.state.monitoring.notifications,
+        ...patch.notifications
+      },
+      rules: this.state.monitoring.rules
+    }, this.state.sites);
+    await this.save();
+    return structuredClone(this.state.monitoring);
+  }
+
+  async updateMonitoringRule(siteId, patch = {}) {
+    const site = this.findSite(siteId);
+    const accountId = String(site.sync?.accountId ?? '').trim();
+    const current = this.state.monitoring.rules.find((rule) => rule.accountId === accountId);
+    const rule = normalizeMonitoringRule({
+      ...current,
+      ...patch,
+      accountId
+    });
+    this.state.monitoring.rules = [
+      ...this.state.monitoring.rules.filter((candidate) => candidate.accountId !== accountId),
+      rule
+    ];
+    await this.save();
+    return structuredClone(rule);
+  }
+
   async updateAppSettings(patch = {}) {
     this.state.appSettings = normalizeAppSettings({
       ...this.state.appSettings,
@@ -482,7 +819,8 @@ export class ConfigService extends EventEmitter {
         baseUrl: site.baseUrl,
         manualEnabled: site.manualEnabled,
         priority: site.priority,
-        multiplier: site.multiplier
+        multiplier: site.multiplier,
+        customMultiplier: site.customMultiplier
       }))
     };
   }
@@ -495,7 +833,10 @@ export class ConfigService extends EventEmitter {
     const nextProxy = importGlobalSettings
       ? normalizeImportedProxySettings(payload.settings.proxy, this.state.proxy)
       : this.state.proxy;
-    const importedSites = selectedSites.map((site) => createSite(site, now, nextProxy));
+    const importedSites = selectedSites.map((site) => this.attachRemoteAccountToSite(
+      createSite(site, now, nextProxy),
+      { now }
+    ));
 
     if (importGlobalSettings) {
       this.state.appSettings = normalizeAppSettings(payload.settings.appSettings);
@@ -506,6 +847,7 @@ export class ConfigService extends EventEmitter {
     }
 
     this.state.sites.push(...importedSites);
+    this.state.sites = unifyWebsiteCustomMultipliers(this.state.sites);
     this.disableLocalProxySites(now);
     this.ensureActiveSite();
     this.rebuildGroupSyncWebsites();
@@ -767,6 +1109,7 @@ export class ConfigService extends EventEmitter {
     const groups = normalizeSiteSync({ remote }).remote.groups;
     const refreshedAt = result?.syncPatch?.lastSyncAt ?? nowIso(now);
     const representativeSiteId = options.representativeSiteId ?? null;
+    const accountId = String(options.accountId ?? '').trim();
     const affectedSites = [];
 
     this.state.groupSync.websites[index] = {
@@ -781,7 +1124,8 @@ export class ConfigService extends EventEmitter {
       const normalizedSite = normalizeSite(site);
       if (
         getSiteSyncWebsiteKey(normalizedSite) !== normalizedKey ||
-        !isConfiguredGroupSyncSite(normalizedSite)
+        !isConfiguredGroupSyncSite(normalizedSite) ||
+        (accountId && String(normalizedSite.sync.accountId ?? '').trim() !== accountId)
       ) {
         continue;
       }
@@ -1060,6 +1404,119 @@ export class ConfigService extends EventEmitter {
     return site;
   }
 
+  findRemoteAccount(id) {
+    const normalizedId = String(id ?? '').trim();
+    return this.state.remoteAccounts.find((account) => account.id === normalizedId) ?? null;
+  }
+
+  findRemoteAccountIndex(id) {
+    const normalizedId = String(id ?? '').trim();
+    const index = this.state.remoteAccounts.findIndex((account) => account.id === normalizedId);
+    if (index === -1) {
+      throw new Error(`Remote account not found: ${normalizedId}`);
+    }
+    return index;
+  }
+
+  attachRemoteAccountToSite(site, {
+    previousAccountId = '',
+    updateExisting = false,
+    now = new Date()
+  } = {}) {
+    const normalizedSite = normalizeSite(site);
+    const sync = normalizedSite.sync;
+    if (!sync.dashboardUrl || !sync.username) {
+      return normalizedSite;
+    }
+
+    const requestedAccountId = sync.accountId || previousAccountId;
+    let account = this.findRemoteAccount(requestedAccountId);
+    const accountChanged = Boolean(
+      sync.accountId && previousAccountId && sync.accountId !== previousAccountId
+    );
+    if (!account) {
+      const identity = getRemoteAccountIdentity(sync);
+      account = this.state.remoteAccounts.find(
+        (candidate) => getRemoteAccountIdentity(candidate) === identity
+      ) ?? null;
+    }
+
+    const at = nowIso(now);
+    if (!account) {
+      account = normalizeRemoteAccount({
+        dashboardUrl: sync.dashboardUrl,
+        username: sync.username,
+        password: sync.password,
+        providerType: sync.providerType,
+        createdAt: at,
+        updatedAt: at
+      }, now);
+      this.state.remoteAccounts.push(account);
+    } else if (updateExisting && !accountChanged) {
+      const destinationAccount = this.state.remoteAccounts.find((candidate) =>
+        candidate.id !== account.id &&
+          getRemoteAccountIdentity(candidate) === getRemoteAccountIdentity(sync)
+      );
+      if (destinationAccount) {
+        const mergedAccountId = account.id;
+        account = destinationAccount;
+        this.state.sites = this.state.sites.map((candidate) =>
+          candidate.sync?.accountId === mergedAccountId
+            ? normalizeSite(hydrateSiteWithRemoteAccount(candidate, account))
+            : candidate
+        );
+        this.state.remoteAccounts = this.state.remoteAccounts.filter(
+          (candidate) => candidate.id !== mergedAccountId
+        );
+      } else {
+        const authChanged = account.dashboardUrl !== sync.dashboardUrl ||
+          account.username !== sync.username ||
+          account.password !== sync.password ||
+          account.providerType !== sync.providerType;
+        const index = this.findRemoteAccountIndex(account.id);
+        account = normalizeRemoteAccount({
+          ...account,
+          dashboardUrl: sync.dashboardUrl,
+          username: sync.username,
+          password: sync.password,
+          providerType: sync.providerType,
+          ...(authChanged ? { session: null } : {}),
+          updatedAt: authChanged ? at : account.updatedAt
+        }, now);
+        this.state.remoteAccounts[index] = account;
+      }
+    }
+
+    return normalizeSite(hydrateSiteWithRemoteAccount(normalizedSite, account));
+  }
+
+  hydrateSiteRemoteAccount(site) {
+    const account = this.findRemoteAccount(site?.sync?.accountId);
+    return normalizeSite(hydrateSiteWithRemoteAccount(site, account));
+  }
+
+  hydrateSitesForRemoteAccount(accountId) {
+    if (!accountId) {
+      return;
+    }
+    const account = this.findRemoteAccount(accountId);
+    if (!account) {
+      return;
+    }
+    this.state.sites = this.state.sites.map((site) =>
+      site.sync?.accountId === accountId
+        ? normalizeSite(hydrateSiteWithRemoteAccount(site, account))
+        : site
+    );
+  }
+
+  removeRemoteAccountIfOrphaned(accountId) {
+    if (!accountId || this.state.sites.some((site) => site.sync?.accountId === accountId)) {
+      return;
+    }
+    this.state.remoteAccounts = this.state.remoteAccounts.filter((account) => account.id !== accountId);
+  }
+
   findSiteIndex(id) {
     const index = this.state.sites.findIndex((site) => site.id === id);
     if (index === -1) {
@@ -1075,6 +1532,7 @@ export class ConfigService extends EventEmitter {
     }
 
     this.clearPendingSave();
+    this.state.monitoring = normalizeMonitoringSettings(this.state.monitoring, this.state.sites);
     const snapshot = this.getState();
     const payload = `${JSON.stringify(snapshot, null, 2)}\n`;
     const run = this.saveQueue.then(async () => {
@@ -1134,21 +1592,39 @@ async function writeFileAtomically(filePath, payload) {
 }
 
 function normalizeState(raw) {
+  const legacyTestModel = Array.isArray(raw?.sites)
+    ? raw.sites.find((site) => typeof site?.testModel === 'string' && site.testModel.trim())?.testModel
+    : null;
+  const initialSites = Array.isArray(raw?.sites) ? raw.sites.map(normalizeSite) : [];
+  const reconciledAccounts = reconcileRemoteAccounts({
+    accounts: raw?.remoteAccounts,
+    sites: initialSites
+  });
   const state = {
     ...structuredClone(DEFAULT_STATE),
     ...raw,
     proxy: {
       ...DEFAULT_STATE.proxy,
-      ...(raw?.proxy ?? {})
+      ...(raw?.proxy ?? {}),
+      testModel: raw?.proxy?.testModel ?? legacyTestModel ?? DEFAULT_TEST_MODEL
     },
     appSettings: normalizeAppSettings(raw?.appSettings ?? DEFAULT_STATE.appSettings),
     modelMapping: normalizeModelMapping(raw?.modelMapping ?? DEFAULT_STATE.modelMapping),
     siteSync: normalizeSiteSyncSettings(raw?.siteSync ?? DEFAULT_STATE.siteSync),
     groupSync: normalizeGroupSyncSettings(raw?.groupSync ?? DEFAULT_STATE.groupSync),
-    sites: Array.isArray(raw?.sites) ? raw.sites.map(normalizeSite) : []
+    monitoring: normalizeMonitoringSettings(
+      raw?.monitoring ?? DEFAULT_STATE.monitoring,
+      reconciledAccounts.sites
+    ),
+    autoProvisionAttempts: normalizeAutoProvisionAttempts(raw?.autoProvisionAttempts),
+    remoteAccounts: reconciledAccounts.accounts,
+    sites: reconciledAccounts.sites.map(normalizeSite)
   };
 
   state.proxy.port = Number.isInteger(Number(state.proxy.port)) ? Number(state.proxy.port) : 8787;
+  state.proxy.allowLanAccess = Boolean(state.proxy.allowLanAccess);
+  state.proxy.localApiKeyHash = normalizeLocalApiKeyHash(state.proxy.localApiKeyHash);
+  state.proxy.testModel = normalizeTestModel(state.proxy.testModel);
   state.proxy.timeoutMs =
     Number.isInteger(Number(state.proxy.timeoutMs)) && Number(state.proxy.timeoutMs) >= 1000
       ? Number(state.proxy.timeoutMs)
@@ -1157,6 +1633,7 @@ function normalizeState(raw) {
     state.proxy.maxReplayableRequestBodyBytes,
     DEFAULT_STATE.proxy.maxReplayableRequestBodyBytes
   );
+  state.proxy.codexRecoveryEnabled = Boolean(state.proxy.codexRecoveryEnabled);
   state.proxy.failureThreshold = Number.isInteger(Number(state.proxy.failureThreshold))
     ? Number(state.proxy.failureThreshold)
     : DEFAULT_FAILURE_THRESHOLD;
@@ -1172,13 +1649,25 @@ function normalizeState(raw) {
   return state;
 }
 
+function hashLocalApiKey(apiKey) {
+  return createHash('sha256').update(String(apiKey ?? ''), 'utf8').digest('hex');
+}
+
+function normalizeLocalApiKeyHash(value) {
+  const hash = String(value ?? '').trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(hash) ? hash : '';
+}
+
 function serializeGlobalSettingsForExport(state) {
   return {
     appSettings: normalizeAppSettings(state.appSettings),
     proxy: {
       port: state.proxy.port,
+      allowLanAccess: state.proxy.allowLanAccess,
+      testModel: state.proxy.testModel,
       timeoutMs: state.proxy.timeoutMs,
       maxReplayableRequestBodyBytes: state.proxy.maxReplayableRequestBodyBytes,
+      codexRecoveryEnabled: state.proxy.codexRecoveryEnabled,
       failureThreshold: state.proxy.failureThreshold,
       smartSwitching: state.proxy.smartSwitching,
       priorityMode: state.proxy.priorityMode,
@@ -1209,9 +1698,9 @@ function serializeSiteForExport(site) {
     remark: normalized.remark,
     baseUrl: normalized.baseUrl,
     apiKey: normalized.apiKey,
-    testModel: normalized.testModel,
     priority: normalized.priority,
     multiplier: normalized.multiplier,
+    customMultiplier: normalized.customMultiplier,
     multiplierLocked: normalized.multiplierLocked,
     modelMapping: structuredClone(normalized.modelMapping),
     sync: serializeSiteSyncForExport(normalized.sync),
@@ -1288,6 +1777,82 @@ function normalizeAppSettings(settings = {}) {
   };
 }
 
+export function normalizeMonitoringSettings(settings = {}, sites = []) {
+  const source = settings && typeof settings === 'object' ? settings : {};
+  const validAccountIds = new Set((Array.isArray(sites) ? sites : [])
+    .map((site) => String(site?.sync?.accountId ?? '').trim())
+    .filter(Boolean));
+  const rules = new Map();
+  for (const input of Array.isArray(source.rules) ? source.rules : []) {
+    const rule = normalizeMonitoringRule(input);
+    if (validAccountIds.has(rule.accountId)) {
+      rules.set(rule.accountId, rule);
+    }
+  }
+
+  return {
+    enabled: Boolean(source.enabled),
+    feishuWebhook: String(source.feishuWebhook ?? '').trim(),
+    checkIntervalSeconds: normalizeInteger(
+      source.checkIntervalSeconds,
+      DEFAULT_MONITORING_SETTINGS.checkIntervalSeconds,
+      10
+    ),
+    failureThreshold: normalizeInteger(
+      source.failureThreshold,
+      DEFAULT_MONITORING_SETTINGS.failureThreshold,
+      1
+    ),
+    repeatIntervalMinutes: normalizeInteger(
+      source.repeatIntervalMinutes,
+      DEFAULT_MONITORING_SETTINGS.repeatIntervalMinutes,
+      1
+    ),
+    noUsableSiteDelayMinutes: normalizeInteger(
+      source.noUsableSiteDelayMinutes,
+      DEFAULT_MONITORING_SETTINGS.noUsableSiteDelayMinutes,
+      1
+    ),
+    notifications: {
+      multiplierChanged: source.notifications?.multiplierChanged === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.multiplierChanged
+        : Boolean(source.notifications.multiplierChanged),
+      lowBalance: source.notifications?.lowBalance === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.lowBalance
+        : Boolean(source.notifications.lowBalance),
+      noUsableSite: source.notifications?.noUsableSite === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.noUsableSite
+        : Boolean(source.notifications.noUsableSite),
+      programIssues: source.notifications?.programIssues === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.programIssues
+        : Boolean(source.notifications.programIssues),
+      answerCompleted: source.notifications?.answerCompleted === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.answerCompleted
+        : Boolean(source.notifications.answerCompleted),
+      goalStatusChanged: source.notifications?.goalStatusChanged === undefined
+        ? DEFAULT_MONITORING_SETTINGS.notifications.goalStatusChanged
+        : Boolean(source.notifications.goalStatusChanged)
+    },
+    rules: [...rules.values()]
+  };
+}
+
+function normalizeMonitoringRule(rule = {}) {
+  const threshold = rule.balanceThreshold === null || rule.balanceThreshold === ''
+    ? null
+    : Number(rule.balanceThreshold);
+  return {
+    accountId: String(rule.accountId ?? '').trim(),
+    enabled: rule.enabled === undefined ? true : Boolean(rule.enabled),
+    balanceThreshold: Number.isFinite(threshold) && threshold >= 0 ? threshold : null
+  };
+}
+
+function normalizeInteger(value, fallback, minimum) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= minimum ? number : fallback;
+}
+
 function normalizeFloatingWindowPosition(position) {
   if (!position || typeof position !== 'object' || Array.isArray(position)) {
     return null;
@@ -1321,9 +1886,9 @@ function normalizeImportSite(site = {}) {
     remark: normalized.remark,
     baseUrl: normalized.baseUrl,
     apiKey: normalized.apiKey,
-    testModel: normalized.testModel,
     priority: normalized.priority,
     multiplier: normalized.multiplier,
+    customMultiplier: normalized.customMultiplier,
     multiplierLocked: normalized.multiplierLocked,
     modelMapping: structuredClone(normalized.modelMapping),
     sync: serializeSiteSyncForExport(normalized.sync),
@@ -1340,6 +1905,7 @@ function normalizeImportedProxySettings(proxy = {}, currentProxy = DEFAULT_STATE
     ...currentProxy
   };
   const port = Number(source.port);
+  const testModel = normalizeTestModel(source.testModel ?? fallback.testModel);
   const timeoutMs = Number(source.timeoutMs);
   const failureThreshold = Number(source.failureThreshold);
   const maxReplayableRequestBodyBytes = normalizeReplayableRequestBodyBytes(
@@ -1349,8 +1915,16 @@ function normalizeImportedProxySettings(proxy = {}, currentProxy = DEFAULT_STATE
 
   return {
     port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : fallback.port,
+    allowLanAccess: source.allowLanAccess === undefined
+      ? fallback.allowLanAccess
+      : Boolean(source.allowLanAccess),
+    localApiKeyHash: normalizeLocalApiKeyHash(fallback.localApiKeyHash),
+    testModel,
     timeoutMs: Number.isInteger(timeoutMs) && timeoutMs >= 1000 ? timeoutMs : fallback.timeoutMs,
     maxReplayableRequestBodyBytes,
+    codexRecoveryEnabled: source.codexRecoveryEnabled === undefined
+      ? fallback.codexRecoveryEnabled
+      : Boolean(source.codexRecoveryEnabled),
     failureThreshold: Number.isInteger(failureThreshold) && failureThreshold >= 0
       ? failureThreshold
       : fallback.failureThreshold,
@@ -1377,6 +1951,10 @@ function normalizeReplayableRequestBodyBytes(value, fallback) {
     : fallback;
 }
 
+function normalizeTestModel(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_TEST_MODEL;
+}
+
 function normalizeOptionalIdSet(ids) {
   if (ids === null || ids === undefined) {
     return null;
@@ -1395,9 +1973,9 @@ function createSite(input, now = new Date(), proxy = DEFAULT_STATE.proxy) {
     remark: input?.remark,
     baseUrl: input?.baseUrl,
     apiKey: input?.apiKey,
-    testModel: input?.testModel,
     priority: input?.priority,
     multiplier: input?.multiplier,
+    customMultiplier: input?.customMultiplier,
     multiplierLocked: input?.multiplierLocked,
     modelMapping: input?.modelMapping,
     capabilities: input?.capabilities,
@@ -1426,9 +2004,9 @@ function sanitizePatch(patch = {}) {
     'remark',
     'baseUrl',
     'apiKey',
-    'testModel',
     'priority',
     'multiplier',
+    'customMultiplier',
     'multiplierLocked',
     'modelMapping',
     'capabilities',
@@ -1583,8 +2161,93 @@ function getWebsiteKey(value) {
   }
 }
 
+function shouldPersistSyncedMultiplier(site, multiplier) {
+  return !site?.multiplierLocked && Number.isFinite(multiplier) && multiplier >= 0;
+}
+
+function unifyWebsiteCustomMultipliers(sites = [], {
+  preferredByKey = new Map(),
+  preferNonNull = false,
+  updatedAt = null
+} = {}) {
+  const normalizedSites = sites.map(normalizeSite);
+  const multiplierByKey = new Map();
+
+  for (const site of normalizedSites) {
+    const key = getSiteSyncWebsiteKey(site);
+    if (!key) {
+      continue;
+    }
+    if (!multiplierByKey.has(key)) {
+      multiplierByKey.set(key, site.customMultiplier);
+      continue;
+    }
+    if (
+      preferNonNull &&
+      multiplierByKey.get(key) === null &&
+      site.customMultiplier !== null
+    ) {
+      multiplierByKey.set(key, site.customMultiplier);
+    }
+  }
+
+  for (const [key, multiplier] of preferredByKey) {
+    multiplierByKey.set(normalizeWebsiteKey(key), multiplier);
+  }
+
+  return normalizedSites.map((site) => {
+    const key = getSiteSyncWebsiteKey(site);
+    if (!key || !multiplierByKey.has(key)) {
+      return site;
+    }
+    const customMultiplier = multiplierByKey.get(key);
+    if (site.customMultiplier === customMultiplier) {
+      return site;
+    }
+    return normalizeSite({
+      ...site,
+      customMultiplier,
+      ...(updatedAt ? { updatedAt } : {})
+    });
+  });
+}
+
 function normalizeWebsiteKey(value) {
   return String(value ?? '').trim().toLowerCase();
+}
+
+function normalizeOptionalIso(value) {
+  if (!value) {
+    return null;
+  }
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+function normalizeAutoProvisionAttempts(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => {
+      const accountId = String(entry?.accountId ?? '').trim();
+      const groupId = String(entry?.groupId ?? '').trim();
+      if (!accountId || !groupId) {
+        return null;
+      }
+      const lastAttemptAt = normalizeOptionalIso(entry?.lastAttemptAt);
+      const nextAttemptAt = normalizeOptionalIso(entry?.nextAttemptAt);
+      return {
+        accountId,
+        groupId,
+        groupName: String(entry?.groupName ?? '').trim(),
+        lastAttemptAt,
+        nextAttemptAt,
+        status: entry?.status === 'success' ? 'success' : 'failure',
+        error: entry?.error ? String(entry.error).slice(0, 1000) : null
+      };
+    })
+    .filter(Boolean);
 }
 
 function isDueGroupSyncWebsite(website, nowMs, intervalMs) {
@@ -1615,7 +2278,14 @@ function isPreheatGroupSyncWebsite(website, nowMs, intervalMs) {
     return false;
   }
 
-  return nowMs >= nextRefreshMs - getSiteSyncPreheatLeadMs(intervalMs);
+  return nowMs >= nextRefreshMs - getGroupSyncPreheatLeadMs(intervalMs);
+}
+
+function getGroupSyncPreheatLeadMs(intervalMs) {
+  return Math.min(
+    SITE_SYNC_PREHEAT_MAX_LEAD_MS,
+    intervalMs * SITE_SYNC_PREHEAT_LEAD_RATIO
+  );
 }
 
 function mergeGroupSyncResultIntoSite(site, { result, groups, representative, now }) {

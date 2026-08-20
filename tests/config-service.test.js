@@ -6,6 +6,137 @@ import test from 'node:test';
 
 import { ConfigService } from '../src/proxy/config-service.js';
 
+test('persists one monitoring rule per account across linked sites and removes stale accounts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'juanproxy-monitoring-config-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    assert.deepEqual(service.getState().monitoring, {
+      enabled: false,
+      feishuWebhook: '',
+      checkIntervalSeconds: 30,
+      failureThreshold: 3,
+      repeatIntervalMinutes: 30,
+      noUsableSiteDelayMinutes: 5,
+      notifications: {
+        multiplierChanged: true,
+        lowBalance: true,
+        noUsableSite: true,
+        programIssues: true,
+        answerCompleted: false,
+        goalStatusChanged: false
+      },
+      rules: []
+    });
+
+    const site = await service.addSite({
+      name: 'monitored',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-monitoring',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com',
+        username: 'owner@example.com',
+        password: 'secret'
+      }
+    });
+    await service.updateMonitoringSettings({
+      enabled: true,
+      feishuWebhook: ' https://open.feishu.cn/open-apis/bot/v2/hook/test ',
+      notifications: {
+        multiplierChanged: false,
+        lowBalance: true,
+        noUsableSite: false,
+        programIssues: true,
+        answerCompleted: true,
+        goalStatusChanged: true
+      },
+      noUsableSiteDelayMinutes: 15
+    });
+    await service.updateMonitoringRule(site.id, {
+      enabled: false,
+      balanceThreshold: 12.5
+    });
+    await service.updateMonitoringRule(site.id, {
+      enabled: true,
+      balanceThreshold: 8
+    });
+
+    let state = service.getState();
+    assert.equal(state.monitoring.enabled, true);
+    assert.equal(state.monitoring.feishuWebhook, 'https://open.feishu.cn/open-apis/bot/v2/hook/test');
+    assert.equal(state.monitoring.noUsableSiteDelayMinutes, 15);
+    assert.deepEqual(state.monitoring.notifications, {
+      multiplierChanged: false,
+      lowBalance: true,
+      noUsableSite: false,
+      programIssues: true,
+      answerCompleted: true,
+      goalStatusChanged: true
+    });
+    assert.doesNotMatch(JSON.stringify(service.exportConfig()), /hook\/test/);
+    assert.deepEqual(state.monitoring.rules, [{
+      accountId: site.sync.accountId,
+      enabled: true,
+      balanceThreshold: 8
+    }]);
+    const linked = await service.cloneSite(site.id);
+    await service.updateMonitoringRule(linked.id, {
+      enabled: false,
+      balanceThreshold: 6
+    });
+    assert.deepEqual(service.getState().monitoring.rules, [{
+      accountId: site.sync.accountId,
+      enabled: false,
+      balanceThreshold: 6
+    }]);
+
+    const other = await service.addSite({
+      name: 'other account',
+      baseUrl: 'https://other.example.com/v1',
+      apiKey: 'sk-other',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://other-panel.example.com',
+        username: 'other@example.com',
+        password: 'other-secret'
+      }
+    });
+    await service.updateSite(site.id, {
+      sync: {
+        ...service.findSite(site.id).sync,
+        accountId: other.sync.accountId,
+        dashboardUrl: other.sync.dashboardUrl,
+        username: other.sync.username,
+        password: other.sync.password
+      }
+    });
+    state = service.getState();
+    assert.equal(state.monitoring.rules.length, 1);
+
+    await service.updateSite(linked.id, {
+      sync: {
+        ...service.findSite(linked.id).sync,
+        accountId: other.sync.accountId,
+        dashboardUrl: other.sync.dashboardUrl,
+        username: other.sync.username,
+        password: other.sync.password
+      }
+    });
+    state = service.getState();
+    assert.deepEqual(state.monitoring.rules, []);
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+    assert.equal(reloaded.getState().monitoring.enabled, true);
+    assert.deepEqual(reloaded.getState().monitoring.rules, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('persists add, update, clone and delete operations', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-config-'));
   const filePath = join(dir, 'config.json');
@@ -15,7 +146,9 @@ test('persists add, update, clone and delete operations', async () => {
     await service.load();
 
     assert.equal(service.getState().proxy.port, 8787);
+    assert.equal(service.getState().proxy.allowLanAccess, false);
     assert.equal(service.getState().proxy.timeoutMs, 120000);
+    assert.equal(service.getState().proxy.codexRecoveryEnabled, false);
     assert.equal(service.getState().proxy.smartSwitching, false);
     assert.deepEqual(service.getState().appSettings.floatingWindow, {
       alwaysOnTop: false,
@@ -47,6 +180,44 @@ test('persists add, update, clone and delete operations', async () => {
     assert.equal(state.sites[0].baseUrl, 'https://upstream.example.com/v1');
     assert.equal(state.sites[0].apiKey, 'sk-test');
     assert.equal(state.activeSiteId, cloned.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('persists and exports the LAN access setting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-lan-access-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await service.updateProxySettings({ allowLanAccess: true });
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+
+    assert.equal(reloaded.getState().proxy.allowLanAccess, true);
+    assert.equal(reloaded.exportConfig().settings.proxy.allowLanAccess, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('persists and exports the opt-in Codex recovery switch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-codex-recovery-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await service.updateProxySettings({ codexRecoveryEnabled: true });
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+
+    assert.equal(reloaded.getState().proxy.codexRecoveryEnabled, true);
+    assert.equal(reloaded.exportConfig().settings.proxy.codexRecoveryEnabled, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -198,6 +369,36 @@ test('exports selected sites with optional global settings', async () => {
   }
 });
 
+test('migrates a legacy per-site test model into global proxy settings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-global-test-model-migration-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    await writeFile(filePath, `${JSON.stringify({
+      version: 1,
+      proxy: { port: 8787 },
+      sites: [{
+        id: 'legacy',
+        name: 'Legacy',
+        baseUrl: 'https://legacy.example/v1',
+        apiKey: 'sk-legacy',
+        testModel: 'legacy-test-model'
+      }]
+    })}\n`, 'utf8');
+
+    const service = new ConfigService({ filePath });
+    await service.load();
+
+    const state = service.getState();
+    assert.equal(state.proxy.testModel, 'legacy-test-model');
+    assert.equal(state.sites[0].testModel, undefined);
+    assert.equal(service.exportConfig().settings.proxy.testModel, 'legacy-test-model');
+    assert.equal(service.exportConfig().sites[0].testModel, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('imports selected exported sites by merging and optionally applying global settings', async () => {
   const sourceDir = await mkdtemp(join(tmpdir(), 'openapi-proxy-import-source-'));
   const targetDir = await mkdtemp(join(tmpdir(), 'openapi-proxy-import-target-'));
@@ -226,7 +427,8 @@ test('imports selected exported sites by merging and optionally applying global 
       name: 'Imported B',
       baseUrl: 'https://import-b.example/v1',
       apiKey: 'example-import-b',
-      multiplier: 0.5
+      multiplier: 0.5,
+      customMultiplier: 2
     });
     const exported = source.exportConfig({ includeGlobalSettings: true });
 
@@ -260,6 +462,7 @@ test('imports selected exported sites by merging and optionally applying global 
     assert.equal(imported.baseUrl, 'https://import-b.example/v1');
     assert.equal(imported.apiKey, 'example-import-b');
     assert.equal(imported.multiplier, 0.5);
+    assert.equal(imported.customMultiplier, 2);
     assert.equal(imported.requestCount, 0);
     assert.equal(imported.errorLog.length, 0);
     assert.equal(state.sites.some((site) => site.name === 'Imported A'), false);
@@ -678,7 +881,7 @@ test('manual enable clears automatic disable and rate limit pause', async () => 
   }
 });
 
-test('persists priority mode, priority, multiplier lock and same-priority selection strategy', async () => {
+test('persists priority mode, priority, custom multiplier, multiplier lock and same-priority selection strategy', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-priority-'));
   const filePath = join(dir, 'config.json');
 
@@ -692,6 +895,7 @@ test('persists priority mode, priority, multiplier lock and same-priority select
       apiKey: 'sk-priority',
       priority: 3,
       multiplier: 0,
+      customMultiplier: 2.5,
       multiplierLocked: true
     });
 
@@ -703,7 +907,85 @@ test('persists priority mode, priority, multiplier lock and same-priority select
     assert.equal(state.proxy.samePriorityStrategy, 'random');
     assert.equal(state.sites.find((site) => site.id === created.id).priority, 3);
     assert.equal(state.sites.find((site) => site.id === created.id).multiplier, 0);
+    assert.equal(state.sites.find((site) => site.id === created.id).customMultiplier, 2.5);
     assert.equal(state.sites.find((site) => site.id === created.id).multiplierLocked, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeps custom multiplier unified across sites from the same sync website', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-website-multiplier-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+
+    const primary = await service.addSite({
+      name: 'primary',
+      baseUrl: 'https://primary.example/v1',
+      apiKey: 'sk-primary',
+      customMultiplier: 2,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/console/token',
+        username: 'user@example.com',
+        password: 'secret'
+      }
+    });
+    const backup = await service.addSite({
+      name: 'backup',
+      baseUrl: 'https://backup.example/v1',
+      apiKey: 'sk-backup',
+      customMultiplier: 9,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://relay.example.com/profile',
+        username: 'user@example.com',
+        password: 'secret'
+      }
+    });
+    const other = await service.addSite({
+      name: 'other',
+      baseUrl: 'https://other.example/v1',
+      apiKey: 'sk-other',
+      customMultiplier: 4,
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://other.example.com/keys',
+        username: 'other@example.com',
+        password: 'secret'
+      }
+    });
+
+    assert.equal(service.findSite(primary.id).customMultiplier, 2);
+    assert.equal(service.findSite(backup.id).customMultiplier, 2);
+
+    await service.updateSite(backup.id, { customMultiplier: 0.25 });
+    assert.equal(service.findSite(primary.id).customMultiplier, 0.25);
+    assert.equal(service.findSite(backup.id).customMultiplier, 0.25);
+    assert.equal(service.findSite(other.id).customMultiplier, 4);
+
+    await service.updateSite(primary.id, { customMultiplier: null });
+    assert.equal(service.findSite(primary.id).customMultiplier, null);
+    assert.equal(service.findSite(backup.id).customMultiplier, null);
+
+    await service.updateSite(primary.id, {
+      sync: {
+        ...service.findSite(primary.id).sync,
+        dashboardUrl: 'https://other.example.com/profile'
+      }
+    });
+    assert.equal(service.findSite(primary.id).customMultiplier, 4);
+    assert.equal(service.findSite(backup.id).customMultiplier, 4);
+    assert.equal(service.findSite(other.id).customMultiplier, 4);
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+    assert.equal(reloaded.findSite(primary.id).customMultiplier, 4);
+    assert.equal(reloaded.findSite(backup.id).customMultiplier, 4);
+    assert.equal(reloaded.findSite(other.id).customMultiplier, 4);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1798,6 +2080,377 @@ test('truncates persisted error log details to keep state payload bounded', asyn
       .sites.find((candidate) => candidate.id === site.id);
     assert.equal(saved.errorLog.length <= 20, true);
     assert.equal(saved.errorLog.every((entry) => entry.detail.length <= 1000), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('migrates duplicate legacy site sync credentials into one shared remote account', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-remote-account-migration-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    await writeFile(filePath, JSON.stringify({
+      sites: [
+        {
+          id: 'primary',
+          name: 'primary',
+          baseUrl: 'https://api.example.com/v1',
+          apiKey: 'sk-primary',
+          sync: {
+            enabled: true,
+            dashboardUrl: 'https://panel.example.com/console/token',
+            username: 'User@Example.com',
+            password: 'secret',
+            providerType: 'new-api'
+          }
+        },
+        {
+          id: 'backup',
+          name: 'backup',
+          baseUrl: 'https://api.example.com/v1',
+          apiKey: 'sk-backup',
+          sync: {
+            enabled: true,
+            dashboardUrl: 'https://panel.example.com/console/personal',
+            username: 'user@example.com',
+            password: 'secret',
+            providerType: 'new-api'
+          }
+        }
+      ]
+    }), 'utf8');
+
+    const service = new ConfigService({ filePath });
+    await service.load();
+    const state = service.getState();
+
+    assert.equal(state.remoteAccounts.length, 1);
+    assert.equal(state.remoteAccounts[0].dashboardUrl, 'https://panel.example.com/console/token');
+    assert.equal(state.remoteAccounts[0].username, 'User@Example.com');
+    assert.equal(state.sites[0].sync.accountId, state.remoteAccounts[0].id);
+    assert.equal(state.sites[1].sync.accountId, state.remoteAccounts[0].id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('updates shared remote account fields for every linked site and invalidates its session', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-shared-remote-account-'));
+  const filePath = join(dir, 'config.json');
+  const service = new ConfigService({ filePath });
+
+  try {
+    await service.load();
+    const first = await service.addSite({
+      name: 'first',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-first',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/keys',
+        username: 'shared@example.com',
+        password: 'old-secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const second = await service.addSite({
+      name: 'second',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-second',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/account',
+        username: 'shared@example.com',
+        password: 'old-secret',
+        providerType: 'modern-v1'
+      }
+    });
+
+    assert.equal(first.sync.accountId, second.sync.accountId);
+    await service.updateRemoteAccountSession(first.id, {
+      providerType: 'modern-v1',
+      origin: 'https://panel.example.com',
+      apiBaseUrl: 'https://panel.example.com/api/v1',
+      token: 'cached-auth-token',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    });
+    assert.equal(service.getRemoteAccountSession(second.id).token, 'cached-auth-token');
+
+    await service.updateSite(first.id, {
+      sync: {
+        ...service.findSite(first.id).sync,
+        password: 'new-secret'
+      }
+    });
+
+    const state = service.getState();
+    assert.equal(state.remoteAccounts.length, 1);
+    assert.equal(state.remoteAccounts[0].password, 'new-secret');
+    assert.equal(state.remoteAccounts[0].session, null);
+    assert.equal(state.sites.find((site) => site.id === first.id).sync.password, 'new-secret');
+    assert.equal(state.sites.find((site) => site.id === second.id).sync.password, 'new-secret');
+
+    const reloaded = new ConfigService({ filePath });
+    await reloaded.load();
+    assert.equal(reloaded.getState().remoteAccounts.length, 1);
+    assert.equal(reloaded.findSite(second.id).sync.password, 'new-secret');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('immediately links imported sites with the same remote identity to one shared account', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-import-shared-account-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+
+    await service.importConfig({
+      kind: 'juanproxy.config-export',
+      version: 1,
+      settings: null,
+      sites: [
+        {
+          sourceId: 'import-a',
+          name: 'Imported A',
+          baseUrl: 'https://api.example.com/v1',
+          apiKey: 'sk-import-a',
+          sync: {
+            enabled: true,
+            dashboardUrl: 'https://panel.example.com/console/token',
+            username: 'Shared@Example.com',
+            password: 'secret',
+            providerType: 'new-api'
+          }
+        },
+        {
+          sourceId: 'import-b',
+          name: 'Imported B',
+          baseUrl: 'https://api.example.com/v1',
+          apiKey: 'sk-import-b',
+          sync: {
+            enabled: true,
+            dashboardUrl: 'https://panel.example.com/console/personal',
+            username: 'shared@example.com',
+            password: 'secret',
+            providerType: 'new-api'
+          }
+        }
+      ]
+    });
+
+    const state = service.getState();
+    assert.equal(state.remoteAccounts.length, 1);
+    assert.equal(state.sites.length, 2);
+    assert.ok(state.sites[0].sync.accountId);
+    assert.equal(state.sites[0].sync.accountId, state.sites[1].sync.accountId);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeps cached session secrets out of renderer state and config exports', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-session-projection-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    const site = await service.addSite({
+      name: 'session projection',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-session-projection',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://panel.example.com/console/token',
+        username: 'shared@example.com',
+        password: 'secret',
+        providerType: 'new-api'
+      }
+    });
+    await service.updateRemoteAccountSession(site.id, {
+      providerType: 'new-api',
+      origin: 'https://panel.example.com',
+      apiBaseUrl: 'https://panel.example.com/api',
+      token: 'renderer-must-not-see-this-token',
+      cookie: 'session=renderer-must-not-see-this-cookie',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    });
+
+    const rendererState = service.getRendererState();
+    assert.equal(rendererState.remoteAccounts[0].hasSession, true);
+    assert.equal(Object.hasOwn(rendererState.remoteAccounts[0], 'session'), false);
+    assert.doesNotMatch(JSON.stringify(rendererState), /renderer-must-not-see-this-(?:token|cookie)/);
+    assert.doesNotMatch(JSON.stringify(service.exportConfig()), /renderer-must-not-see-this-(?:token|cookie)/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('stores only the local API key hash and keeps it across global config imports', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-local-key-storage-'));
+  const filePath = join(dir, 'config.json');
+  const localApiKey = 'jp-local-storage-test-0123456789abcdef';
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    await assert.rejects(() => service.generateLocalApiKey('too-short'), /at least 32 bytes/);
+    await service.generateLocalApiKey(localApiKey);
+    const storedHash = service.getState().proxy.localApiKeyHash;
+
+    await service.importConfig({
+      version: 1,
+      settings: { proxy: { port: 9888 } },
+      sites: []
+    }, { includeGlobalSettings: true });
+
+    const rendererState = service.getRendererState();
+    assert.equal(service.verifyLocalApiKey(localApiKey), true);
+    assert.match(storedHash, /^[a-f0-9]{64}$/);
+    assert.equal(service.getState().proxy.localApiKeyHash, storedHash);
+    assert.equal(Object.hasOwn(rendererState.proxy, 'localApiKeyHash'), false);
+    assert.equal(JSON.stringify(service.exportConfig()).includes(storedHash), false);
+    assert.equal((await readFile(filePath, 'utf8')).includes(localApiKey), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('removes an orphaned shared account after its last site switches accounts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-switch-shared-account-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    const first = await service.addSite({
+      name: 'first account',
+      baseUrl: 'https://first.example.com/v1',
+      apiKey: 'sk-first',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://first-panel.example.com/keys',
+        username: 'first@example.com',
+        password: 'first-secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const second = await service.addSite({
+      name: 'second account',
+      baseUrl: 'https://second.example.com/v1',
+      apiKey: 'sk-second',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://second-panel.example.com/keys',
+        username: 'second@example.com',
+        password: 'second-secret',
+        providerType: 'modern-v1'
+      }
+    });
+
+    await service.updateSite(first.id, {
+      sync: {
+        ...service.findSite(first.id).sync,
+        accountId: second.sync.accountId,
+        dashboardUrl: second.sync.dashboardUrl,
+        username: second.sync.username,
+        password: second.sync.password,
+        providerType: second.sync.providerType
+      }
+    });
+
+    const state = service.getState();
+    assert.equal(state.remoteAccounts.length, 1);
+    assert.equal(state.sites[0].sync.accountId, second.sync.accountId);
+    assert.equal(state.sites[1].sync.accountId, second.sync.accountId);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('immediately merges shared accounts when edited credentials match an existing identity', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-merge-shared-account-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    const service = new ConfigService({ filePath });
+    await service.load();
+    const first = await service.addSite({
+      name: 'first account',
+      baseUrl: 'https://first.example.com/v1',
+      apiKey: 'sk-first',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://first-panel.example.com/keys',
+        username: 'first@example.com',
+        password: 'first-secret',
+        providerType: 'modern-v1'
+      }
+    });
+    const second = await service.addSite({
+      name: 'second account',
+      baseUrl: 'https://second.example.com/v1',
+      apiKey: 'sk-second',
+      sync: {
+        enabled: true,
+        dashboardUrl: 'https://second-panel.example.com/keys',
+        username: 'second@example.com',
+        password: 'second-secret',
+        providerType: 'modern-v1'
+      }
+    });
+
+    await service.updateSite(first.id, {
+      sync: {
+        ...service.findSite(first.id).sync,
+        dashboardUrl: 'https://second-panel.example.com/account',
+        username: 'SECOND@example.com'
+      }
+    });
+
+    const state = service.getState();
+    assert.equal(state.remoteAccounts.length, 1);
+    assert.equal(state.sites[0].sync.accountId, second.sync.accountId);
+    assert.equal(state.sites[1].sync.accountId, second.sync.accountId);
+    assert.equal(state.sites[0].sync.password, 'second-secret');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('loads persisted auto-provision attempts during startup', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'openapi-proxy-auto-provision-reload-'));
+  const filePath = join(dir, 'config.json');
+
+  try {
+    await writeFile(filePath, JSON.stringify({
+      autoProvisionAttempts: [{
+        accountId: 'account-1',
+        groupId: 'low-group',
+        groupName: 'Low group',
+        lastAttemptAt: '2026-08-04T08:00:00+08:00',
+        nextAttemptAt: '2026-08-05T08:00:00+08:00',
+        status: 'failure',
+        error: 'Availability test failed'
+      }]
+    }), 'utf8');
+
+    const service = new ConfigService({ filePath });
+    await service.load();
+
+    assert.deepEqual(service.getState().autoProvisionAttempts, [{
+      accountId: 'account-1',
+      groupId: 'low-group',
+      groupName: 'Low group',
+      lastAttemptAt: '2026-08-04T00:00:00.000Z',
+      nextAttemptAt: '2026-08-05T00:00:00.000Z',
+      status: 'failure',
+      error: 'Availability test failed'
+    }]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

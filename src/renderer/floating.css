@@ -123,10 +123,11 @@ input {
 
 .floating-panel {
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 10px;
   width: 100%;
   height: 100%;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: rgb(255 255 255 / 98%);
@@ -240,8 +241,10 @@ input {
 .floating-details {
   display: grid;
   grid-template-columns: 78px minmax(0, 1fr);
+  min-height: 0;
   gap: 6px 10px;
   margin: 0;
+  overflow: auto;
   border-top: 1px solid var(--line);
   padding-top: 10px;
 }
@@ -264,9 +267,16 @@ input {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   border-top: 1px solid var(--line);
   padding-top: 10px;
+}
+
+.floating-action-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .toggle {
@@ -293,4 +303,20 @@ input {
   font-size: 12px;
   font-weight: 750;
   cursor: pointer;
+}
+
+.floating-actions button.secondary {
+  border-color: var(--line-strong);
+  background: var(--surface);
+  color: var(--primary);
+}
+
+.floating-actions button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.floating-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }

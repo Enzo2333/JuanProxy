@@ -4,8 +4,10 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const rendererHtmlPath = fileURLToPath(new URL('../src/renderer/index.html', import.meta.url));
+const rendererAppPath = fileURLToPath(new URL('../src/renderer/app.js', import.meta.url));
 const floatingHtmlPath = fileURLToPath(new URL('../src/renderer/floating.html', import.meta.url));
 const mainJsPath = fileURLToPath(new URL('../src/main.js', import.meta.url));
+const preloadJsPath = fileURLToPath(new URL('../src/preload.js', import.meta.url));
 let rendererImportCounter = 0;
 
 function createElementStub(tagName = 'div') {
@@ -70,6 +72,10 @@ function createElementStub(tagName = 'div') {
       attributes.set(name, String(value));
       this[name] = value;
     },
+    removeAttribute(name) {
+      attributes.delete(name);
+      delete this[name];
+    },
     getAttribute(name) {
       return attributes.get(name);
     },
@@ -85,6 +91,12 @@ function createElementStub(tagName = 'div') {
       if (globalThis.document) {
         globalThis.document.activeElement = this;
       }
+    },
+    showModal() {
+      this.open = true;
+    },
+    close() {
+      this.open = false;
     }
   };
 }
@@ -96,13 +108,16 @@ function tagNameForSelector(selector) {
     '#site-sync-global-interval-unit',
     '#group-sync-interval-unit',
     '#config-export-mode',
+    '#site-sync-account',
     '#site-sync-provider-type',
     '#site-sync-interval-mode',
     '#site-sync-interval-unit',
     '#rate-limit-window-unit',
     '#auto-recovery-interval-unit',
     '#site-status-filter',
-    '#site-sort'
+    '#site-sort',
+    '#activity-category-filter',
+    '#activity-status-filter'
   ]);
   const textareaSelectors = new Set([
     '#global-model-mapping',
@@ -111,9 +126,12 @@ function tagNameForSelector(selector) {
   ]);
   const inputSelectors = new Set([
     '#proxy-port',
+    '#allow-lan-access',
     '#proxy-timeout-seconds',
     '#proxy-replay-buffer-mb',
+    '#codex-recovery-enabled',
     '#failure-threshold',
+    '#global-test-model',
     '#smart-switching',
     '#auto-switch-multiplier-limit-enabled',
     '#auto-switch-max-multiplier',
@@ -129,10 +147,11 @@ function tagNameForSelector(selector) {
     '#site-name',
     '#site-base-url',
     '#site-api-key',
-    '#site-test-model',
     '#site-model-mapping-enabled',
     '#site-priority',
     '#site-multiplier',
+    '#site-custom-multiplier-enabled',
+    '#site-custom-multiplier',
     '#site-multiplier-locked',
     '#site-sync-enabled',
     '#site-sync-dashboard-url',
@@ -165,6 +184,7 @@ async function setupRendererApp({
   activeSiteId = null,
   proxy = {
     port: 8787,
+    allowLanAccess: false,
     timeoutMs: 120000,
     maxReplayableRequestBodyBytes: 16 * 1024 * 1024,
     failureThreshold: 3,
@@ -177,6 +197,7 @@ async function setupRendererApp({
     port: null,
     error: null
   },
+  proxyAccessUrls = ['http://127.0.0.1:8787/v1'],
   siteSync = {
     intervalValue: 30,
     intervalUnit: 'minute',
@@ -191,6 +212,10 @@ async function setupRendererApp({
     enabled: false,
     mappings: []
   },
+  remoteAccounts = [],
+  recentRouteTraces = [],
+  activityLogEntries = [],
+  siteSyncStatus = null,
   appSettings = {
     floatingWindow: {
       alwaysOnTop: false
@@ -221,7 +246,9 @@ async function setupRendererApp({
       ]
     }
   },
-  copyTextError = null
+  copyTextError = null,
+  generatedLocalApiKey = 'jp-generated-local-key',
+  switchSiteGroupError = null
 } = {}) {
   const elements = new Map();
   const windowListeners = new Map();
@@ -237,14 +264,19 @@ async function setupRendererApp({
     modelMapping,
     siteSync,
     groupSync,
+    remoteAccounts,
     proxyStatus,
+    proxyAccessUrls,
     activeSiteId,
-    sites
+    sites,
+    recentRouteTraces,
+    siteSyncStatus
   };
   const siteTestCalls = [];
   const capabilityDetectionCalls = [];
   const siteSyncCalls = [];
   const siteCreateKeyCalls = [];
+  const siteLogoutCalls = [];
   const refreshAllSiteSyncCalls = [];
   const siteAdds = [];
   const siteUpdates = [];
@@ -256,12 +288,16 @@ async function setupRendererApp({
   const configImportPreviewCalls = [];
   const configImportCalls = [];
   const runtimeLogCalls = [];
+  const activityLogListCalls = [];
+  const activityLogClearCalls = [];
   const confirmMessages = [];
   const stateChangedListeners = [];
   const siteChangedListeners = [];
+  const activityLogChangedListeners = [];
+  let currentActivityLogEntries = [...activityLogEntries];
 
   globalThis.window = {
-    innerWidth: 900,
+    innerWidth: 1180,
     innerHeight: 700,
     openApiProxy: {
       async getState() {
@@ -488,36 +524,58 @@ async function setupRendererApp({
       },
       async createSiteKey(id) {
         siteCreateKeyCalls.push(id);
-        appState.sites = appState.sites.map((site) =>
-          site.id === id
-            ? {
-                ...site,
-                apiKey: 'sk-created',
-                multiplier: 0.001,
-                sync: {
-                  ...site.sync,
-                  lastSyncAt: '2026-06-09T08:00:00.000Z',
-                  lastSyncStatus: 'success',
-                  lastSyncError: null,
-                  remote: {
-                    ...site.sync?.remote,
-                    providerType: site.sync?.providerType ?? 'modern-v1',
-                    keyName: site.name,
-                    remoteKeyId: '37',
-                    keyGroup: 'Example Team',
-                    groupId: '18',
-                    groupMultiplier: 0.001
-                  }
-                }
+        const source = appState.sites.find((site) => site.id === id);
+        const createdSiteId = 'site-created';
+        appState.sites = [
+          ...appState.sites,
+          {
+            ...source,
+            id: createdSiteId,
+            name: `${source.name} 新密钥`,
+            apiKey: 'sk-created',
+            multiplier: 0.001,
+            sync: {
+              ...source.sync,
+              lastSyncAt: '2026-06-09T08:00:00.000Z',
+              lastSyncStatus: 'success',
+              lastSyncError: null,
+              remote: {
+                ...source.sync?.remote,
+                providerType: source.sync?.providerType ?? 'modern-v1',
+                keyName: source.name,
+                remoteKeyId: '37',
+                keyGroup: 'Example Team',
+                groupId: '18',
+                groupMultiplier: 0.001
               }
-            : site
-        );
+            }
+          }
+        ];
         return {
           ...appState,
           createKeyResult: {
             ok: true,
             multiplier: 0.001,
-            keyName: 'site'
+            keyName: 'site',
+            createdSiteId
+          }
+        };
+      },
+      async logoutSiteAccount(id) {
+        siteLogoutCalls.push(id);
+        const accountId = appState.sites.find((site) => site.id === id)?.sync?.accountId;
+        appState.remoteAccounts = appState.remoteAccounts.map((account) =>
+          account.id === accountId
+            ? { ...account, hasSession: false, lastLogoutAt: '2026-07-29T08:00:00.000Z' }
+            : account
+        );
+        return {
+          ...appState,
+          logoutResult: {
+            ok: true,
+            remoteAttempted: true,
+            remoteSucceeded: true,
+            reason: null
           }
         };
       },
@@ -532,6 +590,9 @@ async function setupRendererApp({
         return appState;
       },
       async switchSiteGroup(id, group) {
+        if (switchSiteGroupError) {
+          throw switchSiteGroupError;
+        }
         const groupName = typeof group === 'object' ? group.groupName : group;
         const groupId = typeof group === 'object' ? group.groupId : '';
         siteUpdates.push({
@@ -634,9 +695,21 @@ async function setupRendererApp({
           throw copyTextError;
         }
       },
+      async generateLocalApiKey() {
+        return { localApiKey: generatedLocalApiKey };
+      },
       async logRuntimeError(input) {
         runtimeLogCalls.push(input);
         return { ok: true, filePath: 'test-runtime-errors.jsonl' };
+      },
+      async listActivityLogs(options) {
+        activityLogListCalls.push(options);
+        return [...currentActivityLogEntries];
+      },
+      async clearActivityLogs() {
+        activityLogClearCalls.push(true);
+        currentActivityLogEntries = [];
+        return { ok: true };
       },
       onStateChanged(callback) {
         stateChangedListeners.push(callback);
@@ -644,6 +717,10 @@ async function setupRendererApp({
       },
       onSiteChanged(callback) {
         siteChangedListeners.push(callback);
+        return () => {};
+      },
+      onActivityLogChanged(callback) {
+        activityLogChangedListeners.push(callback);
         return () => {};
       }
     },
@@ -662,8 +739,14 @@ async function setupRendererApp({
       }
     }
   };
+  const documentBody = createElementStub('body');
   globalThis.document = {
     activeElement: null,
+    body: documentBody,
+    documentElement: {
+      clientWidth: 1180,
+      clientHeight: 700
+    },
     querySelector(selector) {
       if (!elements.has(selector)) {
         elements.set(selector, createElementStub(tagNameForSelector(selector)));
@@ -695,6 +778,7 @@ async function setupRendererApp({
     capabilityDetectionCalls,
     siteSyncCalls,
     siteCreateKeyCalls,
+    siteLogoutCalls,
     refreshAllSiteSyncCalls,
     siteAdds,
     siteUpdates,
@@ -706,6 +790,8 @@ async function setupRendererApp({
     configImportPreviewCalls,
     configImportCalls,
     runtimeLogCalls,
+    activityLogListCalls,
+    activityLogClearCalls,
     confirmMessages,
     setConfirmHandler(handler) {
       globalThis.confirm = (message) => {
@@ -728,6 +814,13 @@ async function setupRendererApp({
       for (const listener of siteChangedListeners) {
         listener(patch);
       }
+    },
+    async dispatchActivityLogChanged(entries) {
+      currentActivityLogEntries = [...entries];
+      for (const listener of activityLogChangedListeners) {
+        listener();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   };
 }
@@ -820,6 +913,39 @@ test('renderer preserves focused proxy settings while still updating proxy statu
 
   assert.equal(portInput.value, '9999');
   assert.equal(elements.get('#proxy-url').textContent, 'http://127.0.0.1:8788/v1');
+});
+
+test('renderer saves LAN access and displays the LAN endpoint when enabled', async () => {
+  const { elements, proxyUpdates } = await setupRendererApp({
+    proxy: {
+      port: 10730,
+      allowLanAccess: true,
+      timeoutMs: 120000,
+      maxReplayableRequestBodyBytes: 16 * 1024 * 1024,
+      failureThreshold: 3,
+      smartSwitching: false,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    },
+    proxyStatus: {
+      running: true,
+      host: '0.0.0.0',
+      port: 10730,
+      error: null
+    },
+    proxyAccessUrls: [
+      'http://10.0.0.20:10730/v1',
+      'http://127.0.0.1:10730/v1'
+    ]
+  });
+
+  assert.equal(elements.get('#allow-lan-access').checked, true);
+  assert.equal(elements.get('#proxy-endpoint-label').textContent, '局域网代理');
+  assert.equal(elements.get('#proxy-url').textContent, 'http://10.0.0.20:10730/v1');
+
+  elements.get('#allow-lan-access').checked = false;
+  await elements.get('#save-proxy').dispatchEvent('click');
+  assert.equal(proxyUpdates.at(-1).allowLanAccess, false);
 });
 
 test('formats last request time as relative elapsed text', async () => {
@@ -1075,6 +1201,13 @@ test('builds request dashboard totals and success rate by period', async () => {
   );
 });
 
+test('formats multiplier values without binary floating-point tails', async () => {
+  const { formatMultiplier } = await importRendererApp();
+
+  assert.equal(formatMultiplier(0.35 * 0.1), '0.035');
+  assert.equal(formatMultiplier(0.00001), '0.00001');
+});
+
 test('renderer renders request dashboard as a time-bucket column chart', async () => {
   const { elements } = await setupRendererApp({
     sites: [
@@ -1173,10 +1306,99 @@ test('renderer renders request dashboard for the selected site only', async () =
 
   await elements.get('#new-site').dispatchEvent('click');
 
-  assert.equal(elements.get('#site-test-model').value, 'example-chat-model');
+  assert.equal(elements.has('#site-test-model'), false);
+  assert.equal(elements.get('#global-test-model').value, 'example-chat-model');
   assert.equal(elements.get('#dashboard-requests').textContent, '0');
   assert.equal(elements.get('#dashboard-success').textContent, '0');
   assert.equal(elements.get('#dashboard-errors').textContent, '0');
+});
+
+test('renderer renders recent request route traces with request-local failover attempts', async () => {
+  const { elements } = await setupRendererApp({
+    activeSiteId: 'site-1',
+    sites: [
+      {
+        id: 'site-1',
+        name: 'first',
+        baseUrl: 'https://first.example/v1',
+        apiKey: 'sk-first',
+        manualEnabled: true,
+        enabled: true,
+        errorLog: []
+      },
+      {
+        id: 'site-2',
+        name: 'second',
+        baseUrl: 'https://second.example/v1',
+        apiKey: 'sk-second',
+        manualEnabled: true,
+        enabled: true,
+        errorLog: []
+      }
+    ],
+    recentRouteTraces: [
+      {
+        id: 'trace-1',
+        startedAt: '2026-07-07T14:53:20.000Z',
+        completedAt: '2026-07-07T14:53:21.000Z',
+        durationMs: 1000,
+        method: 'POST',
+        path: '/v1/responses',
+        queryKeys: ['api_key'],
+        contentType: 'application/json',
+        replayable: true,
+        originalModel: 'client-model',
+        forwardedModel: 'upstream-model',
+        modelMapped: true,
+        initialActiveSiteId: 'site-1',
+        finalActiveSiteId: 'site-1',
+        finalSiteId: 'site-2',
+        finalStatusCode: 200,
+        outcome: 'success',
+        requestLocalFailover: true,
+        globalSelectionPreserved: true,
+        attempts: [
+          {
+            siteId: 'site-1',
+            siteName: 'first',
+            ok: false,
+            kind: 'upstream-response',
+            statusCode: 500,
+            classification: {
+              retryable: true,
+              requestLocalRetry: true,
+              affectsSiteHealth: false,
+              reason: 'request content was rejected by upstream sensitive-word policy'
+            }
+          },
+          {
+            siteId: 'site-2',
+            siteName: 'second',
+            ok: true,
+            kind: 'upstream-response',
+            statusCode: 200,
+            classification: null
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.match(elements.get('#route-trace-summary').textContent, /1/);
+  const html = elements.get('#route-trace-log').innerHTML;
+  assert.match(html, /route-trace-entry/);
+  assert.match(html, /POST/);
+  assert.match(html, /\/v1\/responses/);
+  assert.match(html, /client-model/);
+  assert.match(html, /upstream-model/);
+  assert.match(html, /first/);
+  assert.match(html, /second/);
+  assert.match(html, /HTTP 500/);
+  assert.match(html, /HTTP 200/);
+  assert.match(html, /request content was rejected by upstream sensitive-word policy/);
+  assert.doesNotMatch(html, /api_key=.*secret/);
+  assert.doesNotMatch(html, /sk-first/);
+  assert.doesNotMatch(html, /sk-second/);
 });
 
 test('renderer filters the site list by selected availability status', async () => {
@@ -1240,7 +1462,7 @@ test('renderer filters the site list by selected availability status', async () 
   assert.match(elements.get('#site-list-summary').textContent, /1\/3 个配置 · 人工停用/);
 });
 
-test('renderer sorts the site list by request count, success rate, balance and multiplier', async () => {
+test('renderer sorts the site list by request count, success rate, balance and effective multiplier', async () => {
   const { elements } = await setupRendererApp({
     sites: [
       {
@@ -1274,9 +1496,11 @@ test('renderer sorts the site list by request count, success rate, balance and m
         enabled: true,
         status: 'success',
         multiplier: 0.5,
+        customMultiplier: 2,
         sync: {
           remote: {
-            balance: '$9.50'
+            balance: '$9.50',
+            groupMultiplier: 0.05
           }
         },
         requestCount: 2,
@@ -1297,7 +1521,8 @@ test('renderer sorts the site list by request count, success rate, balance and m
         multiplier: 0.001,
         sync: {
           remote: {
-            balance: '$0.20'
+            balance: '$0.20',
+            groupMultiplier: 1
           }
         },
         requestCount: 1,
@@ -1326,11 +1551,11 @@ test('renderer sorts the site list by request count, success rate, balance and m
 
   elements.get('#site-sort').value = 'multiplier';
   await elements.get('#site-sort').dispatchEvent('change');
-  assert.deepEqual(listIds(), ['multiplier', 'requests', 'balance']);
+  assert.deepEqual(listIds(), ['balance', 'requests', 'multiplier']);
 });
 
-test('renderer filters the site list by a synced topbar group and can clear the filter', async () => {
-  const { elements } = await setupRendererApp({
+test('renderer opens low multiplier groups in place and keeps navigation context', async () => {
+  const { elements, siteUpdates } = await setupRendererApp({
     sites: [
       {
         id: 'site-a',
@@ -1347,10 +1572,10 @@ test('renderer filters the site list by a synced topbar group and can clear the 
             balance: '$1.44',
             keyName: 'n',
             keyGroup: 'Example Team',
-            groupMultiplier: 0.001,
+            groupMultiplier: 0.045,
             groups: [
-              { id: 'example-team', name: 'Example Team', multiplier: 0.001, selected: true },
-              { id: 'plus', name: 'GPT Plus', multiplier: 0.045, selected: false }
+              { id: 'example-team', name: 'Example Team', multiplier: 0.045, selected: true },
+              { id: 'budget', name: 'Budget', multiplier: 0.001, selected: false }
             ]
           }
         },
@@ -1414,20 +1639,120 @@ test('renderer filters the site list by a synced topbar group and can clear the 
   assert.equal(elements.get('#toggle-topbar-sync-groups').hidden, true);
   assert.equal(groupBar.children[0].dataset.siteId, 'site-a');
   assert.equal(groupBar.children[0].dataset.filterKey, 'https://sync.example.com');
-  assert.match(groupBar.children[0].textContent, /Example Team/);
+  assert.match(groupBar.children[0].textContent, /Budget/);
   assert.doesNotMatch(groupBar.children[0].textContent, /0\.001x.*0\.001x/);
   assert.match(groupBar.children[0].title, /ExampleRelay/);
 
   await groupBar.children[0].dispatchEvent('click');
 
-  assert.deepEqual(listIds(), ['site-a', 'site-a-alt']);
-  assert.match(elements.get('#site-list-summary').textContent, /站点筛选 ExampleRelay/);
-  assert.equal(elements.get('#clear-site-group-filter').hidden, false);
-
-  await elements.get('#clear-site-group-filter').dispatchEvent('click');
-
+  assert.equal(elements.get('#view-sites').hidden, false);
   assert.deepEqual(listIds(), ['site-a', 'site-a-alt', 'site-b']);
   assert.equal(elements.get('#clear-site-group-filter').hidden, true);
+  assert.equal(elements.get('#site-group-popover').hidden, false);
+  assert.match(elements.get('#site-group-popover-title').textContent, /Budget/);
+  assert.match(elements.get('#site-group-popover-meta').innerHTML, /ExampleRelay/);
+  assert.match(elements.get('#site-group-popover-meta').innerHTML, /\$1\.44/);
+  assert.match(elements.get('#site-group-popover-meta').innerHTML, /0\.001x/);
+
+  await elements.get('#site-group-popover-switch').dispatchEvent('click');
+
+  assert.equal(siteUpdates.at(-1).id, 'site-a');
+  assert.equal(siteUpdates.at(-1).switchGroupName, 'Budget');
+  assert.equal(elements.get('#view-sites').hidden, false);
+  assert.equal(elements.get('#site-group-popover').hidden, true);
+  assert.deepEqual(listIds(), ['site-a', 'site-a-alt', 'site-b']);
+});
+
+test('renderer protects dirty site edits before changing the inspected site', async () => {
+  const { elements, siteUpdates } = await setupRendererApp({
+    activeSiteId: 'site-a',
+    sites: [
+      {
+        id: 'site-a',
+        name: 'Alpha',
+        baseUrl: 'https://alpha.example/v1',
+        apiKey: 'sk-alpha',
+        manualEnabled: true,
+        enabled: true,
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        errorLog: []
+      },
+      {
+        id: 'site-b',
+        name: 'Beta',
+        baseUrl: 'https://beta.example/v1',
+        apiKey: 'sk-beta',
+        manualEnabled: true,
+        enabled: true,
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        errorLog: []
+      }
+    ]
+  });
+
+  elements.get('#site-name').value = 'Alpha edited';
+  await elements.get('#site-form').dispatchEvent('input');
+
+  const betaMainButton = elements.get('#site-list').children[1].children[0];
+  await betaMainButton.dispatchEvent('click');
+
+  assert.equal(elements.get('#unsaved-changes-dialog').hidden, false);
+  assert.equal(elements.get('#site-name').value, 'Alpha edited');
+  assert.match(elements.get('#site-list').children[0].className, /active/);
+  assert.doesNotMatch(elements.get('#site-list').children[1].className, /active/);
+
+  await elements.get('#unsaved-changes-cancel').dispatchEvent('click');
+  assert.equal(elements.get('#unsaved-changes-dialog').hidden, true);
+  assert.equal(elements.get('#site-name').value, 'Alpha edited');
+
+  await betaMainButton.dispatchEvent('click');
+  await elements.get('#unsaved-changes-save').dispatchEvent('click');
+
+  assert.equal(siteUpdates.at(-1).id, 'site-a');
+  assert.equal(siteUpdates.at(-1).patch.name, 'Alpha edited');
+  assert.equal(elements.get('#unsaved-changes-dialog').hidden, true);
+  assert.equal(elements.get('#site-name').value, 'Beta');
+  assert.match(elements.get('#site-list').children[1].className, /active/);
+});
+
+test('renderer keeps the low multiplier popover open when group switching fails', async () => {
+  const { elements } = await setupRendererApp({
+    switchSiteGroupError: new Error('remote group switch failed'),
+    sites: [{
+      id: 'site-a',
+      name: 'Alpha',
+      baseUrl: 'https://alpha.example/v1',
+      apiKey: 'sk-alpha',
+      manualEnabled: true,
+      enabled: true,
+      sync: {
+        dashboardUrl: 'https://alpha.example/console',
+        remote: {
+          balance: '$8.00',
+          keyGroup: 'Plus',
+          groupMultiplier: 0.12,
+          groups: [
+            { id: 'budget', name: 'Budget', multiplier: 0.08, selected: false },
+            { id: 'plus', name: 'Plus', multiplier: 0.12, selected: true }
+          ]
+        }
+      },
+      requestCount: 0,
+      successCount: 0,
+      errorCount: 0,
+      errorLog: []
+    }]
+  });
+
+  await elements.get('#topbar-sync-groups').children[0].dispatchEvent('click');
+  await elements.get('#site-group-popover-switch').dispatchEvent('click');
+
+  assert.equal(elements.get('#site-group-popover').hidden, false);
+  assert.match(elements.get('#toast').textContent, /remote group switch failed/);
 });
 
 test('renderer ranks low multiplier groups after deduplicating by dashboard website', async () => {
@@ -1440,6 +1765,7 @@ test('renderer ranks low multiplier groups after deduplicating by dashboard webs
         apiKey: 'sk-a',
         manualEnabled: true,
         enabled: true,
+        customMultiplier: 0.1,
         sync: {
           dashboardUrl: 'https://sync.example.com/keys',
           remote: {
@@ -1463,6 +1789,7 @@ test('renderer ranks low multiplier groups after deduplicating by dashboard webs
         apiKey: 'sk-a-alt',
         manualEnabled: true,
         enabled: true,
+        customMultiplier: 10,
         sync: {
           dashboardUrl: 'https://sync.example.com/profile',
           remote: {
@@ -1486,6 +1813,7 @@ test('renderer ranks low multiplier groups after deduplicating by dashboard webs
         apiKey: 'sk-b',
         manualEnabled: true,
         enabled: true,
+        customMultiplier: 0.2,
         sync: {
           dashboardUrl: 'https://other-sync.example.com/console/token',
           remote: {
@@ -1509,13 +1837,32 @@ test('renderer ranks low multiplier groups after deduplicating by dashboard webs
   const groupBar = elements.get('#topbar-sync-groups');
 
   assert.equal(groupBar.children.length, 2);
-  assert.equal(groupBar.children[0].dataset.siteId, 'site-a-alt');
-  assert.equal(groupBar.children[0].dataset.filterKey, 'https://sync.example.com');
-  assert.match(groupBar.children[0].textContent, /Cloud low/);
+  assert.equal(groupBar.children[0].dataset.siteId, 'site-b');
+  assert.equal(groupBar.children[0].dataset.filterKey, 'https://other-sync.example.com');
+  assert.match(groupBar.children[0].textContent, /Other low.*0\.0004x/);
+  assert.match(groupBar.children[0].title, /远端倍率：0\.002x/);
+  assert.match(groupBar.children[0].title, /自定义倍数：0\.2x/);
+  assert.match(groupBar.children[0].title, /实际倍率：0\.0004x/);
 
-  await groupBar.children[0].dispatchEvent('click');
+  assert.equal(groupBar.children[1].dataset.siteId, 'site-a');
+  assert.equal(groupBar.children[1].dataset.filterKey, 'https://sync.example.com');
+  assert.match(groupBar.children[1].textContent, /Cloud standard.*0\.001x/);
+
+  await groupBar.children[1].dispatchEvent('click');
+
+  assert.deepEqual(listIds(), ['site-a', 'site-a-alt', 'site-b']);
+  assert.equal(elements.get('#site-group-popover').hidden, false);
+
+  await elements.get('#site-group-popover-filter').dispatchEvent('click');
 
   assert.deepEqual(listIds(), ['site-a', 'site-a-alt']);
+  assert.equal(elements.get('#clear-site-group-filter').hidden, false);
+  assert.match(elements.get('#clear-site-group-filter').textContent, /ExampleRelay/);
+  assert.match(elements.get('#topbar-sync-groups').children[1].className, /filtered/);
+  assert.equal(
+    elements.get('#topbar-sync-groups').children[1].getAttribute('aria-pressed'),
+    'true'
+  );
 });
 
 test('renderer can expand the topbar low multiplier groups beyond the first three', async () => {
@@ -1778,7 +2125,7 @@ test('floating window exposes a circular independent active-site surface', async
   assert.match(js, /setFloatingWindowExpanded/);
   assert.match(js, /setFloatingWindowBounds/);
   assert.match(js, /updateAppSettings/);
-  assert.match(js, /return `\$\{formatMultiplier\(site\?\.multiplier\)\}x`/);
+  assert.match(js, /return `\$\{formatMultiplier\(calculateEffectiveMultiplier\(site\)\)\}x`/);
   assert.doesNotMatch(js, /return site\?\.sync\?\.remote\?\.balance \|\| `\$\{formatMultiplier/);
   assert.match(js, /pointerenter/);
   assert.match(js, /scheduleHoverExpand/);
@@ -1798,6 +2145,265 @@ test('main process creates an independent always-on-top capable floating window'
   assert.match(source, /scheduleFloatingWindowPositionSave/);
 });
 
+test('main process prevents concurrent JuanProxy instances from racing the proxy and config', async () => {
+  const mainSource = await readFile(mainJsPath, 'utf8');
+
+  assert.match(mainSource, /app\.requestSingleInstanceLock\(\)/);
+  assert.match(mainSource, /app\.on\('second-instance'/);
+});
+
+test('main process stores, logs and broadcasts recent request route traces', async () => {
+  const source = await readFile(mainJsPath, 'utf8');
+
+  assert.match(source, /MAX_RECENT_ROUTE_TRACES/);
+  assert.match(source, /let recentRouteTraces = \[\]/);
+  assert.match(source, /proxyServer\.on\('route-trace'/);
+  assert.match(source, /runtimeLogger\s*\?\s*\.info\('proxy\.route-trace'/);
+  assert.match(source, /route-trace:changed/);
+  assert.match(source, /recentRouteTraces:/);
+});
+
+test('renderer exposes the five-task integrated workspace navigation', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+
+  assert.match(html, /id="app-nav"/);
+  assert.match(html, /id="nav-sites"[\s\S]*?<span>控制台<\/span>/);
+  assert.match(html, /id="nav-strategy"/);
+  assert.match(html, /id="nav-diagnostics"/);
+  assert.match(html, /id="nav-activity"/);
+  assert.match(html, /id="nav-settings"/);
+  assert.match(html, /id="view-sites"/);
+  assert.match(html, /id="view-strategy"/);
+  assert.match(html, /id="view-diagnostics"/);
+  assert.match(html, /id="view-activity"/);
+  assert.match(html, /id="view-settings"/);
+  assert.match(html, /id="site-tab-overview"/);
+  assert.match(html, /id="site-tab-basic"/);
+  assert.match(html, /id="site-tab-sync"/);
+  assert.match(html, /id="site-tab-models"/);
+  assert.match(html, /id="site-tab-policy"/);
+  assert.match(html, /id="site-inspector"/);
+});
+
+test('renderer starts in the integrated console and switches task views', async () => {
+  const { elements } = await setupRendererApp();
+
+  assert.equal(elements.get('#view-sites').hidden, false);
+  assert.equal(elements.get('#nav-sites').className, 'active');
+
+  await elements.get('#nav-diagnostics').dispatchEvent('click');
+
+  assert.equal(elements.get('#view-sites').hidden, true);
+  assert.equal(elements.get('#view-diagnostics').hidden, false);
+  assert.equal(elements.get('#nav-diagnostics').className, 'active');
+});
+
+test('renderer shows monitor status and user-friendly automatic import activity', async () => {
+  const { elements } = await setupRendererApp({
+    siteSyncStatus: {
+      monitoring: true,
+      checking: false,
+      intervalMs: 60_000,
+      lastCheckCompletedAt: '2026-08-04T08:00:00.000Z',
+      nextCheckAt: '2026-08-04T08:01:00.000Z',
+      checkedWebsiteCount: 2,
+      syncedWebsiteCount: 1,
+      failedWebsiteCount: 1
+    },
+    activityLogEntries: [
+      {
+        timestamp: '2026-08-04T08:00:03.000Z',
+        level: 'info',
+        source: 'activity.auto-provision',
+        message: '已导入并启用“低倍率站点”',
+        context: {
+          category: 'auto-provision',
+          type: 'imported',
+          status: 'success',
+          siteName: '示例站点',
+          groupName: '低倍率组',
+          candidateMultiplier: 0.003,
+          currentLowestMultiplier: 0.01,
+          trigger: 'scheduled'
+        }
+      },
+      {
+        timestamp: '2026-08-04T08:00:02.000Z',
+        level: 'warn',
+        source: 'activity.auto-provision',
+        message: '候选倍率不低于当前最低，本次跳过',
+        context: {
+          category: 'auto-provision',
+          type: 'not-beneficial',
+          status: 'skipped'
+        }
+      }
+    ]
+  });
+
+  await elements.get('#nav-activity').dispatchEvent('click');
+
+  assert.equal(elements.get('#view-activity').hidden, false);
+  assert.equal(elements.get('#activity-monitor-status').textContent, '监控中');
+  assert.equal(elements.get('#activity-monitor-checking').textContent, '空闲');
+  assert.equal(elements.get('#activity-monitor-counts').textContent, '检查 2 · 成功 1 · 失败 1');
+  assert.match(elements.get('#activity-log-list').innerHTML, /已导入并启用/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /候选倍率不低于当前最低/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /activity-entry success/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /activity-entry skipped/);
+
+  elements.get('#activity-status-filter').value = 'skipped';
+  await elements.get('#activity-status-filter').dispatchEvent('change');
+
+  assert.doesNotMatch(elements.get('#activity-log-list').innerHTML, /已导入并启用/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /候选倍率不低于当前最低/);
+  assert.equal(elements.get('#activity-log-summary').textContent, '显示 1 / 2 条');
+});
+
+test('renderer refreshes activity logs after broadcasts and clears them on request', async () => {
+  const {
+    elements,
+    activityLogListCalls,
+    activityLogClearCalls,
+    dispatchActivityLogChanged
+  } = await setupRendererApp();
+
+  assert.equal(activityLogListCalls.length, 1);
+  await dispatchActivityLogChanged([{
+    timestamp: '2026-08-04T08:00:00.000Z',
+    level: 'error',
+    source: 'activity.auto-provision',
+    message: '模型测试失败，已删除远端密钥',
+    context: {
+      category: 'auto-provision',
+      type: 'test-failed',
+      status: 'failure',
+      rolledBack: true
+    }
+  }]);
+
+  assert.equal(activityLogListCalls.length, 2);
+  assert.match(elements.get('#activity-log-list').innerHTML, /模型测试失败/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /activity-entry failure/);
+  assert.match(elements.get('#activity-log-list').innerHTML, /远端密钥：已执行回滚/);
+
+  await elements.get('#clear-activity-logs').dispatchEvent('click');
+
+  assert.equal(activityLogClearCalls.length, 1);
+  assert.equal(elements.get('#activity-log-summary').textContent, '0 条');
+  assert.match(elements.get('#activity-log-list').innerHTML, /暂无符合条件的运行记录/);
+});
+
+test('renderer switches site workspace tabs without changing the inspected site', async () => {
+  const { elements } = await setupRendererApp({
+    activeSiteId: 'site-a',
+    sites: [{
+      id: 'site-a',
+      name: 'Alpha',
+      baseUrl: 'https://alpha.example/v1',
+      apiKey: 'sk-alpha',
+      enabled: true,
+      requestCount: 0,
+      successCount: 0,
+      errorCount: 0,
+      errorLog: []
+    }]
+  });
+
+  assert.equal(elements.get('#site-tab-overview-panel').hidden, false);
+  assert.equal(elements.get('#site-basic-panel').hidden, true);
+
+  await elements.get('#site-tab-basic').dispatchEvent('click');
+
+  assert.equal(elements.get('#site-tab-overview-panel').hidden, true);
+  assert.equal(elements.get('#site-basic-panel').hidden, false);
+  assert.equal(elements.get('#site-name').value, 'Alpha');
+  assert.equal(elements.get('#site-tab-basic').getAttribute('aria-selected'), 'true');
+});
+
+test('renderer styles the user-tool workspace layout', async () => {
+  const css = [
+    await readFile(new URL('../src/renderer/styles.css', import.meta.url), 'utf8'),
+    await readFile(new URL('../src/renderer/styles/liquid-glass.css', import.meta.url), 'utf8')
+  ].join('\n');
+
+  assert.match(css, /\.user-tool-layout\s*{/);
+  assert.match(css, /grid-template-columns:\s*4\.5rem minmax\(0,\s*1fr\)/);
+  assert.match(css, /\.app-nav\s*{/);
+  assert.match(css, /\.app-nav button\.active/);
+  assert.match(css, /\.workspace\s*{/);
+  assert.match(css, /\.view-section\[hidden\]/);
+  assert.match(css, /\.sites-view\s*{/);
+  assert.match(
+    css,
+    /grid-template-columns:\s*clamp\(15\.5rem,\s*16vw,\s*17rem\)\s+minmax\(28rem,\s*1fr\)\s+clamp\(17\.5rem,\s*18vw,\s*19rem\)/s
+  );
+  assert.match(css, /backdrop-filter:\s*blur\(24px\) saturate\(145%\)/);
+  assert.match(css, /\.diagnostics-grid\s*{/);
+});
+
+test('renderer portals and viewport-positions the group popover above workspace panels', async () => {
+  const source = await readFile(rendererAppPath, 'utf8');
+  const css = await readFile(
+    new URL('../src/renderer/styles/liquid-glass.css', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(source, /document\.body\.append\(elements\.siteGroupPopover\)/);
+  assert.match(source, /function positionSiteGroupPopover\(/);
+  assert.match(source, /getBoundingClientRect\(\)/);
+  assert.match(css, /\.site-group-popover\s*{[^}]*position:\s*fixed/s);
+  assert.match(css, /\.site-group-popover\s*{[^}]*z-index:\s*80/s);
+  assert.match(css, /\.site-group-popover\s*{[^}]*background:\s*rgb\(249 253 255 \/ 96%\)/s);
+});
+
+test('renderer keeps a compact desktop density and uses wide screens for more information', async () => {
+  const css = await readFile(
+    new URL('../src/renderer/styles/liquid-glass.css', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(css, /html\s*{[^}]*font-size:\s*15px/s);
+  assert.match(css, /body\s*{[^}]*font-size:\s*1rem/s);
+  assert.doesNotMatch(css, /html\s*{[^}]*font-size:\s*(?:17|18)px/s);
+  assert.match(css, /button,[\s\S]*?\.text-button\s*{[^}]*min-height:\s*2\.125rem/s);
+  assert.match(css, /\.topbar\s*{[^}]*min-height:\s*4\.25rem[^}]*padding:\s*0\.5rem\s+0\.75rem/s);
+  assert.match(css, /\.user-tool-layout\s*{[^}]*grid-template-columns:\s*4\.5rem\s+minmax\(0,\s*1fr\)/s);
+  assert.match(css, /\.app-nav button\s*{[^}]*min-height:\s*3\.25rem/s);
+  assert.match(
+    css,
+    /\.sites-view\s*{[^}]*grid-template-columns:\s*clamp\(15\.5rem,\s*16vw,\s*17rem\)\s+minmax\(28rem,\s*1fr\)\s+clamp\(17\.5rem,\s*18vw,\s*19rem\)/s
+  );
+  assert.match(css, /@media\s*\(min-width:\s*1600px\)[\s\S]*?\.field-grid\s*{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(10rem,\s*1fr\)\)/s);
+  assert.match(css, /\.site-main h3\s*{[^}]*font-size:\s*1rem/s);
+  assert.match(css, /\.site-tabs button\s*{[^}]*font-size:\s*0\.875rem/s);
+  assert.match(css, /\.site-list\s*{[^}]*align-content:\s*start[^}]*grid-auto-rows:\s*max-content/s);
+  assert.match(css, /\.sync-account-field,\s*\.sync-url-field\s*{[^}]*grid-column:\s*1\s*\/\s*-1/s);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*?\.sites-view\s*{[^}]*grid-template-columns:\s*1fr/s);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*?html,[\s\n]*body\s*{[^}]*overflow:\s*auto/s);
+});
+
+test('main process exposes shared-account logout without returning cached session secrets', async () => {
+  const [mainSource, preloadSource] = await Promise.all([
+    readFile(mainJsPath, 'utf8'),
+    readFile(preloadJsPath, 'utf8')
+  ]);
+
+  assert.match(mainSource, /handleLogged\('site:logout-account'/);
+  assert.match(mainSource, /configService\.getRendererState\(\)/);
+  assert.match(preloadSource, /logoutSiteAccount:\s*\(id\)\s*=>\s*ipcRenderer\.invoke\('site:logout-account',\s*id\)/);
+});
+
+test('renderer keeps the site list inside a bounded scroll area', async () => {
+  const css = await readFile(
+    new URL('../src/renderer/styles/liquid-glass.css', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(css, /\.sites-view > \.sidebar\s*{[^}]*min-height:\s*0/s);
+  assert.match(css, /\.site-list\s*{[^}]*min-height:\s*0[^}]*overflow:\s*auto/s);
+});
+
 test('renderer exposes request dashboard controls', async () => {
   const html = await readFile(rendererHtmlPath, 'utf8');
 
@@ -1807,6 +2413,27 @@ test('renderer exposes request dashboard controls', async () => {
   assert.match(html, /id="dashboard-period-week"/);
   assert.match(html, /id="dashboard-period-month"/);
   assert.match(html, /id="dashboard-success-rate"/);
+});
+
+test('renderer exposes the recent request route trace panel', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+
+  assert.match(html, /id="route-trace-panel"/);
+  assert.match(html, /id="route-trace-summary"/);
+  assert.match(html, /id="route-trace-log"/);
+});
+
+test('renderer keeps the global test model out of site forms and shows recent errors on the site page', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+  const sitesView = html.slice(
+    html.indexOf('id="view-sites"'),
+    html.indexOf('id="view-strategy"')
+  );
+
+  assert.match(html, /id="global-test-model"/);
+  assert.doesNotMatch(html, /id="site-test-model"/);
+  assert.match(sitesView, /id="error-log-panel"/);
+  assert.match(sitesView, />最近错误日志</);
 });
 
 test('renderer exposes site status filter and topbar active site panel', async () => {
@@ -2307,14 +2934,16 @@ test('renderer form exposes site remark field', async () => {
   assert.match(html, /<textarea[^>]+id="site-remark"/);
 });
 
-test('renderer exposes and saves priority mode and site multiplier fields', async () => {
+test('renderer exposes and saves priority mode, real multiplier and optional custom multiplier fields', async () => {
   const html = await readFile(rendererHtmlPath, 'utf8');
 
   assert.match(html, /id="priority-mode"/);
   assert.match(html, /id="site-multiplier" type="text"/);
+  assert.match(html, /id="site-custom-multiplier-enabled"/);
+  assert.match(html, /id="site-custom-multiplier"/);
   assert.match(html, /id="site-multiplier-locked"/);
   assert.match(html, /按优先级/);
-  assert.match(html, /按倍率/);
+  assert.match(html, /按实际倍率/);
 
   const { elements, proxyUpdates, siteUpdates } = await setupRendererApp({
     activeSiteId: 'site-1',
@@ -2338,7 +2967,13 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
         status: 'idle',
         priority: 20,
         multiplier: 0.25,
+        customMultiplier: 2,
         multiplierLocked: true,
+        sync: {
+          remote: {
+            groupMultiplier: 0.5
+          }
+        },
         requestCount: 0,
         successCount: 0,
         errorCount: 0,
@@ -2350,21 +2985,38 @@ test('renderer exposes and saves priority mode and site multiplier fields', asyn
 
   assert.equal(elements.get('#priority-mode').value, 'multiplier');
   assert.equal(elements.get('#site-multiplier').value, 0.25);
+  assert.equal(elements.get('#site-custom-multiplier-enabled').checked, true);
+  assert.equal(elements.get('#site-custom-multiplier-enabled').disabled, true);
+  assert.equal(elements.get('#site-custom-multiplier').value, 2);
+  assert.equal(elements.get('#site-custom-multiplier').disabled, true);
   assert.equal(elements.get('#site-multiplier-locked').checked, true);
+  assert.equal(elements.get('#site-account-multiplier').textContent, '0.5');
+  assert.equal(elements.get('#site-effective-multiplier').textContent, '0.25');
+
+  elements.get('#site-multiplier-locked').checked = false;
+  await elements.get('#site-multiplier-locked').dispatchEvent('change');
+  assert.equal(elements.get('#site-effective-multiplier').textContent, '1');
+  assert.equal(elements.get('#site-custom-multiplier-enabled').disabled, false);
+  assert.equal(elements.get('#site-custom-multiplier').disabled, false);
+  assert.equal(elements.get('#site-multiplier-locked').checked, false);
 
   elements.get('#priority-mode').value = 'priority';
   await elements.get('#save-proxy').dispatchEvent('click');
   assert.equal(proxyUpdates.at(-1).priorityMode, 'priority');
 
   elements.get('#site-multiplier').value = '0.75';
+  elements.get('#site-custom-multiplier').value = '3';
   await elements.get('#site-form').dispatchEvent('submit');
   assert.equal(siteUpdates.at(-1).patch.multiplier, 0.75);
+  assert.equal(siteUpdates.at(-1).patch.customMultiplier, 3);
 
   elements.get('#site-multiplier').value = '0';
+  elements.get('#site-custom-multiplier-enabled').checked = false;
   elements.get('#site-multiplier-locked').checked = false;
   await elements.get('#site-form').dispatchEvent('submit');
   assert.equal(siteUpdates.at(-1).patch.multiplier, 0);
   assert.equal(siteUpdates.at(-1).patch.multiplierLocked, false);
+  assert.equal(siteUpdates.at(-1).patch.customMultiplier, null);
 });
 
 test('renderer hides the API key input unless it is focused', async () => {
@@ -2905,11 +3557,68 @@ test('renderer creates and imports a remote key from the current panel after con
   assert.equal(siteUpdates.at(-1).patch.sync.username, 'user@example.com');
   assert.equal(siteUpdates.at(-1).patch.sync.password, 'secret-2');
   assert.deepEqual(siteCreateKeyCalls, ['site-1']);
+  assert.equal(elements.get('#site-id').value, 'site-created');
+  assert.equal(elements.get('#site-name').value, 'site 新密钥');
   assert.equal(elements.get('#site-api-key').value, 'sk-created');
   assert.equal(elements.get('#site-multiplier').value, 0.001);
   assert.equal(elements.get('#site-sync-key-name').textContent, 'site');
   assert.equal(elements.get('#site-sync-key-group').textContent, 'Example Team');
   assert.equal(elements.get('#site-sync-multiplier').textContent, '0.001');
+});
+
+test('renderer manages a shared remote account and logs out its saved device session', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+  assert.match(html, /id="site-sync-account"/);
+  assert.match(html, /id="logout-site-account"/);
+
+  const { elements, siteLogoutCalls, confirmMessages } = await setupRendererApp({
+    activeSiteId: 'site-1',
+    remoteAccounts: [
+      {
+        id: 'account-1',
+        dashboardUrl: 'https://panel.example.com/keys',
+        username: 'shared@example.com',
+        providerType: 'modern-v1',
+        hasSession: true,
+        linkedSiteCount: 2,
+        lastLoginAt: '2026-07-29T07:30:00.000Z'
+      }
+    ],
+    sites: [
+      {
+        id: 'site-1',
+        name: 'primary',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-primary',
+        enabled: true,
+        manualEnabled: true,
+        priority: 10,
+        multiplier: 1,
+        sync: {
+          enabled: true,
+          accountId: 'account-1',
+          dashboardUrl: 'https://panel.example.com/keys',
+          username: 'shared@example.com',
+          password: 'secret',
+          providerType: 'modern-v1',
+          remote: {}
+        },
+        errorLog: []
+      }
+    ]
+  });
+
+  assert.equal(elements.get('#site-sync-account').value, 'account-1');
+  assert.match(elements.get('#site-sync-account-summary').textContent, /关联 2 个站点/);
+  assert.match(elements.get('#site-sync-account-summary').textContent, /凭证已保存/);
+  assert.equal(elements.get('#logout-site-account').disabled, false);
+
+  await elements.get('#logout-site-account').dispatchEvent('click');
+
+  assert.match(confirmMessages.at(-1), /退出 shared@example.com 的远端登录设备/);
+  assert.deepEqual(siteLogoutCalls, ['site-1']);
+  assert.match(elements.get('#site-sync-account-summary').textContent, /当前未登录/);
+  assert.equal(elements.get('#logout-site-account').disabled, true);
 });
 
 test('renderer switches the selected site group from the current panel after confirmation', async () => {
@@ -3032,6 +3741,32 @@ test('renderer proxy settings expose and save request body replay buffer megabyt
   assert.equal(proxyUpdates.at(-1).maxReplayableRequestBodyBytes, 64 * 1024 * 1024);
 });
 
+test('renderer proxy settings expose, render and save the Codex recovery switch', async () => {
+  const html = await readFile(rendererHtmlPath, 'utf8');
+  assert.match(html, /id="codex-recovery-enabled"/);
+
+  const { elements, proxyUpdates } = await setupRendererApp({
+    proxy: {
+      port: 8787,
+      timeoutMs: 120000,
+      maxReplayableRequestBodyBytes: 16 * 1024 * 1024,
+      codexRecoveryEnabled: true,
+      failureThreshold: 3,
+      smartSwitching: true,
+      priorityMode: 'priority',
+      samePriorityStrategy: 'round-robin'
+    }
+  });
+  const recoveryToggle = elements.get('#codex-recovery-enabled');
+
+  assert.equal(recoveryToggle.checked, true);
+
+  recoveryToggle.checked = false;
+  await elements.get('#save-proxy').dispatchEvent('click');
+
+  assert.equal(proxyUpdates.at(-1).codexRecoveryEnabled, false);
+});
+
 test('renderer shows fixed proxy port startup errors without changing the endpoint', async () => {
   const html = await readFile(rendererHtmlPath, 'utf8');
   assert.match(html, /id="proxy-error"/);
@@ -3095,6 +3830,29 @@ test('renderer copies the displayed proxy URL from the button and shortcut', asy
 
   assert.equal(prevented, true);
   assert.deepEqual(copyTextCalls, [proxyUrl, proxyUrl]);
+});
+
+test('renderer generates and copies the one-time local API key', async () => {
+  const [html, mainSource, preloadSource] = await Promise.all([
+    readFile(rendererHtmlPath, 'utf8'),
+    readFile(mainJsPath, 'utf8'),
+    readFile(preloadJsPath, 'utf8')
+  ]);
+  assert.match(html, /id="generate-local-api-key"/);
+  assert.match(html, /id="copy-local-api-key"/);
+  assert.match(mainSource, /handleLogged\('proxy:generate-local-api-key'/);
+  assert.match(preloadSource, /generateLocalApiKey:\s*\(\)\s*=>\s*ipcRenderer\.invoke\('proxy:generate-local-api-key'\)/);
+
+  const { elements, copyTextCalls, confirmMessages } = await setupRendererApp();
+
+  assert.equal(elements.get('#copy-local-api-key').disabled, true);
+  await elements.get('#generate-local-api-key').dispatchEvent('click');
+  assert.match(confirmMessages.at(-1), /旧本地 API 密钥会立即失效/);
+  assert.equal(elements.get('#local-api-key').value, 'jp-generated-local-key');
+  assert.equal(elements.get('#copy-local-api-key').disabled, false);
+
+  await elements.get('#copy-local-api-key').dispatchEvent('click');
+  assert.deepEqual(copyTextCalls, ['jp-generated-local-key']);
 });
 
 test('renderer logs action errors before showing toast feedback', async () => {

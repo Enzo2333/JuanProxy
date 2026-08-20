@@ -8,7 +8,35 @@ export async function recoverAvailableSites({ configService, testSite }) {
   const failedSites = [];
 
   for (const site of sites) {
-    const result = await testSite(site);
+    const check = async () => {
+      const current = configService.getState().sites.find((candidate) => candidate.id === site.id);
+      if (!current?.manualEnabled || !current?.failureDisabled) {
+        return null;
+      }
+
+      let result;
+      try {
+        result = await testSite(site, {
+          testModel: configService.getState().proxy?.testModel
+        });
+      } catch (error) {
+        result = {
+          ok: false,
+          statusCode: error?.statusCode ?? null,
+          message: error?.message ?? String(error),
+          detail: error?.detail ?? null
+        };
+      }
+
+      return result;
+    };
+    const result = typeof configService.runSiteAvailabilityCheck === 'function'
+      ? await configService.runSiteAvailabilityCheck(site.id, check)
+      : await check();
+
+    if (!result) {
+      continue;
+    }
 
     if (result.ok) {
       const updated = await configService.recordSiteAvailabilitySuccess(site.id, {

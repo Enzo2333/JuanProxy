@@ -15,7 +15,6 @@ function rawSite(overrides = {}) {
     name: overrides.name ?? overrides.id,
     baseUrl: `https://${overrides.id}.example/v1`,
     apiKey: `sk-${overrides.id}`,
-    testModel: 'gpt-5-mini',
     priority: 100,
     manualEnabled,
     failureDisabled,
@@ -55,6 +54,7 @@ test('recovers passing due disabled sites and reschedules failing sites', async 
           activeSiteId: null,
           proxy: {
             port: 8787,
+            testModel: 'global-recovery-model',
             failureThreshold: 3,
             smartSwitching: true,
             samePriorityStrategy: 'round-robin',
@@ -105,8 +105,9 @@ test('recovers passing due disabled sites and reschedules failing sites', async 
     const result = await recoverDueDisabledSites({
       configService: config,
       now: new Date('2026-06-03T08:00:01.000Z'),
-      testSite: async (site) => {
+      testSite: async (site, options) => {
         checked.push(site.id);
+        assert.deepEqual(options, { testModel: 'global-recovery-model' });
         return {
           ok: site.id === 'passing',
           statusCode: site.id === 'passing' ? 200 : 401,
@@ -138,4 +139,140 @@ test('recovers passing due disabled sites and reschedules failing sites', async 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('tests multiple due sites concurrently so a slow site does not hold the batch', async () => {
+  const sites = ['slow', 'fast-one', 'fast-two'].map((id) => rawSite({ id }));
+  let releaseSlow;
+  const slowReleased = new Promise((resolve) => {
+    releaseSlow = resolve;
+  });
+  const calls = [];
+  const recorded = [];
+
+  const run = recoverDueDisabledSites({
+    configService: {
+      getDueDisabledAutoRecoverySites() {
+        return structuredClone(sites);
+      },
+      getState() {
+        return { proxy: { testModel: 'global-recovery-model' } };
+      },
+      async recordSiteAutoRecoverySuccess(id) {
+        recorded.push(['success', id]);
+        return sites.find((site) => site.id === id);
+      },
+      async recordSiteAutoRecoveryFailure(id) {
+        recorded.push(['failure', id]);
+        return sites.find((site) => site.id === id);
+      }
+    },
+    concurrency: 2,
+    now: new Date('2026-06-03T08:00:00.000Z'),
+    testSite: async (site) => {
+      calls.push(site.id);
+      if (site.id === 'slow') {
+        await slowReleased;
+      }
+      return { ok: true, statusCode: 200, message: 'ok' };
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(calls.includes('fast-one'));
+  assert.ok(calls.includes('fast-two'));
+
+  releaseSlow();
+  const result = await run;
+
+  assert.deepEqual(calls, ['slow', 'fast-one', 'fast-two']);
+  assert.deepEqual(recorded.map((entry) => entry[1]).sort(), ['fast-one', 'fast-two', 'slow']);
+  assert.deepEqual(result.recoveredSites.map((site) => site.id).sort(), [
+    'fast-one',
+    'fast-two',
+    'slow'
+  ]);
+});
+
+test('continues checking remaining due sites when one test throws', async () => {
+  const sites = ['broken', 'healthy'].map((id) => rawSite({ id }));
+  const calls = [];
+  const failures = [];
+
+  const result = await recoverDueDisabledSites({
+    configService: {
+      getDueDisabledAutoRecoverySites() {
+        return structuredClone(sites);
+      },
+      getState() {
+        return { proxy: { testModel: 'global-recovery-model' } };
+      },
+      async recordSiteAutoRecoverySuccess(id) {
+        return sites.find((site) => site.id === id);
+      },
+      async recordSiteAutoRecoveryFailure(id, error) {
+        failures.push({ id, message: error.message });
+        return sites.find((site) => site.id === id);
+      }
+    },
+    concurrency: 2,
+    testSite: async (site) => {
+      calls.push(site.id);
+      if (site.id === 'broken') {
+        throw new Error('transport exploded');
+      }
+      return { ok: true, statusCode: 200, message: 'ok' };
+    }
+  });
+
+  assert.deepEqual(calls, ['broken', 'healthy']);
+  assert.deepEqual(failures, [{ id: 'broken', message: 'transport exploded' }]);
+  assert.deepEqual(result.recoveredSites.map((site) => site.id), ['healthy']);
+  assert.deepEqual(result.failedSites.map((site) => site.id), ['broken']);
+});
+
+test('skips a stale due snapshot when another check already restored the site', async () => {
+  const site = rawSite({
+    id: 'restored-while-queued',
+    autoRecoveryState: {
+      lastCheckedAt: null,
+      nextCheckAt: '2026-06-03T08:00:00.000Z',
+      lastResult: null,
+      lastMessage: null
+    }
+  });
+  let testCalled = false;
+
+  const result = await recoverDueDisabledSites({
+    configService: {
+      getDueDisabledAutoRecoverySites() {
+        return [structuredClone(site)];
+      },
+      getState() {
+        return {
+          proxy: { testModel: 'global-recovery-model' },
+          sites: [{ ...site, failureDisabled: false, enabled: true }]
+        };
+      },
+      runSiteAvailabilityCheck(_id, operation) {
+        return operation();
+      },
+      async recordSiteAutoRecoverySuccess() {
+        throw new Error('stale site should not be persisted');
+      },
+      async recordSiteAutoRecoveryFailure() {
+        throw new Error('stale site should not be persisted');
+      }
+    },
+    now: new Date('2026-06-03T08:00:01.000Z'),
+    testSite: async () => {
+      testCalled = true;
+      return { ok: true };
+    }
+  });
+
+  assert.equal(testCalled, false);
+  assert.deepEqual(result.skippedSites.map((candidate) => candidate.id), [site.id]);
+  assert.deepEqual(result.recoveredSites, []);
+  assert.deepEqual(result.failedSites, []);
 });

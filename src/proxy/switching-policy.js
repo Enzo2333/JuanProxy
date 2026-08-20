@@ -80,6 +80,7 @@ export const DEFAULT_SITE_CAPABILITIES = {
 };
 export const DEFAULT_SITE_SYNC = {
   enabled: false,
+  accountId: '',
   dashboardUrl: '',
   username: '',
   password: '',
@@ -117,9 +118,9 @@ export function normalizeSite(site = {}) {
     remark: typeof site.remark === 'string' ? site.remark : '',
     baseUrl: site.baseUrl ?? '',
     apiKey: site.apiKey ?? '',
-    testModel: site.testModel?.trim() || DEFAULT_TEST_MODEL,
     priority: Number.isFinite(Number(site.priority)) ? Number(site.priority) : 100,
     multiplier: normalizeSiteMultiplier(site.multiplier),
+    customMultiplier: normalizeCustomMultiplier(site.customMultiplier),
     multiplierLocked: Boolean(site.multiplierLocked),
     modelMapping: normalizeModelMapping(site.modelMapping),
     capabilities: normalizeSiteCapabilities(site.capabilities),
@@ -156,11 +157,37 @@ function normalizeSiteMultiplier(value) {
   return Number.isFinite(number) && number >= 0 ? number : DEFAULT_SITE_MULTIPLIER;
 }
 
+function normalizeCustomMultiplier(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+export function calculateEffectiveMultiplier(site = {}) {
+  const realMultiplier = normalizeSiteMultiplier(site.multiplier);
+  if (site.multiplierLocked) {
+    return realMultiplier;
+  }
+  const accountMultiplier = normalizeOptionalMultiplier(site.sync?.remote?.groupMultiplier) ?? realMultiplier;
+  const customMultiplier = normalizeCustomMultiplier(site.customMultiplier) ?? 1;
+  return normalizeCalculatedMultiplier(accountMultiplier * customMultiplier);
+}
+
+function normalizeCalculatedMultiplier(value) {
+  if (!Number.isFinite(value) || value === 0) {
+    return value;
+  }
+  return Number(value.toPrecision(15));
+}
+
 export function normalizeSiteSync(sync = {}) {
   const source = sync && typeof sync === 'object' ? sync : {};
 
   return {
     enabled: Boolean(source.enabled),
+    accountId: normalizeTrimmedString(source.accountId),
     dashboardUrl: normalizeTrimmedString(source.dashboardUrl),
     username: normalizeTrimmedString(source.username),
     password: normalizeTrimmedString(source.password),
@@ -766,7 +793,7 @@ export function chooseBestSite(sites = [], options = {}) {
     }
     if (
       autoSwitchMultiplierLimit.enabled &&
-      site.multiplier > autoSwitchMultiplierLimit.maxMultiplier
+      calculateEffectiveMultiplier(site) > autoSwitchMultiplierLimit.maxMultiplier
     ) {
       continue;
     }
@@ -835,9 +862,10 @@ function normalizePriorityMode(value) {
 }
 
 function getSelectionRank(site, priorityMode) {
+  const effectiveMultiplier = calculateEffectiveMultiplier(site);
   return priorityMode === 'multiplier'
-    ? [site.multiplier, site.priority]
-    : [site.priority, site.multiplier];
+    ? [effectiveMultiplier, site.priority]
+    : [site.priority, effectiveMultiplier];
 }
 
 function compareSelectionRanks(left, right) {

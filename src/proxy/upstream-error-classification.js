@@ -7,6 +7,18 @@ export function classifyUpstreamHttpError({ statusCode, bodyText } = {}) {
 
   if (status >= 400 && status < 600) {
     const details = extractErrorDetails(bodyText);
+    if (isSelectedModelCapacityFailure(details)) {
+      return {
+        ...siteHealth('selected model is at capacity'),
+        codexTaskRetry: true
+      };
+    }
+
+    const unavailableModelFailure = classifyUnavailableModelFailure(details);
+    if (unavailableModelFailure) {
+      return siteHealth(unavailableModelFailure);
+    }
+
     const siteHealthOverride = classifyAccountOrKeyFailure(status, details);
     if (siteHealthOverride) {
       return siteHealth(siteHealthOverride);
@@ -55,6 +67,26 @@ function requestScoped({ retryable, requestLocalRetry = false, reason }) {
   };
 }
 
+function isSelectedModelCapacityFailure(details) {
+  return matches(details, [
+    /\bmodel[_ -]?capacity[_ -]?exceeded\b/i,
+    /\bselected\s+model\s+is\s+at\s+capacity\b/i
+  ]);
+}
+
+function classifyUnavailableModelFailure(details) {
+  if (matches(details, [
+    /\bmodel[_ -]?not[_ -]?found\b/i,
+    /\bmodel\s+not\s+found\b/i,
+    /\bno\s+available\s+channel\s+for\s+model\b/i,
+    /\bmodel\s+.+\s+(?:is\s+)?not\s+(?:available|supported|enabled)\b/i
+  ])) {
+    return 'requested model is unavailable on this site';
+  }
+
+  return null;
+}
+
 function classifyAccountOrKeyFailure(status, details) {
   if (status === 401 || status === 402) {
     return `HTTP ${status} is an account or key failure`;
@@ -88,18 +120,6 @@ function classifyAccountOrKeyFailure(status, details) {
 }
 
 function classifyRequestScopedFailure(_status, details) {
-  if (matches(details, [
-    /\bmodel[_ -]?not[_ -]?found\b/i,
-    /\bmodel\s+not\s+found\b/i,
-    /\bno\s+available\s+channel\s+for\s+model\b/i,
-    /\bmodel\s+.+\s+(?:is\s+)?not\s+(?:available|supported|enabled)\b/i
-  ])) {
-    return requestScoped({
-      retryable: true,
-      reason: 'requested model is unavailable on this site'
-    });
-  }
-
   if (matches(details, [
     /\binvalid\s+url\s+\(\s*post\s+\/v\d+\/responses\s*\)/i,
     /\bunknown\s+(?:url|path|endpoint)\b/i,
@@ -151,6 +171,7 @@ function classifyRequestScopedFailure(_status, details) {
     /\binvalid[_ -]?request(?:_error)?\b/i,
     /\binvalid\s+codex\s+request\b/i,
     /\binstructions?\s+(?:are\s+)?required\b/i,
+    /\binput\s+(?:must|should)\s+be\s+(?:a\s+)?(?:valid\s+)?list\b/i,
     /\bmissing\s+required\s+(?:parameter|field)\b/i,
     /\bcontext[_ -]?length[_ -]?exceeded\b/i
   ])) {

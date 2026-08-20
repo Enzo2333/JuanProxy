@@ -3,7 +3,10 @@ setlocal
 
 set "APP_DIR=%~dp0"
 set "ELECTRON_CMD=%APP_DIR%node_modules\.bin\electron.cmd"
+set "JUANPROXY_ELECTRON_EXE=%APP_DIR%node_modules\electron\dist\electron.exe"
 pushd "%APP_DIR%" || exit /b 1
+
+call :stop_existing_juanproxy
 
 where npm >nul 2>nul
 if errorlevel 1 (
@@ -27,4 +30,9 @@ if not exist "%ELECTRON_CMD%" (
 
 start "JuanProxy" "%ELECTRON_CMD%" .
 popd
+exit /b 0
+
+:stop_existing_juanproxy
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$target = $env:JUANPROXY_ELECTRON_EXE; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'electron.exe' -and $_.ExecutablePath -ieq $target } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500"
 exit /b 0

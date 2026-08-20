@@ -1,3 +1,5 @@
+import { calculateEffectiveMultiplier } from '../proxy/switching-policy.js';
+
 const api = window.openApiProxy;
 
 let state = null;
@@ -21,7 +23,9 @@ const elements = {
   main: document.querySelector('#floating-main'),
   details: document.querySelector('#floating-details'),
   alwaysOnTop: document.querySelector('#floating-always-on-top'),
-  collapse: document.querySelector('#floating-collapse')
+  collapse: document.querySelector('#floating-collapse'),
+  openMain: document.querySelector('#floating-open-main'),
+  quitApp: document.querySelector('#floating-quit-app')
 };
 
 async function init() {
@@ -150,6 +154,27 @@ elements.collapse.addEventListener('click', async () => {
   await setExpanded(false);
 });
 
+elements.openMain.addEventListener('click', async () => {
+  try {
+    await api.showMainWindow();
+  } catch (error) {
+    logRuntimeError('floating-renderer.show-main-failed', error);
+  }
+});
+
+elements.quitApp.addEventListener('click', async () => {
+  if (!confirm('退出 JuanProxy？本地代理服务也会停止。')) {
+    return;
+  }
+  elements.quitApp.disabled = true;
+  try {
+    await api.quitApp();
+  } catch (error) {
+    elements.quitApp.disabled = false;
+    logRuntimeError('floating-renderer.quit-failed', error);
+  }
+});
+
 elements.alwaysOnTop.addEventListener('change', async () => {
   state = await api.updateAppSettings({
     floatingWindow: {
@@ -228,9 +253,9 @@ function renderBalanceBadge(site) {
 }
 
 function renderMultiplierBadge(site) {
-  const multiplier = Number(site?.multiplier ?? 1);
+  const multiplier = calculateEffectiveMultiplier(site);
   const danger = multiplier > 1 ? ' is-danger' : '';
-  return `<span class="site-multiplier-badge${danger}">${escapeHtml(`倍率 ${formatMultiplier(multiplier)}`)}</span>`;
+  return `<span class="site-multiplier-badge${danger}">${escapeHtml(`实际倍率 ${formatMultiplier(multiplier)}`)}</span>`;
 }
 
 function formatInitial(name) {
@@ -239,7 +264,7 @@ function formatInitial(name) {
 }
 
 function formatCompactMeta(site) {
-  return `${formatMultiplier(site?.multiplier)}x`;
+  return `${formatMultiplier(calculateEffectiveMultiplier(site))}x`;
 }
 
 function calculateSuccessRate(successCount = 0, errorCount = 0) {
@@ -256,7 +281,8 @@ function formatMultiplier(value) {
   if (!Number.isFinite(number)) {
     return '1';
   }
-  return Number.isInteger(number) ? String(number) : String(number);
+  const normalized = number === 0 ? 0 : Number(number.toPrecision(15));
+  return String(normalized);
 }
 
 function getAvailabilityState(site, now = new Date()) {

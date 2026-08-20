@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
   loginAndCreateSiteKey,
+  loginAndDeleteSiteKey,
   loginAndFetchSiteSync,
   loginAndSwitchSiteGroup,
+  logoutRemoteAccountSession,
   parseMultiplierFromText
 } from '../src/proxy/site-sync-service.js';
 
@@ -167,6 +169,182 @@ test('modern api v1 sync logs in and maps profile, key, group and multiplier met
     password: 'secret'
   });
   assert.equal(profileCall.headers.Authorization, 'Bearer auth-token');
+});
+
+test('modern api v1 reuses a saved account session without logging in again', async () => {
+  const firstFetch = createFetch({
+    'POST /api/v1/auth/login': { data: { auth_token: 'saved-token' } },
+    'GET /api/v1/user/profile': { data: { email: 'user@example.com' } },
+    'GET /api/v1/keys': { data: { items: [] } },
+    'GET /api/v1/groups/available': { data: [] },
+    'GET /api/v1/groups/rates': { data: {} }
+  });
+  const sync = {
+    dashboardUrl: 'https://sync.example.com/keys',
+    username: 'user@example.com',
+    password: 'secret',
+    providerType: 'modern-v1'
+  };
+
+  const first = await loginAndFetchSiteSync({
+    sync,
+    fetch: firstFetch,
+    now: new Date('2026-07-29T08:00:00.000Z')
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.authSession.token, 'saved-token');
+  assert.equal(first.authReused, false);
+
+  const secondFetch = createFetch({
+    'GET /api/v1/user/profile': { data: { email: 'user@example.com' } },
+    'GET /api/v1/keys': { data: { items: [] } },
+    'GET /api/v1/groups/available': { data: [] },
+    'GET /api/v1/groups/rates': { data: {} }
+  });
+  const second = await loginAndFetchSiteSync({
+    sync,
+    authSession: first.authSession,
+    fetch: secondFetch,
+    now: new Date('2026-07-29T08:01:00.000Z')
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.authReused, true);
+  assert.equal(secondFetch.calls.some((call) => call.pathname.endsWith('/auth/login')), false);
+  assert.equal(
+    secondFetch.calls.find((call) => call.pathname.endsWith('/user/profile')).headers.Authorization,
+    'Bearer saved-token'
+  );
+});
+
+test('modern api v1 replaces an expired saved session after one authentication failure', async () => {
+  let loginCount = 0;
+  const fetchMock = createFetch({
+    'POST /api/v1/auth/login': () => {
+      loginCount += 1;
+      return { data: { auth_token: 'fresh-token' } };
+    },
+    'GET /api/v1/user/profile': ({ options }) => options.headers.Authorization === 'Bearer expired-token'
+      ? { body: { message: 'unauthorized' }, ok: false, status: 401 }
+      : { data: { email: 'user@example.com' } },
+    'GET /api/v1/keys': { data: { items: [] } },
+    'GET /api/v1/groups/available': { data: [] },
+    'GET /api/v1/groups/rates': { data: {} }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    authSession: {
+      providerType: 'modern-v1',
+      origin: 'https://sync.example.com',
+      apiBaseUrl: 'https://sync.example.com/api/v1',
+      token: 'expired-token',
+      cookie: '',
+      userId: '',
+      createdAt: '2026-07-29T07:00:00.000Z'
+    },
+    fetch: fetchMock,
+    now: new Date('2026-07-29T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.authReused, false);
+  assert.equal(result.authSession.token, 'fresh-token');
+  assert.equal(loginCount, 1);
+  assert.equal(
+    fetchMock.calls.filter((call) => call.pathname.endsWith('/user/profile')).length,
+    2
+  );
+});
+
+test('modern api v1 keeps a replacement session when metadata then fails for a non-auth reason', async () => {
+  const fetchMock = createFetch({
+    'POST /api/v1/auth/login': { data: { auth_token: 'fresh-token' } },
+    'GET /api/v1/user/profile': ({ options }) => options.headers.Authorization === 'Bearer expired-token'
+      ? { body: { message: 'unauthorized' }, ok: false, status: 401 }
+      : { body: { message: 'temporary upstream failure' }, ok: false, status: 500 },
+    'GET /api/v1/keys': { data: { items: [] } },
+    'GET /api/v1/groups/available': { data: [] },
+    'GET /api/v1/groups/rates': { data: {} }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    authSession: {
+      providerType: 'modern-v1',
+      origin: 'https://sync.example.com',
+      apiBaseUrl: 'https://sync.example.com/api/v1',
+      token: 'expired-token',
+      createdAt: '2026-07-29T07:00:00.000Z'
+    },
+    fetch: fetchMock,
+    now: new Date('2026-07-29T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.authSession.token, 'fresh-token');
+  assert.equal(result.authSessionInvalidated, false);
+});
+
+test('remote account logout uses the saved session without logging in', async () => {
+  const fetchMock = createFetch({
+    'POST /api/v1/auth/logout': { success: true }
+  });
+
+  const result = await logoutRemoteAccountSession({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    authSession: {
+      providerType: 'modern-v1',
+      origin: 'https://sync.example.com',
+      apiBaseUrl: 'https://sync.example.com/api/v1',
+      token: 'saved-token',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    },
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteAttempted, true);
+  assert.equal(result.remoteSucceeded, true);
+  assert.equal(fetchMock.calls.length, 1);
+  assert.equal(fetchMock.calls[0].pathname, '/api/v1/auth/logout');
+  assert.equal(fetchMock.calls[0].headers.Authorization, 'Bearer saved-token');
+});
+
+test('remote account logout is idempotent when there is no saved session', async () => {
+  let fetchCount = 0;
+  const result = await logoutRemoteAccountSession({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    authSession: null,
+    fetch: async () => {
+      fetchCount += 1;
+      throw new Error('must not fetch');
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteAttempted, false);
+  assert.equal(fetchCount, 0);
 });
 
 test('modern api v1 sync maps object-shaped group fields without object string leakage', async () => {
@@ -1080,6 +1258,156 @@ test('new api sync logs in and maps token, group and multiplier metadata', async
   );
 });
 
+test('new api reuses a saved bearer session without creating another login device', async () => {
+  const fetchMock = createFetch({
+    'GET /api/user/self': {
+      data: {
+        username: 'sync-user',
+        quota: 0
+      }
+    },
+    'GET /api/token/': { data: [] },
+    'GET /api/user/self/groups': { data: {} },
+    'GET /api/status': { data: { version: 'new-api' } }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/console/token',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    authSession: {
+      providerType: 'new-api',
+      origin: 'https://relay.example.com',
+      token: 'saved-new-api-token',
+      userId: '42',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    },
+    fetch: fetchMock,
+    now: new Date('2026-07-29T08:01:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.authReused, true);
+  assert.equal(fetchMock.calls.some((call) => call.pathname === '/api/user/login'), false);
+  const selfCall = fetchMock.calls.find((call) => call.pathname === '/api/user/self');
+  assert.equal(selfCall.headers.Authorization, 'Bearer saved-new-api-token');
+  assert.equal(selfCall.headers['New-Api-User'], '42');
+});
+
+test('new api logout uses a saved cookie session without logging in', async () => {
+  const fetchMock = createFetch({
+    'GET /api/user/logout': { success: true }
+  });
+
+  const result = await logoutRemoteAccountSession({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/console/token',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    authSession: {
+      providerType: 'new-api',
+      origin: 'https://relay.example.com',
+      cookie: 'session=saved-cookie',
+      userId: '42',
+      createdAt: '2026-07-29T08:00:00.000Z'
+    },
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteSucceeded, true);
+  assert.equal(fetchMock.calls.length, 1);
+  assert.equal(fetchMock.calls[0].pathname, '/api/user/logout');
+  assert.equal(fetchMock.calls[0].headers.Cookie, 'session=saved-cookie');
+  assert.equal(fetchMock.calls[0].headers['New-Api-User'], '42');
+});
+
+test('new api sync retries login with a Turnstile token query when the remote requires it', async () => {
+  let resolverCalls = 0;
+  const fetchMock = createFetch({
+    'POST /api/user/login': ({ parsed }) => {
+      const turnstile = parsed.searchParams.get('turnstile');
+      if (!turnstile) {
+        return {
+          success: false,
+          message: 'Turnstile token 为空'
+        };
+      }
+      assert.equal(turnstile, 'cf-token');
+      return {
+        data: {
+          token: 'new-api-token'
+        }
+      };
+    },
+    'GET /api/user/self': {
+      data: {
+        username: 'sync-user',
+        quota: 0
+      }
+    },
+    'GET /api/token/': {
+      data: [
+        {
+          name: 'qa',
+          id: 101,
+          group: 'default'
+        }
+      ]
+    },
+    'GET /api/user/self/groups': {
+      data: {
+        default: {
+          desc: 'Default 0.003x',
+          ratio: 0.003
+        }
+      }
+    },
+    'GET /api/status': {
+      data: {
+        version: 'new-api',
+        turnstile_check: true,
+        turnstile_site_key: 'site-key',
+        server_address: 'https://relay.example.com',
+        quota_per_unit: 500000
+      }
+    }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/console/token',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    fetch: fetchMock,
+    resolveTurnstileToken: async (context) => {
+      resolverCalls += 1;
+      assert.equal(context.providerType, 'new-api');
+      assert.equal(context.origin, 'https://relay.example.com');
+      assert.equal(context.siteKey, 'site-key');
+      return 'cf-token';
+    },
+    now: new Date('2026-06-09T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.syncPatch.remote.providerType, 'new-api');
+  assert.equal(result.syncPatch.remote.groupMultiplier, 0.003);
+  assert.equal(resolverCalls, 1);
+
+  const loginCalls = fetchMock.calls.filter((call) => call.pathname === '/api/user/login');
+  assert.equal(loginCalls.length, 2);
+  assert.equal(loginCalls[0].search, '');
+  assert.equal(loginCalls[1].search, '?turnstile=cf-token');
+});
+
 test('new api sync keeps local-only key groups out of the available group list', async () => {
   const fetchMock = createFetch({
     'POST /api/user/login': {
@@ -1720,6 +2048,33 @@ test('new api sync reports login failure messages from success false payloads', 
   assert.equal(fetchMock.calls.length, 1);
 });
 
+test('new api sync reports a clear Turnstile resolver error when verification is required but unavailable', async () => {
+  const fetchMock = createFetch({
+    'POST /api/user/login': {
+      success: false,
+      message: 'Turnstile token 为空'
+    }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    fetch: fetchMock,
+    now: new Date('2026-06-09T08:00:00.000Z')
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.syncPatch.lastSyncError,
+    'Remote login requires Turnstile verification, but no Turnstile token resolver is available'
+  );
+  assert.equal(fetchMock.calls.length, 1);
+});
+
 test('new api sync reports two-factor authentication requirements', async () => {
   const fetchMock = createFetch({
     'POST /api/user/login': {
@@ -2056,4 +2411,424 @@ test('new api creates a token and fetches the generated key for local import', a
   const keyCall = fetchMock.calls.find((call) => call.pathname === '/api/token/42/key');
   assert.equal(keyCall.method, 'POST');
   assert.equal(keyCall.headers.Authorization, 'Bearer new-api-token');
+});
+
+test('new api sync matches full token keys that omit the sk prefix', async () => {
+  const fetchMock = createFetch({
+    'POST /api/user/login': { data: { token: 'new-api-token' } },
+    'GET /api/user/self': { data: { username: 'sync-user', quota: 0 } },
+    'GET /api/token/': {
+      data: {
+        page: 1,
+        page_size: 10,
+        total: 1,
+        items: [
+          { id: 301, name: 'current', key: 'agent-router-key', group: 'default' }
+        ]
+      }
+    },
+    'GET /api/user/self/groups': {
+      data: { default: { desc: 'Default', ratio: 1 } }
+    },
+    'GET /api/status': {
+      data: { server_address: 'https://relay.example.com' }
+    }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-agent-router-key',
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.syncPatch.remote.remoteKeyId, '301');
+});
+
+test('new api sync searches later token pages for the configured key', async () => {
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    name: `other-${index + 1}`,
+    key: `other-key-${index + 1}`,
+    group: 'default'
+  }));
+  const fetchMock = createFetch({
+    'POST /api/user/login': { data: { token: 'new-api-token' } },
+    'GET /api/user/self': { data: { username: 'sync-user', quota: 0 } },
+    'GET /api/token/': ({ parsed }) => parsed.searchParams.get('p') === '2'
+      ? {
+          data: {
+            page: 2,
+            page_size: 100,
+            total: 101,
+            items: [
+              { id: 101, name: 'current', key: 'later-page-key', group: 'default' }
+            ]
+          }
+        }
+      : {
+          data: {
+            page: 1,
+            page_size: 100,
+            total: 101,
+            items: firstPage
+          }
+        },
+    'GET /api/user/self/groups': {
+      data: { default: { desc: 'Default', ratio: 1 } }
+    },
+    'GET /api/status': {
+      data: { server_address: 'https://relay.example.com' }
+    }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-later-page-key',
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.syncPatch.remote.remoteKeyId, '101');
+  assert.deepEqual(
+    fetchMock.calls
+      .filter((call) => call.pathname === '/api/token/')
+      .map((call) => call.search),
+    ['?p=1&size=100', '?p=2&size=100']
+  );
+});
+
+test('modern api v1 includes a Turnstile token when public settings require it', async () => {
+  const fetchMock = createFetch({
+    'GET /api/v1/settings/public': {
+      data: { turnstile_enabled: true, turnstile_site_key: 'modern-site-key' }
+    },
+    'POST /api/v1/auth/login': ({ options }) => {
+      const body = JSON.parse(options.body);
+      assert.equal(body.turnstile_token, 'modern-turnstile-token');
+      return { data: { auth_token: 'modern-auth-token' } };
+    },
+    'GET /api/v1/user/profile': {
+      data: { email: 'user@example.com', balance: '$1.00' }
+    },
+    'GET /api/v1/keys': {
+      data: {
+        items: [
+          { id: 41, name: 'current', key: 'modern-key', group: 'default' }
+        ]
+      }
+    },
+    'GET /api/v1/groups/available': {
+      data: [{ id: 'default', name: 'default', multiplier: 1 }]
+    },
+    'GET /api/v1/groups/rates': { data: { default: 1 } }
+  });
+  const resolverCalls = [];
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://modern.example.com',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    apiKey: 'modern-key',
+    fetch: fetchMock,
+    resolveTurnstileToken: async (context) => {
+      resolverCalls.push(context);
+      return 'modern-turnstile-token';
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(resolverCalls.length, 1);
+  assert.equal(resolverCalls[0].providerType, 'modern-v1');
+  assert.equal(resolverCalls[0].siteKey, 'modern-site-key');
+});
+
+test('new api sync returns a newly created session when later metadata lookup fails', async () => {
+  const fetchMock = createFetch({
+    'POST /api/user/login': { data: { token: 'new-session-token', id: 23 } },
+    'GET /api/user/self': { data: { username: 'sync-user' } },
+    'GET /api/token/': { data: { items: [] } },
+    'GET /api/user/self/groups': { data: {} },
+    'GET /api/status': { data: { server_address: 'https://relay.example.com' } }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://relay.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-missing',
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.authSession.token, 'new-session-token');
+  assert.equal(result.authSession.userId, '23');
+});
+
+test('sync retries a WAF challenge through a browser-backed fetch session', async () => {
+  const challengeCalls = [];
+  const challengeFetch = async (url, options = {}) => {
+    challengeCalls.push({ url, options });
+    return jsonResponse(
+      '<html><title>Just a moment...</title><script>window._cf_chl_opt={}</script></html>',
+      { ok: false, status: 403 }
+    );
+  };
+  const solvedFetch = createFetch({
+    'POST /api/user/login': { data: { token: 'browser-session-token', id: 9 } },
+    'GET /api/user/self': { data: { username: 'sync-user' } },
+    'GET /api/token/': {
+      data: {
+        items: [
+          { id: 55, name: 'current', key: 'browser-key', group: 'default' }
+        ]
+      }
+    },
+    'GET /api/user/self/groups': {
+      data: { default: { desc: 'Default', ratio: 1 } }
+    },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+  const browserSessionCalls = [];
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://waf.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-browser-key',
+    fetch: challengeFetch,
+    resolveBrowserSession: async (context) => {
+      browserSessionCalls.push(context);
+      return { fetch: solvedFetch };
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(challengeCalls.length, 1);
+  assert.equal(browserSessionCalls.length, 1);
+  assert.equal(browserSessionCalls[0].origin, 'https://waf.example.com');
+  assert.equal(result.syncPatch.remote.remoteKeyId, '55');
+});
+
+test('WAF retry reuses a session established before the challenge', async () => {
+  let loginCalls = 0;
+  const initialFetch = createFetch({
+    'POST /api/user/login': () => {
+      loginCalls += 1;
+      return {
+        body: {
+          data: {
+            token: 'established-session-token',
+            id: 9
+          }
+        }
+      };
+    },
+    'GET /api/user/self': {
+      body: '<html><script>window._waf_is_mobile=false;var arg1="challenge"</script></html>',
+      ok: true,
+      status: 200
+    },
+    'GET /api/token/': { data: { items: [] } },
+    'GET /api/user/self/groups': { data: {} },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+  const solvedFetch = createFetch({
+    'GET /api/user/self': { data: { username: 'sync-user' } },
+    'GET /api/token/': {
+      data: {
+        items: [
+          { id: 77, name: 'current', key: 'browser-key', group: 'default' }
+        ]
+      }
+    },
+    'GET /api/user/self/groups': {
+      data: { default: { desc: 'Default', ratio: 1 } }
+    },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+  let challengeUrl = '';
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://waf.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-browser-key',
+    fetch: initialFetch,
+    resolveBrowserSession: async (context) => {
+      challengeUrl = context.challengeUrl;
+      return { fetch: solvedFetch };
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(loginCalls, 1);
+  assert.equal(challengeUrl, 'https://waf.example.com/api/user/self');
+  assert.equal(result.authSession.token, 'established-session-token');
+});
+
+test('WAF challenge does not invalidate an existing account session', async () => {
+  let loginCalls = 0;
+  const challengeFetch = createFetch({
+    'POST /api/user/login': () => {
+      loginCalls += 1;
+      return { data: { token: 'unexpected-new-token' } };
+    },
+    'GET /api/user/self': {
+      body: '<html><title>Just a moment...</title><script>window._cf_chl_opt={}</script></html>',
+      ok: false,
+      status: 403
+    },
+    'GET /api/token/': { data: { items: [] } },
+    'GET /api/user/self/groups': { data: {} },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+  const solvedFetch = createFetch({
+    'GET /api/user/self': { data: { username: 'sync-user' } },
+    'GET /api/token/': {
+      data: {
+        items: [
+          { id: 88, name: 'current', key: 'browser-key', group: 'default' }
+        ]
+      }
+    },
+    'GET /api/user/self/groups': {
+      data: { default: { desc: 'Default', ratio: 1 } }
+    },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+  const savedSession = {
+    providerType: 'new-api',
+    origin: 'https://waf.example.com',
+    token: 'saved-session-token',
+    userId: '9'
+  };
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://waf.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-browser-key',
+    authSession: savedSession,
+    fetch: challengeFetch,
+    resolveBrowserSession: async () => ({ fetch: solvedFetch })
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(loginCalls, 0);
+  assert.equal(result.authSession.token, 'saved-session-token');
+});
+
+test('browser verification failure preserves a session established before the challenge', async () => {
+  const initialFetch = createFetch({
+    'POST /api/user/login': {
+      data: { token: 'session-before-browser-timeout', id: 9 }
+    },
+    'GET /api/user/self': {
+      body: '<html><script>window._waf_is_mobile=false;var arg1="challenge"</script></html>',
+      ok: true,
+      status: 200
+    },
+    'GET /api/token/': { data: { items: [] } },
+    'GET /api/user/self/groups': { data: {} },
+    'GET /api/status': { data: { server_address: 'https://waf.example.com' } }
+  });
+
+  const result = await loginAndFetchSiteSync({
+    sync: {
+      dashboardUrl: 'https://waf.example.com',
+      username: 'sync-user',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    apiKey: 'sk-browser-key',
+    fetch: initialFetch,
+    resolveBrowserSession: async () => {
+      throw new Error('Remote browser verification window was closed');
+    }
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.authSession.token, 'session-before-browser-timeout');
+  assert.match(result.syncPatch.lastSyncError, /verification window was closed/);
+});
+
+test('modern api deletes a remote key by id while reusing the shared session', async () => {
+  const fetchMock = createFetch({
+    'GET /api/v1/settings/public': { data: { api_base_url: 'https://sync.example.com/api/v1' } },
+    'DELETE /api/v1/keys/37': {}
+  });
+  const result = await loginAndDeleteSiteKey({
+    sync: {
+      dashboardUrl: 'https://sync.example.com/keys',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'modern-v1'
+    },
+    remoteKeyId: '37',
+    authSession: {
+      providerType: 'modern-v1',
+      origin: 'https://sync.example.com',
+      apiBaseUrl: 'https://sync.example.com/api/v1',
+      token: 'shared-token'
+    },
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteKeyId, '37');
+  assert.equal(fetchMock.calls.filter((call) => call.method === 'DELETE').length, 1);
+  assert.equal(fetchMock.calls.some((call) => call.pathname === '/api/v1/auth/login'), false);
+});
+
+test('new api deletes a remote token by id while reusing the shared session', async () => {
+  const fetchMock = createFetch({
+    'DELETE /api/token/42': {}
+  });
+  const result = await loginAndDeleteSiteKey({
+    sync: {
+      dashboardUrl: 'https://relay.example.com/console/token',
+      username: 'user@example.com',
+      password: 'secret',
+      providerType: 'new-api'
+    },
+    remoteKeyId: '42',
+    authSession: {
+      providerType: 'new-api',
+      origin: 'https://relay.example.com',
+      token: 'shared-token',
+      userId: '23'
+    },
+    fetch: fetchMock
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteKeyId, '42');
+  assert.equal(fetchMock.calls[0].method, 'DELETE');
+  assert.equal(fetchMock.calls[0].pathname, '/api/token/42');
 });

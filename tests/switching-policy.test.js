@@ -5,6 +5,7 @@ import {
   DEFAULT_GROUP_SYNC_SETTINGS,
   DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT,
   DEFAULT_SITE_SYNC_SETTINGS,
+  calculateEffectiveMultiplier,
   chooseBestSite,
   chooseFailoverSite,
   getGroupSyncSettingsIntervalMs,
@@ -30,6 +31,8 @@ function site(overrides = {}) {
     apiKey: overrides.apiKey ?? 'sk-test',
     priority: overrides.priority ?? 100,
     multiplier: overrides.multiplier,
+    customMultiplier: overrides.customMultiplier,
+    multiplierLocked: overrides.multiplierLocked,
     enabled: overrides.enabled ?? true,
     manualEnabled: overrides.manualEnabled,
     failureDisabled: overrides.failureDisabled,
@@ -273,6 +276,7 @@ test('normalizes remote site sync settings and collected metadata', () => {
 
   assert.deepEqual(defaults.sync, {
     enabled: false,
+    accountId: '',
     dashboardUrl: '',
     username: '',
     password: '',
@@ -302,6 +306,7 @@ test('normalizes remote site sync settings and collected metadata', () => {
     site({
       sync: {
         enabled: true,
+        accountId: '  shared-account-id  ',
         dashboardUrl: '  https://sync-one.example.com/profile  ',
         username: '  user@example.com  ',
         password: '  secret  ',
@@ -333,6 +338,7 @@ test('normalizes remote site sync settings and collected metadata', () => {
   );
 
   assert.equal(normalized.sync.enabled, true);
+  assert.equal(normalized.sync.accountId, 'shared-account-id');
   assert.equal(normalized.sync.dashboardUrl, 'https://sync-one.example.com/profile');
   assert.equal(normalized.sync.username, 'user@example.com');
   assert.equal(normalized.sync.password, 'secret');
@@ -532,6 +538,83 @@ test('chooseBestSite uses lower priority as the multiplier-mode tie breaker', ()
   assert.equal(chosen.id, 'multiplier-tie-low-priority');
 });
 
+test('uses locked real multiplier or account multiplier with an optional custom multiplier', () => {
+  assert.equal(calculateEffectiveMultiplier(site({ multiplier: 0.6 })), 0.6);
+  assert.equal(calculateEffectiveMultiplier(site({
+    multiplier: 0.6,
+    sync: { remote: { groupMultiplier: 0.5 } }
+  })), 0.5);
+  assert.equal(calculateEffectiveMultiplier(site({
+    multiplier: 0.6,
+    customMultiplier: 2,
+    sync: { remote: { groupMultiplier: 0.5 } }
+  })), 1);
+  assert.equal(calculateEffectiveMultiplier(site({
+    multiplier: 0.6,
+    multiplierLocked: true,
+    customMultiplier: 3,
+    sync: { remote: { groupMultiplier: 0.5 } }
+  })), 0.6);
+
+  const normalized = normalizeSite(site({ customMultiplier: '2.5' }));
+  assert.equal(normalized.customMultiplier, 2.5);
+  assert.equal(normalizeSite(site({ customMultiplier: 0 })).customMultiplier, null);
+});
+
+test('normalizes decimal multiplication artifacts before comparing effective multipliers', () => {
+  const calculated = calculateEffectiveMultiplier(site({
+    multiplier: 0.35,
+    customMultiplier: 0.1,
+    sync: { remote: { groupMultiplier: 0.35 } }
+  }));
+  assert.equal(calculated, 0.035);
+
+  const chosen = chooseBestSite([
+    site({
+      id: 'calculated',
+      priority: 2,
+      multiplier: 0.35,
+      customMultiplier: 0.1,
+      sync: { remote: { groupMultiplier: 0.35 } }
+    }),
+    site({
+      id: 'locked',
+      priority: 1,
+      multiplier: 0.035,
+      multiplierLocked: true
+    })
+  ], { priorityMode: 'multiplier' });
+  assert.equal(chosen.id, 'locked');
+});
+
+test('chooseBestSite ranks sites by effective multiplier in multiplier mode and priority ties', () => {
+  const candidates = [
+    site({
+      id: 'lower-manual-multiplier',
+      priority: 1,
+      multiplier: 0.5,
+      multiplierLocked: true,
+      sync: { remote: { groupMultiplier: 0.2 } }
+    }),
+    site({
+      id: 'lower-effective-multiplier',
+      priority: 1,
+      multiplier: 2,
+      customMultiplier: 2,
+      sync: { remote: { groupMultiplier: 0.2 } }
+    })
+  ];
+
+  assert.equal(
+    chooseBestSite(candidates, { priorityMode: 'multiplier' }).id,
+    'lower-effective-multiplier'
+  );
+  assert.equal(
+    chooseBestSite(candidates, { priorityMode: 'priority' }).id,
+    'lower-effective-multiplier'
+  );
+});
+
 test('chooseBestSite can skip sites above the automatic switch multiplier limit', () => {
   assert.deepEqual(DEFAULT_AUTO_SWITCH_MULTIPLIER_LIMIT, {
     enabled: false,
@@ -565,6 +648,23 @@ test('chooseBestSite can skip sites above the automatic switch multiplier limit'
     }),
     null
   );
+
+  const chosenByEffectiveMultiplier = chooseBestSite([
+    site({
+      id: 'raw-above-limit-effective-allowed',
+      priority: 1,
+      multiplier: 2,
+      customMultiplier: 2,
+      sync: { remote: { groupMultiplier: 0.2 } }
+    }),
+    site({ id: 'fallback', priority: 2, multiplier: 0.75 })
+  ], {
+    autoSwitchMultiplierLimit: {
+      enabled: true,
+      maxMultiplier: 0.6
+    }
+  });
+  assert.equal(chosenByEffectiveMultiplier.id, 'raw-above-limit-effective-allowed');
 });
 
 test('chooseBestSite round-robins sites with the same priority', () => {

@@ -166,6 +166,15 @@ export class SiteSyncScheduler extends EventEmitter {
     this.logger = logger;
     this.timer = null;
     this.running = false;
+    this.startedAt = null;
+    this.lastCheckStartedAt = null;
+    this.lastCheckCompletedAt = null;
+    this.nextCheckAt = null;
+    this.lastResultSummary = {
+      checkedWebsiteCount: 0,
+      syncedWebsiteCount: 0,
+      failedWebsiteCount: 0
+    };
   }
 
   start() {
@@ -173,11 +182,17 @@ export class SiteSyncScheduler extends EventEmitter {
       return;
     }
 
+    const startedAt = new Date();
+    this.startedAt = startedAt.toISOString();
+    this.nextCheckAt = new Date(startedAt.getTime() + this.intervalMs).toISOString();
     this.timer = setInterval(() => {
-      this.tick().catch((error) => this.logger.error?.('Remote site sync failed:', error));
+      const now = new Date();
+      this.nextCheckAt = new Date(now.getTime() + this.intervalMs).toISOString();
+      this.tick(now).catch((error) => this.logger.error?.('Remote site sync failed:', error));
     }, this.intervalMs);
     this.timer.unref?.();
-    this.tick().catch((error) => this.logger.error?.('Remote site sync failed:', error));
+    this.emit('status-changed', this.getStatus());
+    this.tick(startedAt).catch((error) => this.logger.error?.('Remote site sync failed:', error));
   }
 
   stop() {
@@ -187,6 +202,21 @@ export class SiteSyncScheduler extends EventEmitter {
 
     clearInterval(this.timer);
     this.timer = null;
+    this.nextCheckAt = null;
+    this.emit('status-changed', this.getStatus());
+  }
+
+  getStatus() {
+    return {
+      monitoring: Boolean(this.timer),
+      checking: this.running,
+      intervalMs: this.intervalMs,
+      startedAt: this.startedAt,
+      lastCheckStartedAt: this.lastCheckStartedAt,
+      lastCheckCompletedAt: this.lastCheckCompletedAt,
+      nextCheckAt: this.nextCheckAt,
+      ...this.lastResultSummary
+    };
   }
 
   async tick(now = new Date()) {
@@ -195,12 +225,20 @@ export class SiteSyncScheduler extends EventEmitter {
     }
 
     this.running = true;
+    const checkedAt = new Date(now);
+    this.lastCheckStartedAt = Number.isFinite(checkedAt.getTime()) ? checkedAt.toISOString() : null;
+    this.emit('status-changed', this.getStatus());
     try {
       const result = await syncDueSites({
         configService: this.configService,
         syncWebsite: this.syncWebsite,
         now
       });
+      this.lastResultSummary = {
+        checkedWebsiteCount: result.checkedWebsites.length,
+        syncedWebsiteCount: result.syncedWebsites.length,
+        failedWebsiteCount: result.failedWebsites.length
+      };
 
       if (result.checkedSites.length > 0) {
         this.emit('checked', result);
@@ -211,7 +249,9 @@ export class SiteSyncScheduler extends EventEmitter {
 
       return result;
     } finally {
+      this.lastCheckCompletedAt = this.lastCheckStartedAt;
       this.running = false;
+      this.emit('status-changed', this.getStatus());
     }
   }
 }

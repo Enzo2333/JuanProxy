@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>JuanProxy</title>
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/liquid-glass.css" />
   </head>
   <body>
     <main class="shell">
@@ -18,7 +20,7 @@
         </div>
 
         <div class="proxy-endpoint">
-          <span>本机代理</span>
+          <span id="proxy-endpoint-label">本机代理</span>
           <div class="proxy-url-row">
             <strong id="proxy-url">http://127.0.0.1:8787/v1</strong>
             <button
@@ -27,6 +29,7 @@
               class="secondary proxy-copy-button"
               title="复制本机代理地址 (Ctrl+Shift+C)"
             >
+              <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#copy"></use></svg>
               复制
             </button>
           </div>
@@ -42,20 +45,6 @@
           <div id="active-site-meta" class="active-site-meta"></div>
         </div>
 
-        <div class="topbar-sync-groups-panel" aria-label="低倍率分组">
-          <div class="sync-groups-heading">
-            <span>低倍率分组</span>
-            <div class="sync-groups-heading-actions">
-              <button id="toggle-topbar-sync-groups" type="button" class="secondary" hidden>展开</button>
-              <button id="refresh-site-sync-all" type="button" class="secondary">刷新分组</button>
-            </div>
-          </div>
-          <div id="topbar-sync-groups" class="topbar-sync-groups"></div>
-          <button id="clear-site-group-filter" type="button" class="secondary clear-group-filter" hidden>
-            清除筛选
-          </button>
-        </div>
-
         <div class="topbar-actions">
           <label class="toggle selection-mode-toggle" title="让独立悬浮窗保持在其他窗口前方">
             <input id="floating-always-on-top" type="checkbox" />
@@ -65,291 +54,202 @@
             <input id="smart-switch" type="checkbox" />
             自动选择
           </label>
-          <button id="restart-proxy" type="button">重启代理</button>
+          <button id="restart-proxy" type="button">
+            <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#rotate-cw"></use></svg>
+            重启代理
+          </button>
         </div>
       </header>
 
-      <div class="app-body">
-        <aside class="sidebar">
-          <section class="sidebar-section">
-            <div class="section-title">
+      <div class="app-body user-tool-layout">
+        <nav id="app-nav" class="app-nav" aria-label="主要视图">
+          <button id="nav-sites" type="button" class="active" data-view="sites" title="控制台">
+            <span class="nav-icon" aria-hidden="true"><svg><use href="./icons.svg#gauge"></use></svg></span><span>控制台</span>
+          </button>
+          <button id="nav-strategy" type="button" data-view="strategy" title="路由规则">
+            <span class="nav-icon" aria-hidden="true"><svg><use href="./icons.svg#route"></use></svg></span><span>路由规则</span>
+          </button>
+          <button id="nav-diagnostics" type="button" data-view="diagnostics" title="请求追踪">
+            <span class="nav-icon" aria-hidden="true"><svg><use href="./icons.svg#activity"></use></svg></span><span>请求追踪</span>
+          </button>
+          <button id="nav-activity" type="button" data-view="activity" title="运行日志">
+            <span class="nav-icon" aria-hidden="true"><svg><use href="./icons.svg#activity"></use></svg></span><span>运行日志</span>
+          </button>
+          <button id="nav-settings" type="button" data-view="settings" title="设置">
+            <span class="nav-icon" aria-hidden="true"><svg><use href="./icons.svg#sliders"></use></svg></span><span>设置</span>
+          </button>
+        </nav>
+
+        <section class="workspace">
+          <section id="view-overview" class="view-section legacy-overview-source" aria-hidden="true" hidden>
+            <header class="content-header workspace-heading">
               <div>
-                <h2>站点</h2>
-                <p id="site-list-summary">0 个配置</p>
+                <h2>代理总览</h2>
+                <p>确认本机代理是否可用、当前站点是否健康，以及近期请求是否稳定。</p>
               </div>
-              <button id="new-site" type="button">新增</button>
-            </div>
-            <div class="site-list-controls">
-              <label class="site-filter">
-                状态筛选
-                <select id="site-status-filter">
-                  <option value="all">全部状态</option>
-                  <option value="enabled">启用中</option>
-                  <option value="unavailable">不可用</option>
-                  <option value="manual-disabled">人工停用</option>
-                  <option value="failure-disabled">错误停用</option>
-                  <option value="rate-limited">限速暂停</option>
-                </select>
-              </label>
-              <label class="site-filter">
-                排序
-                <select id="site-sort">
-                  <option value="default">默认顺序</option>
-                  <option value="requests">请求数多优先</option>
-                  <option value="success-rate">成功率高优先</option>
-                  <option value="balance">余额高优先</option>
-                  <option value="multiplier">倍率低优先</option>
-                </select>
-              </label>
-            </div>
-            <div id="site-list" class="site-list"></div>
-          </section>
+            </header>
 
-          <details class="proxy-panel">
-            <summary>
-              <span>代理设置</span>
-              <small>端口、超时、切换策略</small>
-            </summary>
-            <div class="settings-grid">
-              <label>
-                代理端口
-                <input id="proxy-port" type="number" min="1" max="65535" />
-              </label>
-              <label>
-                上游超时(秒)
-                <input id="proxy-timeout-seconds" type="number" min="1" step="1" placeholder="120" />
-              </label>
-              <label>
-                请求体缓冲(MB)
-                <input id="proxy-replay-buffer-mb" type="number" min="1" max="512" step="1" placeholder="16" />
-              </label>
-              <label>
-                失败阈值
-                <input id="failure-threshold" type="number" min="0" />
-              </label>
-              <label>
-                优先模式
-                <select id="priority-mode">
-                  <option value="priority">按优先级</option>
-                  <option value="multiplier">按倍率</option>
-                </select>
-              </label>
-              <label>
-                同档位策略
-                <select id="same-priority-strategy">
-                  <option value="round-robin">轮询</option>
-                  <option value="random">随机</option>
-                </select>
-              </label>
-              <label class="toggle">
-                <input id="smart-switching" type="checkbox" />
-                自动选择请求站点
-              </label>
-              <label class="toggle">
-                <input id="auto-switch-multiplier-limit-enabled" type="checkbox" />
-                自动选择时跳过高于指定倍率的站点
-              </label>
-              <label>
-                最高自动使用倍率
-                <input id="auto-switch-max-multiplier" type="number" min="0" step="0.000001" placeholder="1" />
-              </label>
-              <label class="toggle">
-                <input id="global-model-mapping-enabled" type="checkbox" />
-                启用全局模型映射
-              </label>
-              <div class="wide-field model-mapping-editor" aria-label="全局模型映射">
-                <div class="model-mapping-toolbar">
-                  <div>
-                    <strong>全局模型映射</strong>
-                    <small>精确匹配请求里的 model；单站点映射命中时优先生效</small>
-                  </div>
-                  <button id="add-global-model-mapping" type="button" class="secondary">添加映射</button>
-                </div>
-                <div id="global-model-mapping-rows" class="model-mapping-rows"></div>
-                <details class="model-mapping-import">
-                  <summary>
-                    <span>批量粘贴</span>
-                    <small>支持 a=b、a -> b 或 JSON</small>
-                  </summary>
-                  <textarea
-                    id="global-model-mapping"
-                    class="model-mapping-textarea"
-                    autocomplete="off"
-                    spellcheck="false"
-                    placeholder="request-model=upstream-model&#10;chat-model -> relay-chat-model"
-                  ></textarea>
-                </details>
-              </div>
-              <div class="button-row">
-                <button id="save-proxy" type="button">保存代理设置</button>
-              </div>
-            </div>
-          </details>
-
-          <details class="proxy-panel site-sync-settings-panel" open>
-            <summary>
-              <span>账号信息同步</span>
-              <small>默认间隔、智能更新</small>
-            </summary>
-            <div class="settings-grid">
-              <label>
-                默认更新间隔
-                <input id="site-sync-global-interval-value" type="number" min="1" step="1" placeholder="30" />
-              </label>
-              <label>
-                单位
-                <select id="site-sync-global-interval-unit">
-                  <option value="minute">分钟</option>
-                  <option value="hour">小时</option>
-                </select>
-              </label>
-              <label class="toggle">
-                <input id="site-sync-intelligent-scheduling" type="checkbox" />
-                根据使用情况智能更新
-              </label>
-              <label>
-                分组倍率刷新间隔
-                <input id="group-sync-interval-value" type="number" min="1" step="1" placeholder="30" />
-              </label>
-              <label>
-                单位
-                <select id="group-sync-interval-unit">
-                  <option value="minute">分钟</option>
-                  <option value="hour">小时</option>
-                </select>
-              </label>
-              <div class="button-row">
-                <button id="save-site-sync-settings" type="button">保存同步设置</button>
-              </div>
-            </div>
-          </details>
-
-          <details class="proxy-panel config-transfer-panel">
-            <summary>
-              <span>配置导入导出</span>
-              <small>备份、迁移、选择部分配置</small>
-            </summary>
-            <div class="settings-grid">
-              <div class="config-transfer-block">
-                <div class="config-transfer-title">
-                  <strong>导出配置</strong>
-                  <small>导出的 JSON 会包含所选站点的 API Key、远端同步账号和密码。</small>
-                </div>
-                <label class="toggle">
-                  <input id="config-export-global-settings" type="checkbox" checked />
-                  包含代理、同步和全局模型映射设置
-                </label>
-                <label>
-                  导出范围
-                  <select id="config-export-mode">
-                    <option value="all">全部站点</option>
-                    <option value="current">当前选中站点</option>
-                    <option value="selected">手动选择站点</option>
-                  </select>
-                </label>
-                <div id="config-export-selected-sites" class="config-site-picker" hidden></div>
-                <div class="button-row">
-                  <button id="export-config" type="button">导出配置</button>
-                </div>
-              </div>
-
-              <div class="config-transfer-block">
-                <div class="config-transfer-title">
-                  <strong>导入配置</strong>
-                  <small>先预览文件，再勾选要导入的站点；导入会新增站点，不会删除现有配置。</small>
-                </div>
-                <div class="button-row">
-                  <button id="preview-import-config" type="button" class="secondary">选择导入文件</button>
-                </div>
-                <div id="config-import-preview" class="config-import-preview" hidden>
-                  <p id="config-import-summary" class="section-note"></p>
-                  <label class="toggle">
-                    <input id="config-import-global-settings" type="checkbox" checked />
-                    导入代理、同步和全局模型映射设置
-                  </label>
-                  <div id="config-import-sites" class="config-site-picker"></div>
-                  <div class="button-row">
-                    <button id="apply-import-config" type="button">导入选中配置</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </details>
-        </aside>
-
-        <section class="content">
-          <header class="content-header">
-            <div>
-              <h2 id="editor-title">新增站点</h2>
-              <p id="editor-subtitle">配置 OpenAI 兼容上游站点</p>
-            </div>
-            <div class="toolbar">
-              <button id="test-site" type="button" class="secondary">测试</button>
-              <button id="toggle-selected-site" type="button" class="secondary">停用</button>
-              <button id="set-active" type="button" class="secondary">选择</button>
-              <button id="clone-site" type="button" class="secondary">复制</button>
-              <button id="delete-site" type="button" class="danger">删除</button>
-            </div>
-          </header>
-
-          <section id="site-overview" class="site-overview" aria-label="站点概览">
-            <div>
-              <span>可用状态</span>
-              <strong id="overview-availability">-</strong>
-            </div>
-            <div>
-              <span>最近请求</span>
-              <strong id="overview-last-request">-</strong>
-            </div>
-            <div>
-              <span>成功率</span>
-              <strong id="overview-success-rate">-</strong>
-            </div>
-            <div>
-              <span>连续错误</span>
-              <strong id="overview-consecutive-errors">-</strong>
-            </div>
-          </section>
-
-          <details id="request-dashboard" class="request-dashboard" open>
-            <summary class="dashboard-header">
+            <section id="site-overview" class="site-overview" aria-label="站点概览">
               <div>
-                <h3>请求看板</h3>
-                <p>汇总所有站点的成功、失败与成功率</p>
-              </div>
-            </summary>
-            <div class="dashboard-controls">
-              <div class="segmented-control" aria-label="统计周期">
-                <button id="dashboard-period-hour" type="button">小时</button>
-                <button id="dashboard-period-day" type="button">日</button>
-                <button id="dashboard-period-week" type="button">周</button>
-                <button id="dashboard-period-month" type="button">月</button>
-              </div>
-            </div>
-            <div class="dashboard-summary">
-              <div>
-                <span>请求</span>
-                <strong id="dashboard-requests">0</strong>
+                <span>可用状态</span>
+                <strong id="overview-availability">-</strong>
               </div>
               <div>
-                <span>成功</span>
-                <strong id="dashboard-success">0</strong>
-              </div>
-              <div>
-                <span>失败</span>
-                <strong id="dashboard-errors">0</strong>
+                <span>最近请求</span>
+                <strong id="overview-last-request">-</strong>
               </div>
               <div>
                 <span>成功率</span>
-                <strong id="dashboard-success-rate">-</strong>
+                <strong id="overview-success-rate">-</strong>
               </div>
-            </div>
-            <div id="dashboard-buckets" class="dashboard-buckets"></div>
-          </details>
+              <div>
+                <span>连续错误</span>
+                <strong id="overview-consecutive-errors">-</strong>
+              </div>
+            </section>
+
+            <details id="request-dashboard" class="request-dashboard" open>
+              <summary class="dashboard-header">
+                <div>
+                  <h3>请求看板</h3>
+                  <p>查看当前选中站点的成功、失败与成功率</p>
+                </div>
+              </summary>
+              <div class="dashboard-controls">
+                <div class="segmented-control" aria-label="统计周期">
+                  <button id="dashboard-period-hour" type="button">小时</button>
+                  <button id="dashboard-period-day" type="button">日</button>
+                  <button id="dashboard-period-week" type="button">周</button>
+                  <button id="dashboard-period-month" type="button">月</button>
+                </div>
+              </div>
+              <div class="dashboard-summary">
+                <div>
+                  <span>请求</span>
+                  <strong id="dashboard-requests">0</strong>
+                </div>
+                <div>
+                  <span>成功</span>
+                  <strong id="dashboard-success">0</strong>
+                </div>
+                <div>
+                  <span>失败</span>
+                  <strong id="dashboard-errors">0</strong>
+                </div>
+                <div>
+                  <span>成功率</span>
+                  <strong id="dashboard-success-rate">-</strong>
+                </div>
+              </div>
+              <div id="dashboard-buckets" class="dashboard-buckets"></div>
+            </details>
+
+            <section class="topbar-sync-groups-panel overview-sync-groups" aria-label="低倍率分组">
+              <div class="sync-groups-heading">
+                <span>低倍率分组</span>
+                <div class="sync-groups-heading-actions">
+                  <button id="toggle-topbar-sync-groups" type="button" class="secondary" hidden>展开</button>
+                  <button id="refresh-site-sync-all" type="button" class="secondary">
+                    <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#rotate-cw"></use></svg>
+                    刷新分组
+                  </button>
+                </div>
+              </div>
+              <div id="topbar-sync-groups" class="topbar-sync-groups"></div>
+              <button id="clear-site-group-filter" type="button" class="secondary clear-group-filter" hidden>
+                清除筛选
+              </button>
+              <div id="site-group-popover" class="site-group-popover" role="dialog" aria-modal="false" hidden>
+                <div class="group-popover-heading">
+                  <div>
+                    <small>低倍率分组</small>
+                    <strong id="site-group-popover-title">-</strong>
+                  </div>
+                  <button id="site-group-popover-close" type="button" class="icon-button" aria-label="关闭分组详情">×</button>
+                </div>
+                <div id="site-group-popover-meta" class="group-popover-meta"></div>
+                <div class="group-popover-actions">
+                  <button id="site-group-popover-view-site" type="button" class="secondary">查看站点</button>
+                  <button id="site-group-popover-filter" type="button" class="secondary">只看关联站点</button>
+                  <button id="site-group-popover-switch" type="button">切换分组</button>
+                </div>
+              </div>
+            </section>
+          </section>
+
+          <section id="view-sites" class="view-section sites-view">
+            <aside class="sidebar">
+              <section class="sidebar-section">
+                <div class="section-title">
+                  <div>
+                    <h2>站点</h2>
+                    <p id="site-list-summary">0 个配置</p>
+                  </div>
+                  <button id="new-site" type="button">
+                    <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#plus"></use></svg>
+                    新增
+                  </button>
+                </div>
+                <div id="sidebar-group-host" class="sidebar-group-host"></div>
+                <div class="site-list-controls">
+                  <label class="site-filter">
+                    状态筛选
+                    <select id="site-status-filter">
+                      <option value="all">全部状态</option>
+                      <option value="enabled">启用中</option>
+                      <option value="unavailable">不可用</option>
+                      <option value="manual-disabled">人工停用</option>
+                      <option value="failure-disabled">错误停用</option>
+                      <option value="rate-limited">限速暂停</option>
+                    </select>
+                  </label>
+                  <label class="site-filter">
+                    排序
+                    <select id="site-sort">
+                      <option value="default">默认顺序</option>
+                      <option value="requests">请求数多优先</option>
+                      <option value="success-rate">成功率高优先</option>
+                      <option value="balance">余额高优先</option>
+                      <option value="multiplier">实际倍率低优先</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="site-list" class="site-list"></div>
+              </section>
+            </aside>
+
+            <section class="content">
+              <header class="content-header">
+                <div>
+                  <h2 id="editor-title">新增站点</h2>
+                  <p id="editor-subtitle">配置 OpenAI 兼容上游站点</p>
+                </div>
+                <div class="toolbar">
+                  <button id="test-site" type="button" class="secondary">测试</button>
+                  <button id="toggle-selected-site" type="button" class="secondary">停用</button>
+                  <button id="set-active" type="button" class="secondary">选择</button>
+                  <button id="clone-site" type="button" class="secondary">复制</button>
+                  <button id="delete-site" type="button" class="danger">删除</button>
+                  <button id="toggle-site-inspector" type="button" class="secondary inspector-toggle" aria-expanded="true">
+                    <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#panel-right"></use></svg>
+                    检查器
+                  </button>
+                </div>
+              </header>
+
+              <nav class="site-tabs" aria-label="站点工作区">
+                <button id="site-tab-overview" type="button" class="active" aria-selected="true">概览</button>
+                <button id="site-tab-basic" type="button" aria-selected="false">基础配置</button>
+                <button id="site-tab-sync" type="button" aria-selected="false">同步与分组</button>
+                <button id="site-tab-models" type="button" aria-selected="false">模型能力</button>
+                <button id="site-tab-policy" type="button" aria-selected="false">站点策略</button>
+              </nav>
+
+              <section id="site-tab-overview-panel" class="site-tab-panel site-overview-panel"></section>
 
           <form id="site-form" class="editor-form">
             <input id="site-id" type="hidden" />
-            <section class="form-section">
+            <section id="site-basic-panel" class="form-section site-tab-panel" hidden>
               <div class="form-section-title">
                 <h3>基础配置</h3>
                 <label class="toggle">
@@ -367,13 +267,25 @@
                   <input id="site-priority" type="number" step="1" placeholder="100" />
                 </label>
                 <label>
-                  倍率
+                  真实倍率
                   <input id="site-multiplier" type="text" inputmode="decimal" placeholder="1" />
                 </label>
                 <label class="toggle">
-                  <input id="site-multiplier-locked" type="checkbox" />
-                  锁定倍率
+                  <input id="site-custom-multiplier-enabled" type="checkbox" />
+                  启用自定义倍数
                 </label>
+                <label>
+                  自定义倍数
+                  <input id="site-custom-multiplier" type="number" min="0.000001" step="any" placeholder="1" />
+                </label>
+                <label class="toggle">
+                  <input id="site-multiplier-locked" type="checkbox" />
+                  锁定真实倍率
+                </label>
+                <div class="multiplier-summary wide-field">
+                  <span>账号倍率 <strong id="site-account-multiplier">-</strong></span>
+                  <span>实际倍率 <strong id="site-effective-multiplier">1</strong></span>
+                </div>
                 <label class="wide-field">
                   Base URL
                   <input
@@ -386,10 +298,6 @@
                 <label class="wide-field">
                   API Key
                   <input id="site-api-key" type="password" autocomplete="new-password" placeholder="example-api-key" required />
-                </label>
-                <label>
-                  测试模型
-                  <input id="site-test-model" autocomplete="off" placeholder="example-chat-model" />
                 </label>
                 <label class="wide-field">
                   备注信息
@@ -425,7 +333,7 @@
               </div>
             </section>
 
-            <section class="form-section capability-section">
+            <section id="site-models-panel" class="form-section capability-section site-tab-panel" hidden>
               <div class="form-section-title capability-title">
                 <div>
                   <h3>模型与能力</h3>
@@ -437,7 +345,7 @@
               <div id="site-capability-models" class="capability-models"></div>
             </section>
 
-            <section class="form-section sync-section">
+            <section id="site-sync-panel" class="form-section sync-section site-tab-panel" hidden>
               <div class="form-section-title sync-title">
                 <h3>远端同步</h3>
                 <div class="sync-actions">
@@ -447,9 +355,17 @@
                   </label>
                   <button id="create-site-key" type="button" class="secondary">创建密钥</button>
                   <button id="sync-site" type="button" class="secondary">同步账号信息</button>
+                  <button id="logout-site-account" type="button" class="danger">退出账号</button>
                 </div>
               </div>
               <div class="sync-grid">
+                <label class="sync-account-field">
+                  共享账号
+                  <select id="site-sync-account">
+                    <option value="">新账号</option>
+                  </select>
+                  <small id="site-sync-account-summary">保存后可在多个站点间共享登录配置</small>
+                </label>
                 <label class="sync-url-field">
                   后台地址
                   <input
@@ -526,7 +442,7 @@
               <p id="site-sync-summary" class="sync-summary">未同步</p>
             </section>
 
-            <details class="advanced-panel">
+            <details id="site-policy-panel" class="advanced-panel site-tab-panel" open hidden>
               <summary>
                 <span>低频策略</span>
                 <small>速率限制、错误停用后自检</small>
@@ -575,37 +491,460 @@
                   </label>
                 </div>
               </fieldset>
+              <fieldset class="monitoring-fields">
+                <legend>飞书余额提醒</legend>
+                <label class="toggle">
+                  <input id="site-monitoring-enabled" type="checkbox" />
+                  启用当前账号的余额提醒
+                </label>
+                <div class="monitoring-grid">
+                  <label>
+                    余额提醒阈值
+                    <input id="site-balance-threshold" type="number" min="0" step="0.01" placeholder="未设置" />
+                  </label>
+                </div>
+                <small id="site-monitoring-account" class="section-note">保存站点后可配置余额提醒</small>
+              </fieldset>
             </details>
 
             <div class="form-actions">
               <button id="save-site" type="submit">保存站点</button>
               <button id="reset-form" type="button" class="secondary">重置</button>
             </div>
-          </form>
-        </section>
+            </form>
 
-        <aside class="context-panel">
-          <section class="status-panel">
-            <div class="context-heading">
-              <div>
-                <h3>选中站点状态</h3>
-                <p id="context-site-name">未选择站点</p>
-              </div>
-              <span id="context-site-status" class="status-pill idle">-</span>
-            </div>
-            <dl id="site-status"></dl>
+            <details id="error-log-panel" class="error-panel" open>
+              <summary>
+                <span>最近错误日志</span>
+                <small id="error-log-summary">0 条</small>
+              </summary>
+              <div id="error-log" class="error-log"></div>
+            </details>
+            </section>
+
+            <aside id="site-inspector" class="context-panel site-inspector" aria-label="实时检查器">
+              <header class="inspector-heading">
+                <div>
+                  <span class="eyebrow">实时检查器</span>
+                  <strong>选中站点状态</strong>
+                </div>
+                <button id="close-site-inspector" type="button" class="icon-button" aria-label="关闭实时检查器">×</button>
+              </header>
+              <div id="inspector-status-host"></div>
+              <section class="inspector-section">
+                <div class="inspector-section-heading">
+                  <strong>最近路由</strong>
+                  <button id="open-request-traces" type="button" class="text-button">查看全部</button>
+                </div>
+                <div id="inspector-route-log" class="inspector-route-log"></div>
+              </section>
+              <div id="inspector-error-host"></div>
+            </aside>
           </section>
 
-          <details id="error-log-panel" class="error-panel" open>
-            <summary>
-              <span>错误记录</span>
-              <small id="error-log-summary">0 条</small>
-            </summary>
-            <div id="error-log" class="error-log"></div>
-          </details>
-        </aside>
+          <section id="view-strategy" class="view-section strategy-view" hidden>
+            <header class="content-header workspace-heading">
+              <div>
+                <h2>路由策略</h2>
+                <p>配置自动选择、故障切换、模型映射和同步调度。</p>
+              </div>
+            </header>
+
+            <details class="proxy-panel" open>
+              <summary>
+                <span>代理与自动选择</span>
+                <small>端口、超时、切换策略</small>
+              </summary>
+              <div class="settings-grid">
+                <label>
+                  代理端口
+                  <input id="proxy-port" type="number" min="1" max="65535" />
+                </label>
+                <div class="wide-field local-api-key-field">
+                  <div>
+                    <strong>本地 API 密钥</strong>
+                    <small>客户端调用 JuanProxy 时使用；转发到上游前会替换为当前站点密钥。</small>
+                  </div>
+                  <div class="local-api-key-actions">
+                    <input
+                      id="local-api-key"
+                      type="password"
+                      readonly
+                      autocomplete="off"
+                      aria-label="本地 API 密钥"
+                      value="已配置；如已遗失请重新生成"
+                    />
+                    <button id="copy-local-api-key" type="button" class="secondary">复制密钥</button>
+                    <button id="generate-local-api-key" type="button" class="secondary">重新生成</button>
+                  </div>
+                  <small id="local-api-key-note">密钥明文只显示一次；重新生成后，旧密钥立即失效。</small>
+                </div>
+                <label class="toggle" title="仅在可信局域网中开启">
+                  <input id="allow-lan-access" type="checkbox" />
+                  允许其他设备访问（监听所有网卡）
+                </label>
+                <label>
+                  上游超时(秒)
+                  <input id="proxy-timeout-seconds" type="number" min="1" step="1" placeholder="120" />
+                </label>
+                <label>
+                  请求体缓冲(MB)
+                  <input id="proxy-replay-buffer-mb" type="number" min="1" max="512" step="1" placeholder="16" />
+                </label>
+                <label class="toggle">
+                  <input id="codex-recovery-enabled" type="checkbox" />
+                  Codex 任务自动恢复
+                </label>
+                <label>
+                  失败阈值
+                  <input id="failure-threshold" type="number" min="0" />
+                </label>
+                <label>
+                  测试模型
+                  <input id="global-test-model" autocomplete="off" placeholder="example-chat-model" />
+                </label>
+                <label>
+                  优先模式
+                  <select id="priority-mode">
+                    <option value="priority">按优先级</option>
+                    <option value="multiplier">按实际倍率</option>
+                  </select>
+                </label>
+                <label>
+                  同档位策略
+                  <select id="same-priority-strategy">
+                    <option value="round-robin">轮询</option>
+                    <option value="random">随机</option>
+                  </select>
+                </label>
+                <label class="toggle">
+                  <input id="smart-switching" type="checkbox" />
+                  自动选择请求站点
+                </label>
+                <label class="toggle">
+                  <input id="auto-switch-multiplier-limit-enabled" type="checkbox" />
+                  自动选择时跳过高于指定实际倍率的站点
+                </label>
+                <label>
+                  最高自动使用实际倍率
+                  <input id="auto-switch-max-multiplier" type="number" min="0" step="0.000001" placeholder="1" />
+                </label>
+                <label class="toggle">
+                  <input id="global-model-mapping-enabled" type="checkbox" />
+                  启用全局模型映射
+                </label>
+                <div class="wide-field model-mapping-editor" aria-label="全局模型映射">
+                  <div class="model-mapping-toolbar">
+                    <div>
+                      <strong>全局模型映射</strong>
+                      <small>精确匹配请求里的 model；单站点映射命中时优先生效</small>
+                    </div>
+                    <button id="add-global-model-mapping" type="button" class="secondary">添加映射</button>
+                  </div>
+                  <div id="global-model-mapping-rows" class="model-mapping-rows"></div>
+                  <details class="model-mapping-import">
+                    <summary>
+                      <span>批量粘贴</span>
+                      <small>支持 a=b、a -> b 或 JSON</small>
+                    </summary>
+                    <textarea
+                      id="global-model-mapping"
+                      class="model-mapping-textarea"
+                      autocomplete="off"
+                      spellcheck="false"
+                      placeholder="request-model=upstream-model&#10;chat-model -> relay-chat-model"
+                    ></textarea>
+                  </details>
+                </div>
+                <div class="button-row">
+                  <button id="save-proxy" type="button">保存代理设置</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="proxy-panel site-sync-settings-panel" open>
+              <summary>
+                <span>账号信息同步</span>
+                <small>默认间隔、智能更新</small>
+              </summary>
+              <div class="settings-grid">
+                <label>
+                  默认更新间隔
+                  <input id="site-sync-global-interval-value" type="number" min="1" step="1" placeholder="30" />
+                </label>
+                <label>
+                  单位
+                  <select id="site-sync-global-interval-unit">
+                    <option value="minute">分钟</option>
+                    <option value="hour">小时</option>
+                  </select>
+                </label>
+                <label class="toggle">
+                  <input id="site-sync-intelligent-scheduling" type="checkbox" />
+                  根据使用情况智能更新
+                </label>
+                <label>
+                  分组倍率刷新间隔
+                  <input id="group-sync-interval-value" type="number" min="1" step="1" placeholder="30" />
+                </label>
+                <label>
+                  单位
+                  <select id="group-sync-interval-unit">
+                    <option value="minute">分钟</option>
+                    <option value="hour">小时</option>
+                  </select>
+                </label>
+                <div class="button-row">
+                  <button id="save-site-sync-settings" type="button">保存同步设置</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="proxy-panel" open>
+              <summary>
+                <span>飞书监控</span>
+                <small>独立 Watchdog、六类通知可分别开关</small>
+              </summary>
+              <div class="settings-grid">
+                <label class="toggle">
+                  <input id="monitoring-enabled" type="checkbox" />
+                  启用飞书监控
+                </label>
+                <label class="wide-field">
+                  飞书群机器人 Webhook
+                  <input
+                    id="feishu-webhook"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                  />
+                </label>
+                <fieldset class="monitoring-fields wide-field">
+                  <legend>通知项目</legend>
+                  <label class="toggle">
+                    <input id="monitoring-multiplier-changed" type="checkbox" />
+                    倍率切换
+                  </label>
+                  <label class="toggle">
+                    <input id="monitoring-low-balance" type="checkbox" />
+                    站点余额不足
+                  </label>
+                  <label class="toggle">
+                    <input id="monitoring-no-usable-site" type="checkbox" />
+                    长时间无可用站点
+                  </label>
+                  <label>
+                    无可用站点持续时间（分钟）
+                    <input id="no-usable-site-delay-minutes" type="number" min="1" step="1" value="5" />
+                  </label>
+                  <label class="toggle">
+                    <input id="monitoring-program-issues" type="checkbox" />
+                    程序异常（闪退或本地请求无响应）
+                  </label>
+                  <label class="toggle">
+                    <input id="monitoring-answer-completed" type="checkbox" />
+                    Codex 普通对话回答完成
+                  </label>
+                  <label class="toggle">
+                    <input id="monitoring-goal-status-changed" type="checkbox" />
+                    Codex 目标完成或暂停
+                  </label>
+                </fieldset>
+                <small id="monitoring-summary" class="wide-field section-note">
+                  持续异常每 30 分钟提醒一次，恢复后通知
+                </small>
+                <div class="button-row">
+                  <button id="save-monitoring" type="button">保存监控设置</button>
+                  <button id="test-feishu-webhook" type="button" class="secondary">发送测试消息</button>
+                  <button id="install-monitoring-task" type="button" class="secondary">安装并启动后台任务</button>
+                  <button id="remove-monitoring-task" type="button" class="secondary">停止并移除后台任务</button>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section id="view-diagnostics" class="view-section diagnostics-view" hidden>
+            <header class="content-header workspace-heading">
+              <div>
+                <h2>诊断</h2>
+                <p>查看请求如何选路、哪些站点失败，以及当前站点的详细状态。</p>
+              </div>
+            </header>
+
+            <div class="diagnostics-grid">
+              <section class="status-panel">
+                <div class="context-heading">
+                  <div>
+                    <h3>选中站点状态</h3>
+                    <p id="context-site-name">未选择站点</p>
+                  </div>
+                  <span id="context-site-status" class="status-pill idle">-</span>
+                </div>
+                <dl id="site-status"></dl>
+              </section>
+
+              <details id="route-trace-panel" class="route-trace-panel" open>
+                <summary>
+                  <span>请求路由</span>
+                  <small id="route-trace-summary">0 条</small>
+                </summary>
+                <div id="route-trace-log" class="route-trace-log"></div>
+              </details>
+
+            </div>
+          </section>
+
+          <section id="view-activity" class="view-section activity-view" hidden>
+            <header class="content-header workspace-heading">
+              <div>
+                <h2>运行日志</h2>
+                <p>查看远端同步、低倍率分组自动测试与导入的进度和结果。</p>
+              </div>
+            </header>
+
+            <section class="activity-status-panel">
+              <div class="context-heading">
+                <div>
+                  <h3>低倍率监控状态</h3>
+                  <p id="activity-monitor-summary">等待状态更新</p>
+                </div>
+                <span id="activity-monitor-status" class="status-pill idle">未启动</span>
+              </div>
+              <dl class="activity-status-grid">
+                <div><dt>当前执行</dt><dd id="activity-monitor-checking">-</dd></div>
+                <div><dt>上次检查</dt><dd id="activity-monitor-last-check">-</dd></div>
+                <div><dt>下次检查</dt><dd id="activity-monitor-next-check">-</dd></div>
+                <div><dt>最近统计</dt><dd id="activity-monitor-counts">-</dd></div>
+              </dl>
+            </section>
+
+            <section class="activity-log-panel">
+              <div class="activity-toolbar">
+                <div>
+                  <h3>活动记录</h3>
+                  <p id="activity-log-summary">0 条</p>
+                </div>
+                <div class="activity-controls">
+                  <label>
+                    分类
+                    <select id="activity-category-filter">
+                      <option value="all">全部分类</option>
+                      <option value="sync">远端同步</option>
+                      <option value="auto-provision">自动导入</option>
+                    </select>
+                  </label>
+                  <label>
+                    结果
+                    <select id="activity-status-filter">
+                      <option value="all">全部结果</option>
+                      <option value="running">进行中</option>
+                      <option value="success">成功</option>
+                      <option value="skipped">跳过</option>
+                      <option value="failure">失败</option>
+                    </select>
+                  </label>
+                  <button id="refresh-activity-logs" type="button" class="secondary" title="刷新运行日志">
+                    <svg class="button-icon" aria-hidden="true"><use href="./icons.svg#rotate-cw"></use></svg>
+                    刷新
+                  </button>
+                  <button id="clear-activity-logs" type="button" class="danger">清空记录</button>
+                </div>
+              </div>
+              <div id="activity-log-list" class="activity-log-list" aria-live="polite"></div>
+            </section>
+          </section>
+
+          <section id="view-settings" class="view-section settings-view" hidden>
+            <header class="content-header workspace-heading">
+              <div>
+                <h2>设置</h2>
+                <p>备份、迁移、导入或导出本机配置。</p>
+              </div>
+            </header>
+
+            <details class="proxy-panel config-transfer-panel" open>
+              <summary>
+                <span>配置导入导出</span>
+                <small>备份、迁移、选择部分配置</small>
+              </summary>
+              <div class="settings-grid">
+                <div class="config-transfer-block">
+                  <div class="config-transfer-title">
+                    <strong>导出配置</strong>
+                    <small>导出的 JSON 会包含所选站点的 API Key、远端同步账号和密码。</small>
+                  </div>
+                  <label class="toggle">
+                    <input id="config-export-global-settings" type="checkbox" checked />
+                    包含代理、同步和全局模型映射设置
+                  </label>
+                  <label>
+                    导出范围
+                    <select id="config-export-mode">
+                      <option value="all">全部站点</option>
+                      <option value="current">当前选中站点</option>
+                      <option value="selected">手动选择站点</option>
+                    </select>
+                  </label>
+                  <div id="config-export-selected-sites" class="config-site-picker" hidden></div>
+                  <div class="button-row">
+                    <button id="export-config" type="button">导出配置</button>
+                  </div>
+                </div>
+
+                <div class="config-transfer-block">
+                  <div class="config-transfer-title">
+                    <strong>导入配置</strong>
+                    <small>先预览文件，再勾选要导入的站点；导入会新增站点，不会删除现有配置。</small>
+                  </div>
+                  <div class="button-row">
+                    <button id="preview-import-config" type="button" class="secondary">选择导入文件</button>
+                  </div>
+                  <div id="config-import-preview" class="config-import-preview" hidden>
+                    <p id="config-import-summary" class="section-note"></p>
+                    <label class="toggle">
+                      <input id="config-import-global-settings" type="checkbox" checked />
+                      导入代理、同步和全局模型映射设置
+                    </label>
+                    <div id="config-import-sites" class="config-site-picker"></div>
+                    <div class="button-row">
+                      <button id="apply-import-config" type="button">导入选中配置</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </details>
+
+            <details class="proxy-panel app-lifecycle-panel" open>
+              <summary>
+                <span>应用生命周期</span>
+                <small>关闭主窗口时继续在后台运行</small>
+              </summary>
+              <div class="app-lifecycle-actions">
+                <div class="config-transfer-title">
+                  <strong>退出 JuanProxy</strong>
+                  <small>完整停止本地代理、后台同步和悬浮窗。点击主窗口关闭按钮只会隐藏主界面。</small>
+                </div>
+                <button id="quit-app" type="button" class="danger">退出 JuanProxy</button>
+              </div>
+            </details>
+          </section>
+        </section>
       </div>
     </main>
+
+    <dialog id="unsaved-changes-dialog" class="glass-dialog" hidden>
+      <div class="dialog-icon" aria-hidden="true">!</div>
+      <div class="dialog-copy">
+        <span class="eyebrow">未保存的修改</span>
+        <h2>离开前如何处理当前站点？</h2>
+        <p>你对当前站点的修改尚未保存。保存后继续、放弃修改，或留在当前页面。</p>
+      </div>
+      <div class="dialog-actions">
+        <button id="unsaved-changes-cancel" type="button" class="secondary">取消</button>
+        <button id="unsaved-changes-discard" type="button" class="danger">放弃修改</button>
+        <button id="unsaved-changes-save" type="button">保存并继续</button>
+      </div>
+    </dialog>
 
     <div id="toast" class="toast" hidden></div>
     <script src="./app.js" type="module"></script>
